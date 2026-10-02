@@ -1,0 +1,364 @@
+#version 450
+// Pass 2: one ray per pixel, front to back with a running transmittance,
+// compositing the model surface (voxel or smooth, optionally Cp-painted),
+// an opaque slice plane, Q-criterion vortex cores, dye smoke, the field
+// haze and the tunnel box edges.
+// Also writes each pixel's depth (ray distance to the first opaque hit,
+// 1e30 if none) so the smoke / streamline splats can be depth-tested.
+//
+// Transfer function: opacity from deviation from the freestream above a
+// noise floor, so undisturbed flow is transparent (without it the tunnel
+// renders as a block of fog). Cost scales with pixels, not flow.
+//
+// Output: packed RGBA8 per pixel, row 0 at the top (Vulkan image order).
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "vol_common.glsl"
+
+const int SURFACE_HIDDEN = 0;
+const int SURFACE_VOXEL = 1;
+const int SURFACE_SMOOTH = 2;
+const float SOLID_SUBSTEP = 0.5;
+const vec3 BACKGROUND = vec3(0.05, 0.05, 0.09);
+
+// Feature bits in P.img.z
+const int F_BOX = 1;
+const int F_HAZE = 2;
+const int F_PAINT_CP = 4;
+const int F_Q = 8;
+const int F_DYE = 16;
+const int F_DYE_BY_SPEED = 32;
+const float DYE_SPEED_SPAN = 1.5;  // dye colour spans |u| / U in [0, 1.5]
+
+// 128 bytes -- the guaranteed push-constant minimum; all vec4 (std430-safe).
+layout(push_constant) uniform Params {
+    ivec4 dims;   // nx, ny, nz, n_steps
+    ivec4 img;    // width, height, feature bits, surface
+    ivec4 modes;  // cmode, slice_axis (-1 = none), pscale (float bits), -
+    vec4 eye;     // xyz, tan(fov / 2)
+    vec4 fwd;     // xyz, aspect
+    vec4 right;   // xyz, u_ref
+    vec4 up;      // xyz, rho_ref (Euler: p_ref)
+    vec4 haze;    // gain, floor, slice_pos (0..1), dye_gain
+} P;
+
+layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 1) readonly buffer Macro { vec4 macro[]; };
+// Volume quantities as 3-D textures (Image3D): hardware trilinear filtering,
+// one fetch per sample from 3-D-tiled memory (8 scattered buffer loads per
+// sample before). Extent (nz, ny, nx): sampled at p.zyx / N.zyx.
+layout(binding = 2) uniform sampler3D t_field;
+layout(std430, binding = 3) readonly buffer Occ { uint occ[]; };
+layout(binding = 4) uniform sampler3D t_raw;
+layout(binding = 5) uniform sampler3D t_blur;
+layout(binding = 6) uniform sampler3D t_q;
+layout(std430, binding = 7) readonly buffer QStat { vec4 qstat; };  // threshold, rms, n
+layout(binding = 8) uniform sampler3D t_dye;
+layout(std430, binding = 9) writeonly buffer Image { uint image[]; };
+layout(std430, binding = 10) writeonly buffer Depth { float depth[]; };
+layout(binding = 11) uniform sampler3D t_speed;  // |u| per cell
+
+ivec3 N;
+
+// -- colour maps ------------------------------------------------------------------
+vec3 coolwarm(float t) {
+    const float tc = clamp(t, 0.0, 1.0);
+    return tc <= 0.5 ? vec3(2.0 * tc, 2.0 * tc, 1.0) : vec3(1.0, 2.0 * (1.0 - tc), 2.0 * (1.0 - tc));
+}
+
+vec3 vortmap(float t) {
+    const float tc = clamp(t, 0.0, 1.0);
+    const vec3 c0 = vec3(40.0, 130.0, 255.0) / 255.0;
+    const vec3 c1 = vec3(10.0, 30.0, 90.0) / 255.0;
+    const vec3 c2 = vec3(3.0, 4.0, 8.0) / 255.0;
+    const vec3 c3 = vec3(110.0, 25.0, 20.0) / 255.0;
+    const vec3 c4 = vec3(255.0, 140.0, 40.0) / 255.0;
+    if (tc < 0.3) return mix(c0, c1, tc / 0.3);
+    if (tc < 0.5) return mix(c1, c2, (tc - 0.3) / 0.2);
+    if (tc < 0.7) return mix(c2, c3, (tc - 0.5) / 0.2);
+    return mix(c3, c4, (tc - 0.7) / 0.3);
+}
+
+// Sequential maps (dye, vortex cores)
+vec3 dyemap(float t) {
+    const float tc = clamp(t, 0.0, 1.0);
+    const vec3 c0 = vec3(0.20, 0.07, 0.42), c1 = vec3(0.66, 0.13, 0.46);
+    const vec3 c2 = vec3(0.98, 0.45, 0.18), c3 = vec3(1.00, 0.93, 0.62);
+    if (tc < 0.35) return mix(c0, c1, tc / 0.35);
+    if (tc < 0.65) return mix(c1, c2, (tc - 0.35) / 0.30);
+    return mix(c2, c3, (tc - 0.65) / 0.35);
+}
+
+vec3 qcoremap(float t) {
+    return mix(vec3(0.30, 0.95, 0.50), vec3(0.85, 0.55, 0.30), clamp(t, 0.0, 1.0));
+}
+
+vec3 fieldcolor(float sv, int cmode) {
+    const float t = 0.5 + 0.5 * clamp(sv, -1.0, 1.0);
+    if (cmode == CMODE_VORT) return vortmap(t);
+    if (cmode == CMODE_GREY) return vec3(0.88, 0.92, 1.0) * clamp(sv, 0.0, 1.0);
+    return coolwarm(t);
+}
+
+// -- sampling -----------------------------------------------------------------
+ivec3 cell_of(vec3 p) { return ivec3(clamp(p, vec3(0.0), vec3(N - 1))); }
+
+bool is_solid_cell(ivec3 c) { return flags[cell_index(c.x, c.y, c.z, N)] != FLUID; }
+
+// Trilinear sample of a cell-centred scalar (nearest-cell looks blocky).
+// `which`: 0 field, 1 solid_raw, 2 solid_blur, 3 Q, 4 dye, 5 |u| (GLSL
+// cannot pass a buffer as an argument).
+float trilinear(int which, vec3 p) {
+    // hardware trilinear; clamp-to-edge = the old clamp of p - 1/2 to [0, N - 1]
+    const vec3 uvw = p.zyx / vec3(N.zyx);
+    switch (which) {
+    case 0: return textureLod(t_field, uvw, 0.0).r;
+    case 1: return textureLod(t_raw, uvw, 0.0).r;
+    case 2: return textureLod(t_blur, uvw, 0.0).r;
+    case 3: return textureLod(t_q, uvw, 0.0).r;
+    case 4: return textureLod(t_dye, uvw, 0.0).r;
+    default: return textureLod(t_speed, uvw, 0.0).r;
+    }
+}
+
+// Trilinear rho over FLUID cells only (weights renormalised): solid cells
+// hold a stale density and would bias the surface Cp.
+float fluid_trilinear_rho(vec3 p, float fallback) {
+    const vec3 g = clamp(p - 0.5, vec3(0.0), vec3(N) - 1.001);
+    const ivec3 i0 = ivec3(g);
+    const vec3 t = g - vec3(i0);
+    float acc = 0.0, wsum = 0.0;
+    for (int dx = 0; dx < 2; ++dx)
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dz = 0; dz < 2; ++dz) {
+                const uint c = cell_index(i0.x + dx, i0.y + dy, i0.z + dz, N);
+                if (flags[c] == FLUID) {
+                    const float w = (dx == 1 ? t.x : 1.0 - t.x) * (dy == 1 ? t.y : 1.0 - t.y) *
+                                    (dz == 1 ? t.z : 1.0 - t.z);
+                    acc += w * macro[c].w;
+                    wsum += w;
+                }
+            }
+    return wsum > 1e-6 ? acc / wsum : fallback;
+}
+
+// Voxel normal: 3x3x3 weighted pull towards fluid neighbours (a 6-neighbour
+// difference shades every voxel step as a hard facet).
+vec3 voxel_normal(vec3 p) {
+    const ivec3 c = cell_of(p);
+    vec3 n = vec3(0.0);
+    for (int ox = -1; ox <= 1; ++ox)
+        for (int oy = -1; oy <= 1; ++oy)
+            for (int oz = -1; oz <= 1; ++oz) {
+                if (ox == 0 && oy == 0 && oz == 0) continue;
+                const ivec3 q = clamp(c + ivec3(ox, oy, oz), ivec3(0), N - 1);
+                if (!is_solid_cell(q)) n += vec3(ox, oy, oz) * inversesqrt(float(ox * ox + oy * oy + oz * oz));
+            }
+    return length(n) < 1e-6 ? vec3(0.0, 1.0, 0.0) : normalize(n);
+}
+
+// Smooth normal: -grad of the blurred indicator (central, +-0.75 cells).
+vec3 smooth_normal(vec3 p) {
+    const float h = 0.75;
+    const vec3 g = vec3(trilinear(2, p + vec3(h, 0, 0)) - trilinear(2, p - vec3(h, 0, 0)),
+                        trilinear(2, p + vec3(0, h, 0)) - trilinear(2, p - vec3(0, h, 0)),
+                        trilinear(2, p + vec3(0, 0, h)) - trilinear(2, p - vec3(0, 0, h)));
+    return length(g) < 1e-6 ? vec3(0.0, 1.0, 0.0) : normalize(-g);
+}
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    const int W = P.img.x, H = P.img.y;
+    if (px.x >= W || px.y >= H) return;  // no barrier() in this kernel
+    N = P.dims.xyz;
+    const int n_steps = P.dims.w;
+    const int feat = P.img.z;
+    const bool show_box = (feat & F_BOX) != 0, show_haze = (feat & F_HAZE) != 0;
+    const bool paint_cp = (feat & F_PAINT_CP) != 0;
+    const bool show_q = (feat & F_Q) != 0, show_dye = (feat & F_DYE) != 0;
+    const bool dye_by_speed = (feat & F_DYE_BY_SPEED) != 0;
+    const int surface = P.img.w, cmode = P.modes.x, slice_axis = P.modes.y;
+    const float pscale = intBitsToFloat(P.modes.z);
+    const float dye_gain = P.haze.w;
+    const float q_thresh = show_q ? qstat.x : 1e30;
+    const vec3 eye = P.eye.xyz;
+    const float tan_half = P.eye.w, aspect = P.fwd.w;
+    const float u_ref = P.right.w, rho_ref = P.up.w;
+    const float haze_gain = P.haze.x, haze_floor = P.haze.y, slice_pos = P.haze.z;
+    const float inv_q = 1.0 / max(0.5 * u_ref * u_ref, 1e-12);
+    const vec3 light = normalize(vec3(0.4, 0.8, 0.45));
+    const vec3 dims = vec3(N);
+    const ivec3 nb = (N + OCC_BLOCK - 1) / OCC_BLOCK;
+
+    const float u = (2.0 * (float(px.x) + 0.5) / float(W) - 1.0) * tan_half * aspect;
+    const float v = (1.0 - 2.0 * (float(px.y) + 0.5) / float(H)) * tan_half;  // row 0 = top
+    const vec3 d = normalize(P.fwd.xyz + u * P.right.xyz + v * P.up.xyz);
+
+    // Slab-intersect the tunnel box: march only inside it.
+    float t_near = 0.0, t_far = 1e18;
+    bool hit_box = true;
+    for (int k = 0; k < 3; ++k) {
+        if (abs(d[k]) < 1e-9) {
+            if (eye[k] < 0.0 || eye[k] > dims[k]) hit_box = false;
+        } else {
+            float ta = -eye[k] / d[k], tb = (dims[k] - eye[k]) / d[k];
+            if (ta > tb) { const float s = ta; ta = tb; tb = s; }
+            t_near = max(t_near, ta);
+            t_far = min(t_far, tb);
+        }
+    }
+
+    vec3 acc = vec3(0.0);
+    float trans = 1.0;
+    float hit_t = 1e30;
+
+    if (hit_box && t_far > t_near) {
+        if (show_box) {  // an edge is where two coordinates sit on a box face
+            const vec3 pe = eye + d * t_near;
+            int on_face = 0;
+            for (int k = 0; k < 3; ++k)
+                if (abs(pe[k]) < 0.9 || abs(pe[k] - dims[k]) < 0.9) ++on_face;
+            if (on_face >= 2) {
+                acc += 0.55 * vec3(0.55, 0.57, 0.62);
+                trans *= 0.45;
+            }
+        }
+
+        const float dt = (t_far - t_near) / float(n_steps);
+        // Fixed per-pixel start offset: in-phase rays drew "wood-grain"
+        // bands one step apart; dithered, they become fine grain.
+        const float jit = fract(sin(float(px.x) * 12.9898 + float(px.y) * 78.233) * 43758.5453);
+        float t = t_near + jit * dt;
+        float last_rho = 1.0;
+        for (int step = 0; step < n_steps; ++step) {
+            if (trans < 0.01) break;
+            vec3 p = eye + d * t;
+            const ivec3 ci = cell_of(p);
+            const ivec3 bi = ci / OCC_BLOCK;
+            bool solid = false;
+            if (occ[(bi.x * nb.y + bi.y) * nb.z + bi.z] == 1u) {
+                // Near geometry: re-walk this step finely from the previous
+                // sample so a surface is hit where it is and a 1-cell part
+                // cannot be stepped over.
+                const float t0 = max(t - dt, t_near);
+                const int nsub = max(1, int(ceil((t - t0) / SOLID_SUBSTEP)));
+                if (surface == SURFACE_SMOOTH) {
+                    // first crossing of the indicator's 1/2 level, refined by
+                    // a secant step between substeps
+                    float v0 = trilinear(1, eye + d * t0);
+                    float tprev = t0;
+                    for (int k = 1; k <= nsub; ++k) {
+                        const float tt = t0 + (t - t0) * float(k) / float(nsub);
+                        const float v1 = trilinear(1, eye + d * tt);
+                        if (v1 >= 0.5) {
+                            const float f = v1 - v0 > 1e-6 ? clamp((0.5 - v0) / (v1 - v0), 0.0, 1.0) : 0.0;
+                            t = tprev + (tt - tprev) * f;
+                            p = eye + d * t;
+                            solid = true;
+                            break;
+                        }
+                        v0 = v1;
+                        tprev = tt;
+                    }
+                } else {
+                    for (int k = 1; k <= nsub; ++k) {
+                        const float tt = t0 + (t - t0) * float(k) / float(nsub);
+                        const vec3 pp = eye + d * tt;
+                        if (is_solid_cell(cell_of(pp))) {
+                            solid = true;
+                            t = tt;
+                            p = pp;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (solid) {
+                if (surface != SURFACE_HIDDEN) {
+                    const vec3 nrm = surface == SURFACE_SMOOTH ? smooth_normal(p) : voxel_normal(p);
+                    const float ndl = max(dot(nrm, light), 0.0);
+                    // a touch of view-facing rim so silhouettes survive
+                    const float rim = 0.25 * (1.0 - abs(dot(nrm, d)));
+                    const float diff = 0.38 + 0.55 * ndl + rim;
+                    // The model (OBSTACLE) is painted; a floor / belt / wall
+                    // is plain darker grey, so it does not read as part of it.
+                    const uint hit_flag = flags[cell_index(cell_of(p + 0.5 * d).x, cell_of(p + 0.5 * d).y,
+                                                           cell_of(p + 0.5 * d).z, N)];
+                    const bool model_cell = hit_flag == 1u || hit_flag == FLUID;
+                    vec3 col = (model_cell ? vec3(0.80, 0.81, 0.84) : vec3(0.36, 0.37, 0.41)) * diff;
+                    if (paint_cp && model_cell) {
+                        // Pressure half a cell back along the ray over FLUID
+                        // cells only (the single last fluid cell striped every
+                        // voxel staircase).
+                        const float rho_s = fluid_trilinear_rho(p - d * (0.5 + 0.5 * dt), last_rho);
+                        const float cp = (rho_s - rho_ref) * pscale * inv_q;
+                        col = coolwarm(0.5 + 0.5 * clamp(cp, -1.0, 1.0)) * diff;
+                    }
+                    acc += trans * col;
+                    trans = 0.0;
+                    hit_t = t;
+                    break;
+                }
+            } else {
+                last_rho = macro[cell_index(ci.x, ci.y, ci.z, N)].w;
+
+                if (slice_axis >= 0) {  // an opaque cut
+                    if (abs(p[slice_axis] - slice_pos * dims[slice_axis]) < 0.6 * dt + 0.35) {
+                        acc += trans * fieldcolor(trilinear(0, p), cmode);
+                        trans = 0.0;
+                        hit_t = t;
+                        break;
+                    }
+                }
+
+                float dens = 0.0;
+                vec3 col = vec3(0.0);
+
+                if (show_q) {  // vortex cores: translucent shells
+                    const float qv = trilinear(3, p);
+                    if (qv > q_thresh) {
+                        const float shell =
+                            clamp((qv - q_thresh) / max(3.0 * q_thresh, 1e-20), 0.0, 1.0);
+                        const float w = 3.0 * (0.35 + 0.65 * shell);
+                        dens += w;
+                        col += w * qcoremap(shell);
+                    }
+                }
+
+                if (show_dye) {  // concentration -> opacity; white or by speed
+                    const float cd = trilinear(4, p);
+                    if (cd > 0.002) {
+                        const float w = dye_gain * min(cd, 1.2);
+                        const vec3 dcol =
+                            dye_by_speed ? dyemap(trilinear(5, p) / (DYE_SPEED_SPAN * max(u_ref, 1e-9)))
+                                         : vec3(0.90, 0.92, 0.96);
+                        dens += w;
+                        col += w * dcol;
+                    }
+                }
+
+                if (show_haze) {
+                    const float sv = trilinear(0, p);
+                    // schlieren / Mach: magnitude above the floor only
+                    const float dev = cmode >= CMODE_GREY ? sv - haze_floor : abs(sv) - haze_floor;
+                    if (dev > 0.0) {
+                        const float hd = haze_gain * min(dev, 3.0);
+                        dens += hd;
+                        col += hd * fieldcolor(sv, cmode);
+                    }
+                }
+
+                if (dens > 1e-6) {  // density-weighted colour
+                    const float alpha = 1.0 - exp(-dens * dt * 0.08);
+                    acc += trans * alpha * (col / dens);
+                    trans *= 1.0 - alpha;
+                }
+            }
+            t += dt;
+        }
+    }
+
+    image[px.y * W + px.x] = packUnorm4x8(vec4(acc + trans * BACKGROUND, 1.0));
+    depth[px.y * W + px.x] = hit_t;
+}

@@ -1,0 +1,44 @@
+#version 450
+// Pressure force on the MODEL (OBSTACLE cells only: a floor WALL is solid
+// too, and its pressure once counted as the car's "lift" -- Cl -124): per
+// fluid/solid face, the wall pressure times the face's area vector (the
+// staircase's projected areas sum to the body's exactly). Wall pressure =
+// the image ghost's value interpolated to the true wall where the face uses
+// it (the ghost's own pressure lies beyond the wall and gave a NACA 0012 a
+// thrust), else the star pressure of the mirror Riemann problem. Per-
+// workgroup partial sums in a fixed order; summed on the host in double.
+// THEORY 8.8.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "euler_common.glsl"
+#include "euler_buffers.glsl"
+#include "euler_flux.glsl"
+
+shared vec3 s_f[256];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint c = linear_group() * 256u + lid;
+    vec3 f = vec3(0.0);
+    if (c < uint(N().x * N().y * N().z) && flags[c] == FLUID) {
+        const ivec3 p = coords(c);
+        const S w = w_at(p);
+        for (int ax = 0; ax < 3; ++ax) {
+            const ivec3 e = e3(ax);
+            for (int sgn = 0; sgn < 2; ++sgn) {
+                const ivec3 cs = sgn == 0 ? p + e : p - e;
+                if (!model_cell(cs)) continue;
+                const float pw =
+                    image_used(p, cs) ? gpw[cidx(cs)] : hllc(w, mirror(w, ax), ax).v[1 + ax];
+                f += (sgn == 0 ? pw : -pw) * vec3(e);
+            }
+        }
+    }
+    s_f[lid] = f;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) s_f[lid] += s_f[lid + s];
+        barrier();
+    }
+    if (lid == 0u) partials[linear_group()] = vec4(s_f[0], 0.0);
+}

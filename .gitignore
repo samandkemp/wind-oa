@@ -1,0 +1,44 @@
+# Build trees (CMake presets put everything under build/)
+/build/
+/build-vl/
+/out/
+
+# Working notes -- kept locally, not part of the public repo
+/docs/PLAN.md
+/docs/PROGRESS.md
+/docs/QUESTIONS.md
+/docs/TRANSITION.md
+
+# Settled-flow cache (app; safe to delete)
+/cache/
+
+# Run outputs (headless runs regenerate these; do not commit them)
+/runs/
+*.log
+*.csv
+
+# Screenshots from the app / headless rig
+*.png
+# ...but images deliberately committed for the docs/README are kept
+!docs/images/*.png
+
+# Imported STLs never ship -- only the procedural catalogue does
+*.stl
+
+# Editor / OS noise
+.vs/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.VSCodeCounter/
+
+# vulkaninfo / Vulkan-Profiles device dumps (machine-specific, ~400 KB)
+VP_VULKANINFO_*.json
+
+# Dear ImGui window layout (per user)
+*imgui.ini
+
+# App screenshots (P key)
+/screenshots/

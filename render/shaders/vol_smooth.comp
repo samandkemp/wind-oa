@@ -1,0 +1,51 @@
+#version 450
+// 3x3x3 box filter of the velocity over FLUID cells only (solid -> 0), the
+// input of the Q-criterion: at sandbox Re the flow is under-resolved, and
+// 1-cell velocity wiggles have huge gradients that raw Q flags as vortices
+// everywhere.
+//
+// Separable: the masked mean is (box3 of u m) / (box3 of m), m = 1 for
+// fluid, and a 3x3x3 box is three 3-tap boxes -- 9 reads per cell instead
+// of 27 (only the summation order differs from the direct form: a visual).
+//   P.dims.w = 0: x pass from macro + flags -> tmp_a = (sum u m, sum m)
+//            = 1: y pass tmp_a -> tmp_b
+//            = 2: z pass tmp_b -> vsmooth = u / count (fluid), 0 (solid)
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "vol_common.glsl"
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, pass
+} P;
+
+layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 1) readonly buffer Macro { vec4 macro[]; };
+layout(std430, binding = 2) buffer Smooth { vec4 vsmooth[]; };
+layout(std430, binding = 3) buffer TmpA { vec4 tmp_a[]; };
+layout(std430, binding = 4) buffer TmpB { vec4 tmp_b[]; };
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= uint(n.x * n.y * n.z)) return;
+    const int pass = P.dims.w;
+    const ivec3 p = cell_coords(c, n);
+    ivec3 o = ivec3(0);
+    o[pass] = 1;
+    vec4 acc = vec4(0.0);
+    for (int k = -1; k <= 1; ++k) {
+        const ivec3 q = p + k * o;
+        if (q[pass] < 0 || q[pass] >= n[pass]) continue;
+        const uint j = cell_index(q.x, q.y, q.z, n);
+        if (pass == 0) {
+            if (flags[j] == FLUID) acc += vec4(macro[j].xyz, 1.0);
+        } else if (pass == 1) {
+            acc += tmp_a[j];
+        } else {
+            acc += tmp_b[j];
+        }
+    }
+    if (pass == 0) tmp_a[c] = acc;
+    else if (pass == 1) tmp_b[c] = acc;
+    else vsmooth[c] = flags[c] == FLUID ? vec4(acc.xyz / max(acc.w, 1.0), 0.0) : vec4(0.0);
+}

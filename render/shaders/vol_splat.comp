@@ -1,0 +1,76 @@
+#version 450
+// Depth-tested splats over the marched image: smoke particles as soft
+// discs, and line segments (streamlines, the smoke-wand outline) stepped
+// in 3-D at ~1 sample per pixel so depth interpolates correctly. Each is
+// hidden where the march hit the model or the slice nearer to the eye.
+//
+// Two items landing on one pixel race (read-modify-write, last writer
+// wins): the particles carry no depth ordering among themselves.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "vol_common.glsl"
+
+layout(push_constant) uniform Params {
+    vec4 eye;    // xyz, tan(fov / 2)
+    vec4 fwd;    // xyz, aspect
+    vec4 right;  // xyz, -
+    vec4 up;     // xyz, -
+    ivec4 img;   // width, height, count, mode (0 points, 1 segments)
+    vec4 misc;   // radius (cells, points), alpha, -, -
+} P;
+
+layout(std430, binding = 0) coherent buffer Image { uint image[]; };
+layout(std430, binding = 1) readonly buffer Depth { float depth[]; };
+layout(std430, binding = 2) readonly buffer Verts { vec4 verts[]; };   // points / pairs
+layout(std430, binding = 3) readonly buffer Colours { vec4 colours[]; };  // per point / segment
+
+// Lattice point -> (pixel x, pixel y from the top, view depth, ray distance).
+// The ray distance is exactly the march's t for that pixel.
+vec4 project(vec3 p) {
+    const vec3 rel = p - P.eye.xyz;
+    const float zc = dot(rel, P.fwd.xyz);
+    if (zc <= 1e-3) return vec4(-1e9, -1e9, zc, 0.0);
+    const float sx = (dot(rel, P.right.xyz) / (zc * P.eye.w * P.fwd.w) + 1.0) * 0.5 * float(P.img.x);
+    const float sy = (1.0 - dot(rel, P.up.xyz) / (zc * P.eye.w)) * 0.5 * float(P.img.y);
+    return vec4(sx, sy, zc, length(rel));
+}
+
+void blend(int ix, int iy, float dist, vec3 c, float a) {
+    if (ix < 0 || iy < 0 || ix >= P.img.x || iy >= P.img.y) return;
+    const int k = iy * P.img.x + ix;
+    if (dist >= depth[k]) return;
+    const vec4 old = unpackUnorm4x8(image[k]);
+    image[k] = packUnorm4x8(vec4(mix(old.rgb, c, a), 1.0));
+}
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= P.img.z) return;
+    const float alpha = P.misc.y;
+    if (P.img.w == 0) {
+        const vec4 s = project(verts[i].xyz);
+        if (s.z <= 0.5) return;
+        // world radius -> pixels, kept >= ~1 px so distant smoke does not
+        // vanish, capped so near smoke does not become blobs
+        const float r = clamp(P.misc.x / (s.z * P.eye.w) * 0.5 * float(P.img.y), 0.7, 6.0);
+        const int ri = int(ceil(r));
+        const int cx = int(floor(s.x)), cy = int(floor(s.y));
+        const vec3 c = colours[i].rgb;
+        for (int oy = -ri; oy <= ri; ++oy)
+            for (int ox = -ri; ox <= ri; ++ox) {
+                const float ddx = float(cx + ox) + 0.5 - s.x, ddy = float(cy + oy) + 0.5 - s.y;
+                const float cov = clamp(r + 0.5 - sqrt(ddx * ddx + ddy * ddy), 0.0, 1.0);
+                if (cov > 0.0) blend(cx + ox, cy + oy, s.w, c, alpha * cov);
+            }
+    } else {
+        const vec3 a3 = verts[2 * i].xyz, b3 = verts[2 * i + 1].xyz;
+        const vec4 a = project(a3), b = project(b3);
+        if (a.z <= 0.5 || b.z <= 0.5) return;
+        const int n = int(clamp(max(abs(b.x - a.x), abs(b.y - a.y)), 1.0, 256.0));
+        const vec4 c = colours[i];
+        for (int j = 0; j <= n; ++j) {
+            const vec4 s = project(mix(a3, b3, float(j) / float(n)));
+            blend(int(floor(s.x)), int(floor(s.y)), s.w, c.rgb, alpha * c.a);
+        }
+    }
+}

@@ -1,0 +1,73 @@
+#version 450
+// Streamlines: instantaneous field lines integrated with RK2 at a fixed
+// arc-length step from a seed grid in the y-z plane at x = seed_x. One
+// thread per line writes its segments as
+// vertex pairs plus a per-segment colour by speed (coolwarm about 1.3 U).
+// A stalled or exited line collapses the rest of its segments to a point.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "vol_common.glsl"
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, n_seeds (a square number)
+    vec4 misc;   // seed_x, u_ref, step (cells), -
+    ivec4 n;     // steps per line, -, -, -
+} P;
+
+layout(std430, binding = 0) readonly buffer Macro { vec4 macro[]; };
+layout(std430, binding = 1) writeonly buffer Verts { vec4 verts[]; };
+layout(std430, binding = 2) writeonly buffer Colours { vec4 colours[]; };
+
+ivec3 N;
+
+vec3 sample_u(vec3 p) {
+    const vec3 g = clamp(p - 0.5, vec3(0.0), vec3(N) - 1.001);
+    const ivec3 i0 = ivec3(g);
+    const vec3 f = g - vec3(i0);
+    vec3 acc = vec3(0.0);
+    for (int dx = 0; dx < 2; ++dx)
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dz = 0; dz < 2; ++dz) {
+                const float w = (dx == 1 ? f.x : 1.0 - f.x) * (dy == 1 ? f.y : 1.0 - f.y) *
+                                (dz == 1 ? f.z : 1.0 - f.z);
+                acc += w * macro[cell_index(i0.x + dx, i0.y + dy, i0.z + dz, N)].xyz;
+            }
+    return acc;
+}
+
+void main() {
+    const int line = int(gl_GlobalInvocationID.x);
+    const int n_seeds = P.dims.w;
+    if (line >= n_seeds) return;
+    N = P.dims.xyz;
+    const int side = int(round(sqrt(float(n_seeds))));
+    const int segs = P.n.x - 1;
+    const float h = P.misc.z;
+    vec3 p = vec3(P.misc.x, (float(line / side) + 0.5) / float(side) * float(N.y),
+                  (float(line % side) + 0.5) / float(side) * float(N.z));
+    const int base = line * segs;
+    bool stopped = false;
+    for (int k = 0; k < segs; ++k) {
+        if (stopped) {
+            verts[2 * (base + k)] = vec4(p, 1.0);
+            verts[2 * (base + k) + 1] = vec4(p, 1.0);
+            colours[base + k] = vec4(0.0);
+            continue;
+        }
+        const vec3 u1 = sample_u(p);
+        const float u1n = length(u1);
+        vec3 q = p;
+        if (u1n > 1e-9) {
+            const vec3 u2 = sample_u(p + 0.5 * h * u1 / u1n);
+            const float u2n = length(u2);
+            if (u2n > 1e-9) q = p + h * u2 / u2n;
+        }
+        verts[2 * (base + k)] = vec4(p, 1.0);
+        verts[2 * (base + k) + 1] = vec4(q, 1.0);
+        const float t = clamp(u1n / max(1.3 * P.misc.y, 1e-9), 0.0, 1.0);
+        const vec3 col = t <= 0.5 ? vec3(2.0 * t, 2.0 * t, 1.0) : vec3(1.0, 2.0 * (1.0 - t), 2.0 * (1.0 - t));
+        colours[base + k] = vec4(col, 1.0);
+        if (q.x > float(N.x) - 2.0 || length(q - p) < 1e-6) stopped = true;
+        p = q;
+    }
+}

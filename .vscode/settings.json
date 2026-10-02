@@ -1,0 +1,6 @@
+{
+  "cmake.useCMakePresets": "always",
+  "editor.formatOnSave": true,
+  "[cpp]": { "editor.defaultFormatter": "ms-vscode.cpptools" },
+  "C_Cpp.formatting": "clangFormat"
+}

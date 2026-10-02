@@ -1,0 +1,32 @@
+#version 450
+// Periodic Gaussian filter along one axis of a vec4 field [s][y][z] -- the
+// inlet-turbulence patch generator. Filtering white noise in Fourier space
+// with exp(-2 (pi L)^2 k^2) is a periodic convolution with a Gaussian of
+// sigma = L cells, done here separably (no FFT library; THEORY 7.1).
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // span, ny, nz, axis
+    ivec4 r;     // radius (taps = 2 r + 1), -, -, -
+} P;
+
+layout(std430, binding = 0) readonly buffer Src { vec4 src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { vec4 dst[]; };
+layout(std430, binding = 2) readonly buffer Wt { float wt[]; };
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint c = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u + gl_GlobalInvocationID.x;
+    if (c >= uint(n.x * n.y * n.z)) return;
+    const int ci = int(c);
+    ivec3 p = ivec3(ci / (n.y * n.z), (ci / n.z) % n.y, ci % n.z);
+    const int ax = P.dims.w;
+    const int R = P.r.x;
+    vec4 acc = vec4(0.0);
+    for (int k = -R; k <= R; ++k) {
+        ivec3 q = p;
+        q[ax] = ((p[ax] + k) % n[ax] + n[ax]) % n[ax];
+        acc += wt[k + R] * src[(q.x * n.y + q.y) * n.z + q.z];
+    }
+    dst[c] = acc;
+}

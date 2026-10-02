@@ -1,0 +1,77 @@
+#version 450
+// Q-criterion from central differences of the smoothed velocity:
+//   Q = (|Omega|^2 - |S|^2) / 2     (> 0 where rotation beats strain)
+// Zeroed in and next to solid cells (the 3x3x3 neighbourhood): at a
+// bounce-back wall the gradient is the voxel staircase, not vorticity.
+// Also writes per-workgroup partial sums of Q^2 and counts over positive
+// Q, sampled on every STRIDE-th cell, for the adaptive RMS threshold
+// (reduced deterministically by vol_qstat).
+// THEORY 10.3.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "vol_common.glsl"
+
+const int STRIDE = 4;
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, (unused)
+} P;
+
+layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 1) readonly buffer Smooth { vec4 vsmooth[]; };
+layout(std430, binding = 2) writeonly buffer Q { float qf[]; };
+layout(std430, binding = 3) writeonly buffer Partials { vec2 partials[]; };  // sum q^2, n
+
+shared vec2 s_acc[256];
+
+vec3 vs(ivec3 p, ivec3 n) { return vsmooth[cell_index(p.x, p.y, p.z, n)].xyz; }
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint lid = gl_LocalInvocationID.x;
+    const uint c = linear_group() * 256u + lid;
+    const bool in_grid = c < uint(n.x * n.y * n.z);  // no early return: barrier() below
+    float q = 0.0;
+    vec2 stat = vec2(0.0);
+    if (in_grid) {
+        const ivec3 p = cell_coords(c, n);
+        const bool inner = all(greaterThanEqual(p, ivec3(2))) && all(lessThan(p, n - 2));
+        bool solid_near = !inner;
+        if (inner) {
+            for (int dx = -1; dx <= 1 && !solid_near; ++dx)
+                for (int dy = -1; dy <= 1 && !solid_near; ++dy)
+                    for (int dz = -1; dz <= 1; ++dz)
+                        if (flags[cell_index(p.x + dx, p.y + dy, p.z + dz, n)] != FLUID) {
+                            solid_near = true;
+                            break;
+                        }
+        }
+        if (!solid_near) {
+            const vec3 dudx = 0.5 * (vs(p + ivec3(1, 0, 0), n) - vs(p - ivec3(1, 0, 0), n));
+            const vec3 dudy = 0.5 * (vs(p + ivec3(0, 1, 0), n) - vs(p - ivec3(0, 1, 0), n));
+            const vec3 dudz = 0.5 * (vs(p + ivec3(0, 0, 1), n) - vs(p - ivec3(0, 0, 1), n));
+            const float sxx = dudx.x, syy = dudy.y, szz = dudz.z;
+            const float sxy = 0.5 * (dudy.x + dudx.y);
+            const float sxz = 0.5 * (dudz.x + dudx.z);
+            const float syz = 0.5 * (dudz.y + dudy.z);
+            const float oxy = 0.5 * (dudy.x - dudx.y);
+            const float oxz = 0.5 * (dudz.x - dudx.z);
+            const float oyz = 0.5 * (dudz.y - dudy.z);
+            const float s2 = sxx * sxx + syy * syy + szz * szz +
+                             2.0 * (sxy * sxy + sxz * sxz + syz * syz);
+            const float o2 = 2.0 * (oxy * oxy + oxz * oxz + oyz * oyz);
+            q = 0.5 * (o2 - s2);
+            if (q > 0.0 && p.x % STRIDE == 0 && p.y % STRIDE == 0 && p.z % STRIDE == 0)
+                stat = vec2(q * q, 1.0);
+        }
+        qf[c] = q;
+    }
+    // fixed-order tree: deterministic partials
+    s_acc[lid] = stat;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) s_acc[lid] += s_acc[lid + s];
+        barrier();
+    }
+    if (lid == 0u) partials[linear_group()] = s_acc[0];
+}

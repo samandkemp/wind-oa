@@ -1,0 +1,338 @@
+#version 450
+// D3Q19 fused stream + collide, pull scheme. Per FLUID cell:
+//   1. Pull f_i from the upwind neighbour x - e_i with boundary rules
+//      (inlet / pressure outlet / periodic in x; free-slip or periodic in
+//      y, z; half-way or interpolated bounce-back at solids; Ladd moving-
+//      wall terms for LID and spinning OBSTACLE cells; momentum-exchange
+//      force + torque on OBSTACLE links)
+//   2. moments  3. Smagorinsky eddy viscosity  4. BGK or regularised (+RR)
+//      collision with Guo forcing  4b. outlet sponge  5. write rho, u
+// Specification: THEORY 2 (collision), 3 (boundaries), 4.1 (forces).
+// Compile-time switches are specialisation constants: the driver folds
+// them, so a disabled feature is absent from the compiled kernel (the
+// identity discipline).
+//
+// rho / u live in a double-buffered macro field. The pressure outlet reads
+// the previous step's velocity at the last interior plane; with a single
+// buffer that read would race with the same kernel's writes, so here it is
+// exactly the previous step.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = 0) const int MODE_X = 0;        // 0 inlet/outlet, 1 periodic
+layout(constant_id = 1) const int MODE_Y = 0;        // 0 free-slip, 1 periodic
+layout(constant_id = 2) const int MODE_Z = 0;
+layout(constant_id = 3) const bool REGULARISED = false;
+layout(constant_id = 4) const bool RECURSIVE = false;
+layout(constant_id = 5) const bool USE_IBB = false;
+layout(constant_id = 6) const bool MOVING = false;
+layout(constant_id = 7) const int SPONGE = 0;        // outlet sponge width, cells
+layout(constant_id = 8) const int SPONGE_TARGET = 0; // 0 rho only, 1 full freestream
+// P4 performance switches. Both are exact identities (tools/lbm_equiv checks
+// every bit against the switches off):
+//   LAZY_MACRO     write rho / u only on the steps someone reads them
+//                  (P.aux.y = 1: the last step of a submit, or every step
+//                  when a per-step hook such as the dye needs them) -- plus
+//                  always the plane x = nx - 2, which the next step's
+//                  pressure outlet reads. Saves 16 of ~176 bytes per cell.
+//   SPARSE_FORCES  skip the per-workgroup force tree (8 barriers) where no
+//                  thread touched a model link -- ~99 % of workgroups; they
+//                  write exact zeros.
+layout(constant_id = 9) const bool LAZY_MACRO = false;
+layout(constant_id = 10) const bool SPARSE_FORCES = false;
+// f16 storage: f is stored as the binary16 of (f_i - w_i) -- the deviation
+// from rest, ~100x smaller than f, so f16 keeps its precision where the
+// physics is (the flow cache's scheme). Arithmetic stays f32. Halves the
+// distribution traffic; an approximation, not an identity.
+layout(constant_id = 11) const bool F16 = false;
+
+#include "lattice.glsl"
+#include "lbm_params.glsl"
+
+layout(std430, binding = 0) readonly buffer FSrc { float f_src[]; };
+layout(std430, binding = 1) writeonly buffer FDst { float f_dst[]; };
+// the same two buffers viewed as f16 (descriptor aliasing; F16 picks one)
+layout(std430, binding = 0) readonly buffer FSrc16 { float16_t f_src16[]; };
+layout(std430, binding = 1) writeonly buffer FDst16 { float16_t f_dst16[]; };
+layout(std430, binding = 2) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 3) readonly buffer MacroPrev { vec4 macro_prev[]; };  // u.xyz, rho
+layout(std430, binding = 4) writeonly buffer MacroOut { vec4 macro_out[]; };
+layout(std430, binding = 5) readonly buffer LinkQ { uint link_q[]; };  // packed u8, [Q][cell]
+layout(std430, binding = 6) readonly buffer UWall { vec4 u_wall[]; };
+layout(std430, binding = 7) writeonly buffer Partials { vec4 partials[]; };  // per group: F, T
+
+shared vec4 s_force[256];
+shared vec4 s_torque[256];
+shared uint s_any_link;
+bool touched_link = false;  // this thread saw an OBSTACLE link (forces nonzero)
+
+// f_i at flat index idx = i N + cell, in either storage
+float ld(int i, uint idx) { return F16 ? float(f_src16[idx]) + W[i] : f_src[idx]; }
+void st(int i, uint idx, float v) {
+    if (F16) f_dst16[idx] = float16_t(v - W[i]);
+    else f_dst[idx] = v;
+}
+
+float link_fraction(uint idx) {
+    uint word = link_q[idx >> 2u];
+    return float((word >> ((idx & 3u) * 8u)) & 0xFFu) / 255.0;
+}
+
+void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
+    const int nx = n.x, ny = n.y, nz = n.z;
+    const uint N = uint(nx * ny * nz);
+    const ivec3 p = cell_coords(c, n);
+    const int x = p.x, y = p.y, z = p.z;
+    const vec3 u_in = vec3(P.flow.x, 0.0, 0.0);
+    const float tau0 = P.flow.y;
+    const float smag_pref = P.flow.z;
+    const vec3 g = P.g.xyz;
+
+    // Hard Dirichlet inlet plane, THEORY 3.1 (a soft equilibrium-pull inlet alone lets
+    // the tunnel settle ~15 % below the commanded speed).
+    const bool write_macro = !LAZY_MACRO || P.aux.y != 0.0 || x == nx - 2;
+    if (MODE_X == 0 && x == 0) {
+        for (int i = 0; i < Q; ++i) st(i, uint(i) * N + c, feq(i, 1.0, u_in));
+        if (write_macro) macro_out[c] = vec4(u_in, 1.0);
+        return;
+    }
+
+    // ---- 1. Pull with boundary handling ----------------------------------
+    float fl[19];
+    for (int i = 0; i < Q; ++i) {
+        int ii = i;
+        int sx = x - E[i].x;
+        int sy = y - E[i].y;
+        int sz = z - E[i].z;
+        bool handled = false;
+        float value = 0.0;
+
+        // x: inlet / pressure outlet / periodic
+        if (sx < 0 || sx >= nx) {
+            if (MODE_X == 1) {
+                sx = (sx + nx) % nx;
+            } else {
+                if (sx < 0) {
+                    value = feq(ii, 1.0, u_in);
+                } else {
+                    // Pressure outlet (THEORY 3.2): equilibrium at rho = 1 with the
+                    // previous step's velocity at the last interior plane.
+                    int syc = clamp(sy, 0, ny - 1);
+                    int szc = clamp(sz, 0, nz - 1);
+                    vec3 u_out = macro_prev[cell_index(nx - 2, syc, szc, n)].xyz;
+                    value = feq(ii, 1.0, u_out);
+                }
+                handled = true;
+            }
+        }
+        // y: free-slip specular / periodic (THEORY 3.4)
+        if (!handled && (sy < 0 || sy >= ny)) {
+            if (MODE_Y == 1) {
+                sy = (sy + ny) % ny;
+            } else {
+                ii = SPEC_Y[ii];
+                sy = y - E[ii].y;
+            }
+        }
+        // z: free-slip specular / periodic
+        if (!handled && (sz < 0 || sz >= nz)) {
+            if (MODE_Z == 1) {
+                sz = (sz + nz) % nz;
+            } else {
+                ii = SPEC_Z[ii];
+                sz = z - E[ii].z;
+            }
+        }
+
+        if (!handled) {
+            const uint sc = cell_index(sx, sy, sz, n);
+            const uint sflag = flags[sc];
+            if (sflag == FLUID) {
+                value = ld(ii, uint(ii) * N + sc);
+            } else {
+                const int io = OPP[ii];  // direction into the wall
+                const float f_towards = ld(io, uint(io) * N + c);
+                value = f_towards;        // half-way bounce-back (THEORY 3.5)
+                if (sflag == LID) {
+                    value += 6.0 * W[ii] * dot(vec3(E[ii]), P.u_lid.xyz);
+                } else if (sflag == OBSTACLE) {
+                    if (USE_IBB) {
+                        // Bouzidi linear interpolated bounce-back (THEORY 3.6)
+                        const float qv = link_fraction(uint(io) * N + c);
+                        const int ax = x + E[ii].x;
+                        const int ay = y + E[ii].y;
+                        const int az = z + E[ii].z;
+                        bool away_ok = ax >= 0 && ax < nx && ay >= 0 && ay < ny && az >= 0 &&
+                                       az < nz;
+                        uint ac = 0u;
+                        if (away_ok) {
+                            ac = cell_index(ax, ay, az, n);
+                            away_ok = flags[ac] == FLUID;
+                        }
+                        if (qv < 0.5 && away_ok) {
+                            value = 2.0 * qv * f_towards +
+                                    (1.0 - 2.0 * qv) * ld(io, uint(io) * N + ac);
+                        } else if (qv >= 0.5) {
+                            value = f_towards / (2.0 * qv) +
+                                    (2.0 * qv - 1.0) / (2.0 * qv) * ld(ii, uint(ii) * N + c);
+                        }
+                        // else: thin-gap fallback = half-way
+                    }
+                    if (MOVING) {
+                        value += 6.0 * W[ii] * dot(vec3(E[ii]), u_wall[sc].xyz);
+                    }
+                    // Momentum exchange relative to ambient (Mei et al.; THEORY 4.1):
+                    // e_io (f_out + f_in - 2 w_io) per link.
+                    const vec3 link_f = (f_towards + value - 2.0 * W[io]) * vec3(E[io]);
+                    touched_link = true;
+                    force += link_f;
+                    const vec3 mid = vec3(float(x + sx) * 0.5 + 0.5, float(y + sy) * 0.5 + 0.5,
+                                          float(z + sz) * 0.5 + 0.5) -
+                                     P.torque_ref.xyz;
+                    torque += cross(mid, link_f);
+                }
+            }
+        }
+        fl[i] = value;
+    }
+
+    // ---- 2. Moments (THEORY 2.1) -------------------------------------------
+    float rho = 0.0;
+    vec3 mom = vec3(0.0);
+    for (int i = 0; i < Q; ++i) {
+        rho += fl[i];
+        mom += fl[i] * vec3(E[i]);
+    }
+    const vec3 u = (mom + 0.5 * g) / rho;  // Guo: half the force impulse
+
+    // ---- 3. LES: eddy viscosity from the non-equilibrium flux (THEORY 2.5) --
+    float pxx = 0.0, pyy = 0.0, pzz = 0.0, pxy = 0.0, pxz = 0.0, pyz = 0.0;
+    for (int i = 0; i < Q; ++i) {
+        const float fneq = fl[i] - feq(i, rho, u);
+        const vec3 e = vec3(E[i]);
+        pxx += fneq * e.x * e.x;
+        pyy += fneq * e.y * e.y;
+        pzz += fneq * e.z * e.z;
+        pxy += fneq * e.x * e.y;
+        pxz += fneq * e.x * e.z;
+        pyz += fneq * e.y * e.z;
+    }
+    // Remove the Guo force dipole so LES and the regularised rebuild see the
+    // viscous part only.
+    pxx += u.x * g.x;
+    pyy += u.y * g.y;
+    pzz += u.z * g.z;
+    pxy += 0.5 * (u.x * g.y + u.y * g.x);
+    pxz += 0.5 * (u.x * g.z + u.z * g.x);
+    pyz += 0.5 * (u.y * g.z + u.z * g.y);
+
+    const float q_norm =
+        sqrt(pxx * pxx + pyy * pyy + pzz * pzz + 2.0 * (pxy * pxy + pxz * pxz + pyz * pyz));
+    const float tau_t = 0.5 * (sqrt(tau0 * tau0 + smag_pref * q_norm / rho) - tau0);
+    const float omega = 1.0 / (tau0 + tau_t);
+
+    // Recursive-regularised 3rd-order coefficients, THEORY 2.4 (the six D3Q19-supported
+    // aab moments, Jacob-Malaspinas-Sagaut 2018).
+    float a3xxy = 0.0, a3yyx = 0.0, a3xxz = 0.0, a3zzx = 0.0, a3yyz = 0.0, a3zzy = 0.0;
+    if (RECURSIVE) {
+        a3xxy = 2.0 * u.x * pxy + u.y * pxx;
+        a3yyx = 2.0 * u.y * pxy + u.x * pyy;
+        a3xxz = 2.0 * u.x * pxz + u.z * pxx;
+        a3zzx = 2.0 * u.z * pxz + u.x * pzz;
+        a3yyz = 2.0 * u.y * pyz + u.z * pyy;
+        a3zzy = 2.0 * u.z * pyz + u.y * pzz;
+    }
+
+    // ---- 4. Collide (BGK THEORY 2.2, regularised 2.3) ------------------------
+    float fo[19];
+    for (int i = 0; i < Q; ++i) {
+        const float fe = feq(i, rho, u);
+        const vec3 ev = vec3(E[i]);
+        const float forcing = W[i] * (3.0 * dot(ev - u, g) + 9.0 * dot(ev, u) * dot(ev, g));
+        if (REGULARISED || RECURSIVE) {
+            // f_neq rebuilt from the clean Pi: w_i / (2 cs^4) (e e - cs^2 I) : Pi
+            const float q_pi = (ev.x * ev.x - CS2) * pxx + (ev.y * ev.y - CS2) * pyy +
+                               (ev.z * ev.z - CS2) * pzz +
+                               2.0 * (ev.x * ev.y * pxy + ev.x * ev.z * pxz + ev.y * ev.z * pyz);
+            float f_neq = W[i] * 4.5 * q_pi;
+            if (RECURSIVE) {
+                const float q3 = a3xxy * ev.y * (ev.x * ev.x - CS2) +
+                                 a3yyx * ev.x * (ev.y * ev.y - CS2) +
+                                 a3xxz * ev.z * (ev.x * ev.x - CS2) +
+                                 a3zzx * ev.x * (ev.z * ev.z - CS2) +
+                                 a3yyz * ev.z * (ev.y * ev.y - CS2) +
+                                 a3zzy * ev.y * (ev.z * ev.z - CS2);
+                f_neq += W[i] * 13.5 * q3;
+            }
+            // f_out = feq + (1 - omega) filter(m) + S/2 (not Guo's
+            // (1 - omega/2) S: that lost 46 % of Poiseuille at tau 0.52).
+            fo[i] = fe + (1.0 - omega) * f_neq + 0.5 * forcing;
+        } else {
+            fo[i] = fl[i] - omega * (fl[i] - fe) + (1.0 - 0.5 * omega) * forcing;
+        }
+    }
+
+    // ---- 4b. Outlet sponge (THEORY 3.3) ----------------------------------------
+    if (SPONGE > 0 && MODE_X == 0) {
+        const float d = float(nx - 1 - x);
+        if (d < float(SPONGE)) {
+            const float ramp = 1.0 - d / float(SPONGE);
+            const float sig = 0.35 * ramp * ramp;
+            const vec3 u_t = (SPONGE_TARGET == 1) ? u_in : u;
+            for (int i = 0; i < Q; ++i) fo[i] += sig * (feq(i, 1.0, u_t) - fo[i]);
+        }
+    }
+
+    for (int i = 0; i < Q; ++i) st(i, uint(i) * N + c, fo[i]);
+
+    // ---- 5. Macroscopic output ---------------------------------------------------
+    if (write_macro) macro_out[c] = vec4(u, rho);
+}
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint N = uint(n.x * n.y * n.z);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint c = linear_group() * 256u + lid;
+
+    vec3 force = vec3(0.0);
+    vec3 torque = vec3(0.0);
+    if (c < N && flags[c] == FLUID) process(c, n, force, torque);
+
+    // Deterministic per-workgroup force / torque partials (fixed-order tree;
+    // no float atomics). lbm_reduce.comp folds them into the step total.
+    if (SPARSE_FORCES) {
+        // Workgroup-uniform test (the value is read after a barrier by every
+        // thread, so the early exit keeps barrier() in uniform control flow).
+        if (lid == 0u) s_any_link = 0u;
+        barrier();
+        if (touched_link) atomicOr(s_any_link, 1u);
+        barrier();
+        if (s_any_link == 0u) {
+            if (lid == 0u) {
+                const uint gid = linear_group();
+                partials[2u * gid] = vec4(0.0);
+                partials[2u * gid + 1u] = vec4(0.0);
+            }
+            return;
+        }
+    }
+    s_force[lid] = vec4(force, 0.0);
+    s_torque[lid] = vec4(torque, 0.0);
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            s_force[lid] += s_force[lid + s];
+            s_torque[lid] += s_torque[lid + s];
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        const uint gid = linear_group();
+        partials[2u * gid] = s_force[0];
+        partials[2u * gid + 1u] = s_torque[0];
+    }
+}

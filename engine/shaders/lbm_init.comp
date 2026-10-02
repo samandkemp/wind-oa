@@ -1,0 +1,40 @@
+#version 450
+// Fill both distribution buffers and both macro buffers with the
+// equilibrium at (rho0, u). Every cell, solid or not: solids keep these
+// values forever (they are never written again).
+// F16: stored as binary16 of f - w_i (see lbm_step.comp).
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const bool F16 = false;
+#include "lattice.glsl"
+#include "lbm_params.glsl"
+
+layout(std430, binding = 0) writeonly buffer FA { float f_a[]; };
+layout(std430, binding = 1) writeonly buffer FB { float f_b[]; };
+layout(std430, binding = 0) writeonly buffer FA16 { float16_t f_a16[]; };
+layout(std430, binding = 1) writeonly buffer FB16 { float16_t f_b16[]; };
+layout(std430, binding = 2) writeonly buffer MA { vec4 macro_a[]; };
+layout(std430, binding = 3) writeonly buffer MB { vec4 macro_b[]; };
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint N = uint(n.x * n.y * n.z);
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= N) return;
+    const vec3 u = P.aux.xyz;
+    const float rho0 = P.aux.w;
+    for (int i = 0; i < Q; ++i) {
+        const float fe = feq(i, rho0, u);
+        if (F16) {
+            f_a16[uint(i) * N + c] = float16_t(fe - W[i]);
+            f_b16[uint(i) * N + c] = float16_t(fe - W[i]);
+        } else {
+            f_a[uint(i) * N + c] = fe;
+            f_b[uint(i) * N + c] = fe;
+        }
+    }
+    macro_a[c] = vec4(u, rho0);
+    macro_b[c] = vec4(u, rho0);
+}

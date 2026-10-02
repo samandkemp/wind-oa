@@ -1,0 +1,27 @@
+#version 450
+// Signed distance, pass 1: one thread per triangle, exact point-to-triangle
+// distance to every cell centre within `band` of the triangle's bounding
+// box, kept as the minimum in 1/4096-cell fixed point
+// (one atomicMin). Scattering from triangles handles big triangles that a
+// centroid binning would miss. THEORY 5.4.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "vox_common.glsl"
+
+void main() {
+    const int t = linear_id();
+    if (t >= V.dims.w) return;
+    const float band = V.fparam.x;
+    const vec3 a = tri_vertex(t, 0), b = tri_vertex(t, 1), c = tri_vertex(t, 2);
+    ivec3 lo, hi;
+    tri_cell_box(t, band, lo, hi);
+    for (int x = lo.x; x <= hi.x; ++x) {
+        for (int y = lo.y; y <= hi.y; ++y) {
+            for (int z = lo.z; z <= hi.z; ++z) {
+                const vec3 pc = vec3(x, y, z) + 0.5;
+                const float d = length(closest_on_tri(pc, a, b, c) - pc);
+                if (d < band) atomicMin(shell[cell_of(ivec3(x, y, z))], int(d * 4096.0));
+            }
+        }
+    }
+}

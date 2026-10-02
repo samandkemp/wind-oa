@@ -1,0 +1,41 @@
+#version 450
+// The CFL time step, on the device. P.aux.x = 0: per-workgroup max over
+// fluid cells of |u| + |v| + |w| + 3 c into partials[g].x; = 1: one group
+// reduces the partials (P.aux.y of them) and sets dt = min(cfl / wmax,
+// dt_cap), advancing the time by it (the step it is computed for then runs).
+// THEORY 8.4.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "euler_common.glsl"
+#include "euler_buffers.glsl"
+
+shared float s_max[256];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    float m = 1e-6;
+    if (P.aux.x < 0.5) {
+        const uint c = linear_group() * 256u + lid;
+        if (c < uint(N().x * N().y * N().z) && flags[c] == FLUID) {
+            const S w = prim(load_u(c));
+            m = abs(w.v.y) + abs(w.v.z) + abs(w.v.w) + 3.0 * sqrt(GAMMA * w.e / w.v.x);
+        }
+    } else {
+        for (uint i = lid; i < uint(P.aux.y); i += 256u) m = max(m, partials[i].x);
+    }
+    s_max[lid] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) s_max[lid] = max(s_max[lid], s_max[lid + s]);
+        barrier();
+    }
+    if (lid == 0u) {
+        if (P.aux.x < 0.5) {
+            partials[linear_group()].x = s_max[0];
+        } else {
+            const float dt = min(P.flow.z / s_max[0], P.flow.w);
+            dtbuf.x = dt;
+            dtbuf.y += dt;
+        }
+    }
+}

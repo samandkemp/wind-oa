@@ -1,0 +1,38 @@
+#version 450
+// Solid-derived fields, rebuilt when the geometry changes:
+//   solid_raw[c] = 1 for non-fluid cells, else 0 (the smooth surface's
+//                  indicator, blurred afterwards by vol_blur)
+//   occ[block]   = 1 where a block of OCC_BLOCK^3 cells, or any of its 26
+//                  neighbour blocks, holds a non-fluid cell (the march
+//                  re-walks finely only there). `occ` is zeroed first
+//                  (vkCmdFillBuffer); every writer stores the same 1, so
+//                  the races are benign.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "vol_common.glsl"
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, (unused)
+} P;
+
+layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 1) writeonly buffer Occ { uint occ[]; };
+layout(std430, binding = 2) writeonly buffer SolidRaw { float solid_raw[]; };
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= uint(n.x * n.y * n.z)) return;
+    const bool solid = flags[c] != FLUID;
+    solid_raw[c] = solid ? 1.0 : 0.0;
+    if (!solid) return;
+    const ivec3 nb = (n + OCC_BLOCK - 1) / OCC_BLOCK;
+    const ivec3 b = cell_coords(c, n) / OCC_BLOCK;
+    for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dz = -1; dz <= 1; ++dz) {
+                const ivec3 q = b + ivec3(dx, dy, dz);
+                if (all(greaterThanEqual(q, ivec3(0))) && all(lessThan(q, nb)))
+                    occ[(q.x * nb.y + q.y) * nb.z + q.z] = 1u;
+            }
+}

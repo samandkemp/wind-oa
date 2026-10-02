@@ -1,0 +1,13 @@
+#version 450
+// Initialisation: U = the freestream everywhere (an impulsive start). The
+// RK2 stages themselves are fused with the fluxes in euler_update.comp.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "euler_common.glsl"
+#include "euler_buffers.glsl"
+
+void main() {
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= uint(N().x * N().y * N().z)) return;
+    store_u(c, cons(freestream()));
+}

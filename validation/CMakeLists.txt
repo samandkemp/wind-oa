@@ -1,0 +1,43 @@
+# Validation gates (docs/VALIDATION.md): one executable per V case, each
+# checking its external reference. Registered with CTest by gate id; exit
+# non-zero on failure.
+#
+#   ctest --preset dev -L gate          every gate
+#   ctest --preset dev -R V3            one gate
+#   ctest --preset dev -L gate -LE long the quick ones (< ~1 min each)
+
+function(windoa_gate id source)
+    cmake_parse_arguments(G "LONG" "" "" ${ARGN})
+    add_executable(${id} ${source})
+    target_link_libraries(${id} PRIVATE windoa_engine)
+    add_test(NAME ${id} COMMAND ${id})
+    if(G_LONG)
+        set_tests_properties(${id} PROPERTIES LABELS "gate;long" TIMEOUT 3600)
+    else()
+        set_tests_properties(${id} PROPERTIES LABELS "gate" TIMEOUT 600)
+    endif()
+endfunction()
+
+windoa_gate(V1_poiseuille V1_poiseuille.cpp)
+windoa_gate(V2_mass V2_mass.cpp)
+windoa_gate(V3_cavity V3_cavity.cpp)
+windoa_gate(V4_regularised V4_regularised.cpp LONG)
+windoa_gate(V5_rr V5_rr.cpp)
+windoa_gate(V6_sphere V6_sphere.cpp LONG)
+windoa_gate(V7_cylinder V7_cylinder.cpp)
+windoa_gate(V8_magnus V8_magnus.cpp)
+windoa_gate(V9_ibb V9_ibb.cpp LONG)
+windoa_gate(V10_outlet V10_outlet.cpp LONG)
+windoa_gate(V11_stability V11_stability.cpp LONG)
+windoa_gate(V12_voxelise V12_voxelise.cpp)
+windoa_gate(V13_stl_sphere V13_stl_sphere.cpp)
+windoa_gate(V14_ahmed V14_ahmed.cpp LONG)
+windoa_gate(V15_ahmed_re V15_ahmed_re.cpp LONG)
+windoa_gate(V16_marching_cubes V16_marching_cubes.cpp)
+windoa_gate(V17_sod V17_sod.cpp)
+windoa_gate(V18_wedge V18_wedge.cpp)
+windoa_gate(V19_naca V19_naca.cpp LONG)
+windoa_gate(V20_dye V20_dye.cpp LONG)
+windoa_gate(V21_turbulence V21_turbulence.cpp LONG)
+windoa_gate(V22_convergence V22_convergence.cpp LONG)
+windoa_gate(V23_flow_cache V23_flow_cache.cpp LONG)

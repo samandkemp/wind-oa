@@ -1,0 +1,113 @@
+#version 450
+// Smoke streaklines: massless particles continuously emitted from a
+// rectangular rake upstream of the model -- continuous emission draws
+// streaklines, what tunnel smoke shows.
+//   mode 0 (advect): carry every particle through n_steps of flow with RK2
+//     midpoint sub-steps of up to 2 lattice steps; respawn it at the rake if
+//     it entered a solid, left the tunnel or aged out; colour by speed.
+//   mode 1 (reset): scatter particles downstream of the rake with random
+//     ages, so streaks exist from the first frame (a scatter point inside a
+//     solid restarts at the rake instead).
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "vol_common.glsl"
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, particle count
+    vec4 rake;   // x, cy, cz, (unused)
+    vec4 half_;  // half_y, half_z, u_ref, max_age
+    ivec4 misc;  // n_steps, n_side, seed, mode
+} P;
+
+layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 1) readonly buffer Macro { vec4 macro[]; };
+layout(std430, binding = 2) buffer Particles { vec4 part[]; };  // xyz, age
+layout(std430, binding = 3) writeonly buffer Colours { vec4 colours[]; };
+
+ivec3 N;
+
+// PCG hash -> [0, 1): a per-particle, per-frame random stream.
+uint pcg(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+uint rng_state;
+float rnd() {
+    rng_state = pcg(rng_state);
+    return float(rng_state) * (1.0 / 4294967296.0);
+}
+
+vec3 sample_u(vec3 p) {  // trilinear velocity, cell centres at i + 0.5
+    const vec3 g = clamp(p - 0.5, vec3(0.0), vec3(N) - 1.001);
+    const ivec3 i0 = ivec3(g);
+    const vec3 f = g - vec3(i0);
+    vec3 acc = vec3(0.0);
+    for (int dx = 0; dx < 2; ++dx)
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dz = 0; dz < 2; ++dz) {
+                const float w = (dx == 1 ? f.x : 1.0 - f.x) * (dy == 1 ? f.y : 1.0 - f.y) *
+                                (dz == 1 ? f.z : 1.0 - f.z);
+                acc += w * macro[cell_index(i0.x + dx, i0.y + dy, i0.z + dz, N)].xyz;
+            }
+    return acc;
+}
+
+bool in_fluid(vec3 p) {
+    if (any(lessThan(p, vec3(0.0))) || any(greaterThanEqual(p, vec3(N)))) return false;
+    const ivec3 c = ivec3(p);
+    return flags[cell_index(c.x, c.y, c.z, N)] == FLUID;
+}
+
+// Emission point for particle i on the n x n rake, jittered within its cell.
+vec3 emit_point(int i) {
+    const int n = P.misc.y;
+    const int stream = i % (n * n);
+    const float fy = (float(stream / n) / float(max(n - 1, 1)) - 0.5) * 2.0;
+    const float fz = (float(stream % n) / float(max(n - 1, 1)) - 0.5) * 2.0;
+    const float hy = P.half_.x, hz = P.half_.y;
+    return vec3(P.rake.x, P.rake.y + fy * hy + (rnd() - 0.5) * hy / float(max(n - 1, 1)),
+                P.rake.z + fz * hz + (rnd() - 0.5) * hz / float(max(n - 1, 1)));
+}
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= P.dims.w) return;
+    N = P.dims.xyz;
+    rng_state = pcg(uint(i) * 9781u + uint(P.misc.z) * 6271u + 1u);
+
+    if (P.misc.w == 1) {  // reset
+        vec3 start = emit_point(i);
+        start.x = P.rake.x + rnd() * (float(N.x) - P.rake.x - 4.0);
+        float age = rnd() * 4000.0;
+        if (!in_fluid(start)) {
+            start = emit_point(i);
+            age = 0.0;
+        }
+        part[i] = vec4(start, age);
+        colours[i] = vec4(0.35, 0.45, 0.75, 1.0);
+        return;
+    }
+
+    vec3 pos = part[i].xyz;
+    float age = part[i].w;
+    float remaining = float(P.misc.x);
+    bool hit = false;
+    while (remaining > 0.0 && !hit) {
+        const float dt = min(remaining, 2.0);
+        const vec3 v1 = sample_u(pos);
+        const vec3 v2 = sample_u(pos + 0.5 * dt * v1);
+        pos += dt * v2;
+        remaining -= dt;
+        if (!in_fluid(pos)) hit = true;
+    }
+    age += float(P.misc.x);
+    if (hit || pos.x > float(N.x) - 2.0 || pos.x < 1.0 || age > P.half_.w) {
+        pos = emit_point(i);
+        age = 0.0;
+    }
+    part[i] = vec4(pos, age);
+    // speed-tinted: slow = deep blue, fast = white
+    const float t = clamp(length(sample_u(pos)) / max(1.3 * P.half_.z, 1e-9), 0.0, 1.0);
+    colours[i] = vec4(0.35 + 0.65 * t, 0.45 + 0.55 * t, 0.75 + 0.25 * t, 1.0);
+}

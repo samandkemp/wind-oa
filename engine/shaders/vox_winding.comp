@@ -1,0 +1,68 @@
+#version 450
+// Nonzero-winding solid test along one axis (V.misc.x = 0, 1, 2): one
+// thread per grid column. Collect every triangle crossing of the column,
+// then for each cell centre sum the signed crossings beyond it; nonzero =
+// inside, and the cell gets one vote. Run for all three axes; 2 of 3 votes
+// make it solid (vox_votes.comp). Winding, not parity: unions of
+// overlapping closed parts stay solid where they overlap. THEORY 5.2.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "vox_common.glsl"
+
+float cross2(vec2 p, vec2 q) {
+    return p.x * q.y - p.y * q.x;
+}
+
+void main() {
+    const int axis = V.misc.x;
+    // (i, j) = the two axes spanning the column grid, in this order:
+    // x-cast (y, z), y-cast (x, z), z-cast (x, y).
+    const int ai = axis == 0 ? 1 : 0;
+    const int aj = axis == 2 ? 1 : 2;
+    const int ni = V.dims[ai];
+    const int nj = V.dims[aj];
+    const int nk = V.dims[axis];
+    const int col = linear_id();
+    if (col >= ni * nj) return;
+    const int ci = col / nj;
+    const int cj = col % nj;
+    const vec2 pc = vec2(float(ci) + 0.5, float(cj) + 0.5);
+
+    float hits[MAX_HITS];
+    int sgn[MAX_HITS];
+    int n_hits = 0;
+    for (int t = 0; t < V.dims.w && n_hits < MAX_HITS; ++t) {
+        const vec3 a3 = tri_vertex(t, 0), b3 = tri_vertex(t, 1), c3 = tri_vertex(t, 2);
+        const vec2 a = vec2(a3[ai], a3[aj]);
+        const vec2 b = vec2(b3[ai], b3[aj]);
+        const vec2 c = vec2(c3[ai], c3[aj]);
+        const float d = cross2(b - a, c - a);
+        if (abs(d) > 1e-12) {
+            const float u = cross2(b - pc, c - pc) / d;
+            const float v = cross2(c - pc, a - pc) / d;
+            const float w = 1.0 - u - v;
+            if (u >= 0.0 && v >= 0.0 && w >= 0.0) {
+                hits[n_hits] = u * a3[axis] + v * b3[axis] + w * c3[axis];
+                // facing +axis or -axis: the projected area's sign (up to a
+                // per-axis constant, irrelevant to a nonzero test)
+                sgn[n_hits] = d > 0.0 ? 1 : -1;
+                ++n_hits;
+            }
+        }
+    }
+
+    ivec3 p;
+    p[ai] = ci;
+    p[aj] = cj;
+    for (int k = 0; k < nk; ++k) {
+        const float centre = float(k) + 0.5;
+        int winding = 0;
+        for (int h = 0; h < n_hits; ++h) {
+            if (hits[h] > centre) winding += sgn[h];
+        }
+        if (winding != 0) {
+            p[axis] = k;
+            vote[cell_of(p)] += 1;  // one thread per column per axis: no race
+        }
+    }
+}

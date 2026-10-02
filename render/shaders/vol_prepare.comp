@@ -1,0 +1,88 @@
+#version 450
+// Pass 1: the transfer-function input, once per cell, into `field` (the
+// march then only samples it, rather than redoing the maths per sample).
+// Signed and normalised; solid cells hold 0:
+//   speed      (|u| - U) / U
+//   pressure   Cp = pscale (rho - rho_ref) / (U^2 / 2)
+//   vorticity  |curl u| / U
+//   vort_x     omega_x / U * VORT_X_SCALE
+//   mach       (M - 1) / MACH_SPAN, M = |u| sqrt(3) on the LBM
+//   schlieren  |grad rho| / U^2 * SCHLIEREN_GAIN
+// Two sources: the LBM (macro = u, rho; pressure rho / 3) or, with
+// gamma > 0, the compressible Euler state (macro = u, p; aux = rho;
+// M = |u| / sqrt(gamma p / rho)). THEORY 10.1.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "vol_common.glsl"
+
+const float VORT_X_SCALE = 10.0;
+const float MACH_SPAN = 0.5;
+const float SCHLIEREN_GAIN = 4.0;
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, mode
+    vec4 ref;    // u_ref, rho_ref (Euler: p_ref), pscale, gamma (0 = LBM)
+} P;
+
+layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 1) readonly buffer Macro { vec4 macro[]; };
+layout(std430, binding = 2) writeonly buffer Field { float field[]; };
+layout(std430, binding = 3) readonly buffer Aux { float aux[]; };  // Euler rho
+layout(std430, binding = 4) writeonly buffer Speed { float speed[]; };  // |u| (dye colour)
+
+bool compressible() { return P.ref.w > 0.0; }
+vec3 vel(int x, int y, int z) { return macro[cell_index(x, y, z, P.dims.xyz)].xyz; }
+float rho(int x, int y, int z) {
+    const uint c = cell_index(x, y, z, P.dims.xyz);
+    return compressible() ? aux[c] : macro[c].w;
+}
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= uint(n.x * n.y * n.z)) return;
+    const int mode = P.dims.w;
+    const float u_ref = P.ref.x;
+    const float inv_u = 1.0 / max(u_ref, 1e-9);
+    const float inv_q = 1.0 / max(0.5 * u_ref * u_ref, 1e-12);
+    const ivec3 p = cell_coords(c, n);
+    const int x = p.x, y = p.y, z = p.z;
+    const bool inner = x >= 1 && x < n.x - 1 && y >= 1 && y < n.y - 1 && z >= 1 && z < n.z - 1;
+
+    float v = 0.0;
+    if (flags[c] == FLUID) {
+        const vec4 m = macro[c];
+        if (mode == MODE_SPEED) {
+            v = (length(m.xyz) - u_ref) * inv_u;
+        } else if (mode == MODE_PRESSURE) {
+            v = (m.w - P.ref.y) * P.ref.z * inv_q;
+        } else if (mode == MODE_MACH) {
+            const float a = compressible() ? sqrt(max(P.ref.w * m.w / max(aux[c], 1e-6), 1e-12))
+                                           : sqrt(1.0 / 3.0);
+            v = (length(m.xyz) / a - 1.0) / MACH_SPAN;
+        } else if (mode == MODE_SCHLIEREN) {
+            if (inner) {
+                const vec3 g = 0.5 * vec3(rho(x + 1, y, z) - rho(x - 1, y, z),
+                                          rho(x, y + 1, z) - rho(x, y - 1, z),
+                                          rho(x, y, z + 1) - rho(x, y, z - 1));
+                v = length(g) / max(u_ref * u_ref, 1e-8) * SCHLIEREN_GAIN;
+            }
+        } else if (mode == MODE_VORT_X) {
+            if (y >= 1 && y < n.y - 1 && z >= 1 && z < n.z - 1) {
+                const float dwdy = 0.5 * (vel(x, y + 1, z).z - vel(x, y - 1, z).z);
+                const float dvdz = 0.5 * (vel(x, y, z + 1).y - vel(x, y, z - 1).y);
+                v = (dwdy - dvdz) * inv_u * VORT_X_SCALE;
+            }
+        } else {  // MODE_VORTICITY
+            if (inner) {
+                const vec3 dudx = 0.5 * (vel(x + 1, y, z) - vel(x - 1, y, z));
+                const vec3 dudy = 0.5 * (vel(x, y + 1, z) - vel(x, y - 1, z));
+                const vec3 dudz = 0.5 * (vel(x, y, z + 1) - vel(x, y, z - 1));
+                const vec3 om = vec3(dudy.z - dudz.y, dudz.x - dudx.z, dudx.y - dudy.x);
+                v = length(om) * inv_u;
+            }
+        }
+    }
+    field[c] = v;
+    speed[c] = length(macro[c].xyz);
+}

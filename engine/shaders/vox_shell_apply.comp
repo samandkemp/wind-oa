@@ -1,0 +1,59 @@
+#version 450
+// Thin-feature shell, pass 2: mark shell cells of thin features solid.
+// Thin = the feature's opposite surface is within 1.5 cells:
+// stepping 0.5 / 1 / 1.5 cells from the nearest surface point along +-n
+// finds a shell cell whose nearest triangle faces the other way (normals
+// more than 120 degrees apart). A thick body's skin only sees its own face
+// or, at a convex edge, a perpendicular one -- so it keeps its exact
+// centre-inside voxels. A single-sided (zero-thickness) surface has no far
+// side, but also no solid anywhere near it: that counts as thin too.
+// Four simpler rules were tried and rejected. THEORY 5.3.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "vox_common.glsl"
+
+void main() {
+    const int c = linear_id();
+    const ivec3 n = V.dims.xyz;
+    if (c >= n.x * n.y * n.z) return;
+    const int key = shell[c];
+    if (key == SHELL_EMPTY || flags[c] != FLUID) return;
+    const vec3 nrm = key_normal(key);
+    if (dot(nrm, nrm) <= 0.5) return;
+
+    const ivec3 p = ivec3(c / (n.y * n.z), (c / n.z) % n.y, c % n.z);
+    const int t = key & ((1 << TRI_BITS) - 1);
+    const vec3 q = closest_on_tri(vec3(p) + 0.5, tri_vertex(t, 0), tri_vertex(t, 1),
+                                  tri_vertex(t, 2));
+
+    bool thin = false;
+    for (int k = 0; k < 6 && !thin; ++k) {
+        const float step = 0.5 * float(k / 2 + 1) * ((k % 2 == 0) ? 1.0 : -1.0);
+        const vec3 pp = q + step * nrm;
+        // the 8 cells whose centres surround the sample (the one containing
+        // it is often nearest to the same face); clamped, so a sheet running
+        // off the grid edge still finds its far side
+        const ivec3 base = ivec3(floor(pp - 0.5));
+        for (int o = 0; o < 8; ++o) {
+            const ivec3 cc = clamp_cell(base + ivec3(o >> 2, (o >> 1) & 1, o & 1));
+            if (dot(nrm, key_normal(shell[cell_of(cc)])) < -0.5) thin = true;
+        }
+    }
+    if (!thin) {
+        int near_solid = 0;
+        for (int k = 0; k < 4; ++k) {
+            const float step = (1.0 + 0.5 * float(k / 2)) * ((k % 2 == 0) ? 1.0 : -1.0);
+            const vec3 pp = q + step * nrm;
+            const ivec3 base = ivec3(floor(pp - 0.5));
+            for (int o = 0; o < 8; ++o) {
+                const ivec3 cc = clamp_cell(base + ivec3(o >> 2, (o >> 1) & 1, o & 1));
+                if (vote[cell_of(cc)] >= 2) ++near_solid;
+            }
+        }
+        if (near_solid == 0) thin = true;
+    }
+    if (thin) {
+        flags[c] = OBSTACLE;
+        atomicAdd(counter[0], 1u);
+    }
+}

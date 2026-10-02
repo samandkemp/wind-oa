@@ -1,0 +1,35 @@
+#version 450
+// One workgroup reduces vol_q's partials (fixed order, deterministic) and
+// writes the adaptive vortex-core threshold straight to the device -- the
+// march reads it there, so no host round trip:
+//   qstat = (threshold = 3 * rms(Q > 0) * sense, rms, samples, -)
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint n_partials;
+    float sense;
+} P;
+
+layout(std430, binding = 0) readonly buffer Partials { vec2 partials[]; };
+layout(std430, binding = 1) writeonly buffer QStat { vec4 qstat; };
+
+shared vec2 s_acc[256];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    vec2 acc = vec2(0.0);
+    for (uint i = lid; i < P.n_partials; i += 256u) acc += partials[i];
+    s_acc[lid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) s_acc[lid] += s_acc[lid + s];
+        barrier();
+    }
+    if (lid == 0u) {
+        const float cnt = s_acc[0].y;
+        const float rms = cnt > 0.0 ? sqrt(s_acc[0].x / cnt) : 0.0;
+        // rms 0 (still air): an unreachable threshold, so nothing shows
+        const float th = rms > 0.0 ? 3.0 * rms * P.sense : 1e30;
+        qstat = vec4(th, rms, cnt, 0.0);
+    }
+}

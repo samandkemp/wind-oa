@@ -1,0 +1,27 @@
+#version 450
+// [1,2,1]/4 along one axis, clamped at the grid edge. Three passes (x, y, z)
+// turn the raw solid indicator into the blurred copy whose gradient gives
+// the smooth surface's shading normals.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "vol_common.glsl"
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, axis
+} P;
+
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float dst[]; };
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= uint(n.x * n.y * n.z)) return;
+    const ivec3 p = cell_coords(c, n);
+    ivec3 o = ivec3(0);
+    o[P.dims.w] = 1;
+    const ivec3 lo = max(p - o, ivec3(0));
+    const ivec3 hi = min(p + o, n - 1);
+    dst[c] = 0.25 * (src[cell_index(lo.x, lo.y, lo.z, n)] + 2.0 * src[c] +
+                     src[cell_index(hi.x, hi.y, hi.z, n)]);
+}

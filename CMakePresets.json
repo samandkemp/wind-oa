@@ -1,0 +1,31 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "Visual Studio 2022 (x64)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build"
+    },
+    {
+      "name": "validation-layers",
+      "inherits": "dev",
+      "displayName": "Visual Studio 2022 (x64) + Vulkan validation layers",
+      "binaryDir": "${sourceDir}/build-vl",
+      "cacheVariables": { "WINDOA_VALIDATION_LAYERS": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev", "configuration": "RelWithDebInfo" },
+    { "name": "debug", "configurePreset": "dev", "configuration": "Debug" },
+    { "name": "release", "configurePreset": "dev", "configuration": "Release" },
+    { "name": "validation-layers", "configurePreset": "validation-layers", "configuration": "Debug" }
+  ],
+  "testPresets": [
+    { "name": "dev", "configurePreset": "dev", "configuration": "RelWithDebInfo",
+      "output": { "outputOnFailure": true } },
+    { "name": "quick", "inherits": "dev", "displayName": "Skip the long gates (label long)",
+      "filter": { "exclude": { "label": "long" } } }
+  ]
+}

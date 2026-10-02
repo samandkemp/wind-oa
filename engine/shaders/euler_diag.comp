@@ -1,0 +1,36 @@
+#version 450
+// Derived fields for the renderer / analysis -- macro = (u, p), rho -- and
+// per-workgroup health partials: (max local Mach over fluid, non-finite or
+// non-positive-density fluid cells). NaN tested on the bits (fast-math may
+// fold x != x away).
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "euler_common.glsl"
+#include "euler_buffers.glsl"
+
+shared vec2 s_h[256];
+
+bool non_finite(float v) { return (floatBitsToUint(v) & 0x7F800000u) == 0x7F800000u; }
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint c = linear_group() * 256u + lid;
+    vec2 h = vec2(0.0);
+    if (c < uint(N().x * N().y * N().z)) {
+        const S u = load_u(c);
+        const S w = prim(u);
+        macro[c] = vec4(w.v.yzw, w.e);
+        rho_out[c] = w.v.x;
+        if (flags[c] == FLUID) {
+            if (non_finite(u.v.x) || non_finite(u.e) || u.v.x <= 0.0) h.y = 1.0;
+            else h.x = length(w.v.yzw) / sqrt(GAMMA * w.e / w.v.x);
+        }
+    }
+    s_h[lid] = h;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) s_h[lid] = vec2(max(s_h[lid].x, s_h[lid + s].x), s_h[lid].y + s_h[lid + s].y);
+        barrier();
+    }
+    if (lid == 0u) partials[linear_group()] = vec4(s_h[0], 0.0, 0.0);
+}

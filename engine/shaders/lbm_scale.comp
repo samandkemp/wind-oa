@@ -1,0 +1,31 @@
+#version 450
+// Closed-domain mass anchor (enforce_mass; THEORY 3.8): scale every distribution
+// of the live buffer by k, and rho of FLUID cells with it. rho and rho u
+// scale together, so the velocity field is left exactly unchanged (in f32
+// storage; f16 storage re-rounds the scaled deviations).
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const bool F16 = false;
+#include "lattice.glsl"
+#include "lbm_params.glsl"
+
+layout(std430, binding = 0) buffer F { float f[]; };
+layout(std430, binding = 0) buffer F16v { float16_t f16[]; };
+layout(std430, binding = 1) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 2) buffer Macro { vec4 macro[]; };
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint N = uint(n.x * n.y * n.z);
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= N) return;
+    const float k = P.aux.x;
+    for (int i = 0; i < Q; ++i) {
+        const uint idx = uint(i) * N + c;
+        if (F16) f16[idx] = float16_t((float(f16[idx]) + W[i]) * k - W[i]);
+        else f[idx] *= k;
+    }
+    if (flags[c] == FLUID) macro[c].w *= k;
+}

@@ -1,0 +1,54 @@
+#version 450
+// Per-workgroup statistics over FLUID cells, reduced on the host in double:
+//   partials[g] = (max |u|, non-finite cells, sum(rho - 1), fluid cells)
+// P.aux.x >= 0 restricts to the x-plane with that index (upstream reference
+// pressure); -1 = the whole domain. Summing the excess rho - 1 keeps the
+// f32 terms small (~1e-2) and the reduction precise.
+// NaN / Inf are tested on the bits: `x != x` is folded away by fast-math,
+// and a poisoned cell then goes uncounted (V11).
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "lattice.glsl"
+#include "lbm_params.glsl"
+
+layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 1) readonly buffer Macro { vec4 macro[]; };
+layout(std430, binding = 2) writeonly buffer Partials { vec4 partials[]; };
+
+shared vec4 s[256];
+
+bool non_finite(float v) {
+    return (floatBitsToUint(v) & 0x7F800000u) == 0x7F800000u;
+}
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint N = uint(n.x * n.y * n.z);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint c = linear_group() * 256u + lid;
+    const int plane = int(P.aux.x);
+
+    vec4 v = vec4(0.0);
+    if (c < N && flags[c] == FLUID && (plane < 0 || cell_coords(c, n).x == plane)) {
+        const vec4 m = macro[c];
+        const float sp = length(m.xyz);
+        if (non_finite(sp) || non_finite(m.w)) {
+            v.y = 1.0;
+        } else {
+            v.x = sp;
+            v.z = m.w - 1.0;
+        }
+        v.w = 1.0;
+    }
+    s[lid] = v;
+    barrier();
+    for (uint k = 128u; k > 0u; k >>= 1u) {
+        if (lid < k) {
+            const vec4 a = s[lid];
+            const vec4 b = s[lid + k];
+            s[lid] = vec4(max(a.x, b.x), a.y + b.y, a.z + b.z, a.w + b.w);
+        }
+        barrier();
+    }
+    if (lid == 0u) partials[linear_group()] = s[0];
+}

@@ -1,0 +1,36 @@
+#version 450
+// One SSP-RK2 stage (THEORY 8.4), fused: every fluid cell computes the flux differences
+// of its six faces (x, then y, then z -- the order the per-axis kernels
+// accumulated R in, so the arithmetic is unchanged) and writes the updated
+// state directly. No residual buffer round trips: the split version
+// streamed R through three read-modify-write passes plus a stage pass
+// (~180 bytes per cell per stage; this is ~60).
+//   P.opt.z = 1  stage 1: out = Uin + dt R(Uin)          (non-fluid: copy Uin)
+//   P.opt.z = 2  stage 2: out = (U0 + Uin + dt R(Uin)) / 2  (non-fluid: untouched)
+// Bindings (euler_buffers.glsl): 0 = Uin (the stencil), 1 = U0, 2 = out.
+// Stage 1 reads U and writes U1; stage 2 reads U1 (stencil) and U (as U0)
+// and writes U in place -- each thread reads its own U0 cell before writing
+// it, and the stencil reads come from U1, so nothing races.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "euler_common.glsl"
+#include "euler_buffers.glsl"
+#include "euler_flux.glsl"
+
+void main() {
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= uint(N().x * N().y * N().z)) return;
+    const int stage = P.opt.z;
+    const S uin = load_u(c);
+    if (flags[c] != FLUID) {
+        if (stage == 1) store_r(c, uin);
+        return;
+    }
+    const ivec3 p = coords(c);
+    S r = s_sub(flux_any(p, 0), flux_any(p + e3(0), 0));
+    r = s_add(r, s_sub(flux_any(p, 1), flux_any(p + e3(1), 1)));
+    r = s_add(r, s_sub(flux_any(p, 2), flux_any(p + e3(2), 2)));
+    const float dt = dtbuf.x;
+    if (stage == 1) store_r(c, s_add(uin, s_mul(r, dt)));
+    else store_r(c, s_add(s_mul(load_u0(c), 0.5), s_mul(s_add(uin, s_mul(r, dt)), 0.5)));
+}

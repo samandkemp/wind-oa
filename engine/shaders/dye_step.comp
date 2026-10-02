@@ -1,0 +1,107 @@
+#version 450
+// One step of the dye (passive scalar) on its own D3Q7 lattice. Reuses the
+// flow's pull streaming and the same bounce-back on the same flags, so dye
+// can never leak into a solid.
+//   D3Q7: w0 = 1/4, wi = 1/8, cs^2 = 1/4, D = (tau - 1/2) / 4
+//   g_eq = w C (1 + 4 e.u + 8 (e.u)^2 - 2 u.u)   (second order: stays
+//          positive upstream at any speed; the linear form goes negative
+//          past |u| 0.25 and the clip then manufactures dye)
+//   TRT: odd part relaxes with tau (sets D), even part with tau_plus
+// Boundaries: inlet brings clean air (0); outlet is equilibrium outflow at
+// the cell's own C and u (plain zero-gradient recycled dye and blew up at
+// the outlet corners); side walls and bodies bounce back (no flux).
+// Sources relax the cell towards C = 1 by src[c] per step.
+// Called once per flow step, after it: `macro` is the step's fresh output.
+// Specification: THEORY 6.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "lattice.glsl"
+
+const ivec3 E7[7] = ivec3[](ivec3(0, 0, 0), ivec3(1, 0, 0), ivec3(-1, 0, 0), ivec3(0, 1, 0),
+                            ivec3(0, -1, 0), ivec3(0, 0, 1), ivec3(0, 0, -1));
+const float W7[7] = float[](0.25, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125);
+const int OPP7[7] = int[](0, 2, 1, 4, 3, 6, 5);
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, periodic bits (1 x, 2 y, 4 z)
+    vec4 tau;    // omega_minus (1 / tau), omega_plus (1 / tau_plus), -, -
+} P;
+
+layout(std430, binding = 0) readonly buffer GSrc { float gs[]; };
+layout(std430, binding = 1) writeonly buffer GDst { float gd[]; };
+layout(std430, binding = 2) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 3) readonly buffer Macro { vec4 macro[]; };
+layout(std430, binding = 4) buffer Conc { float conc[]; };
+layout(std430, binding = 5) readonly buffer Src { float src[]; };
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const uint N = uint(n.x * n.y * n.z);
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= N) return;
+    if (flags[c] != FLUID) {
+        for (int i = 0; i < 7; ++i) gd[uint(i) * N + c] = 0.0;
+        conc[c] = 0.0;
+        return;
+    }
+    const ivec3 p = cell_coords(c, n);
+    const int per = P.dims.w;
+    const vec3 u = macro[c].xyz;
+
+    float g[7];
+    for (int i = 0; i < 7; ++i) {
+        ivec3 s = p - E7[i];
+        if ((per & 1) != 0) s.x = (s.x + n.x) % n.x;
+        if ((per & 2) != 0) s.y = (s.y + n.y) % n.y;
+        if ((per & 4) != 0) s.z = (s.z + n.z) % n.z;
+        float val;
+        if (s.x < 0) {
+            val = 0.0;  // clean inlet air
+        } else if (s.x >= n.x) {
+            const float eo = dot(vec3(E7[i]), u);
+            val = W7[i] * conc[c] * (1.0 + 4.0 * eo + 8.0 * eo * eo - 2.0 * dot(u, u));
+        } else if (s.y < 0 || s.y >= n.y || s.z < 0 || s.z >= n.z) {
+            val = gs[uint(OPP7[i]) * N + c];  // side walls: no flux
+        } else if (flags[cell_index(s.x, s.y, s.z, n)] != FLUID) {
+            val = gs[uint(OPP7[i]) * N + c];  // body: no flux
+        } else {
+            val = gs[uint(i) * N + cell_index(s.x, s.y, s.z, n)];
+        }
+        g[i] = val;
+    }
+    float C = 0.0;
+    for (int i = 0; i < 7; ++i) C += g[i];
+    const float r = src[c];
+    if (r > 0.0) {  // relaxation source towards C = 1
+        const float dc = r * (1.0 - C);
+        for (int i = 0; i < 7; ++i) g[i] += W7[i] * dc;
+        C += dc;
+    }
+    // Boundedness limiter: all dye comes from C = 1
+    // sources, so C > 1 is only the scheme's small overshoot (<= 1.07
+    // measured) -- or a pile-up next to spinning walls, where the Ladd
+    // moving-wall term makes the flow locally compressible (a mass sink) and
+    // the conservative scalar grew without bound (C 760 beside a wheel).
+    // Rescaling the populations above C_MAX is an exact identity
+    // for every validated case.
+    const float C_MAX = 1.25;
+    if (C > C_MAX) {
+        const float k = C_MAX / C;
+        for (int i = 0; i < 7; ++i) g[i] *= k;
+        C = C_MAX;
+    }
+    const float usq = dot(u, u);
+    float geq[7];
+    for (int i = 0; i < 7; ++i) {
+        const float eu = dot(vec3(E7[i]), u);
+        geq[i] = W7[i] * C * (1.0 + 4.0 * eu + 8.0 * eu * eu - 2.0 * usq);
+    }
+    for (int i = 0; i < 7; ++i) {
+        const int o = OPP7[i];
+        const float gp = 0.5 * (g[i] + g[o]), gm = 0.5 * (g[i] - g[o]);
+        const float ep = 0.5 * (geq[i] + geq[o]), em = 0.5 * (geq[i] - geq[o]);
+        const float outv = g[i] - P.tau.y * (gp - ep) - P.tau.x * (gm - em);
+        gd[uint(i) * N + c] = max(outv, 0.0);  // guards f32 round-off only
+    }
+    conc[c] = C;
+}

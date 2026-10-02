@@ -1,0 +1,15 @@
+#version 450
+// 2-of-3 majority -> OBSTACLE. Clears previous OBSTACLE cells first; WALL
+// and LID cells are preserved.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "vox_common.glsl"
+
+void main() {
+    const int c = linear_id();
+    if (c >= V.dims.x * V.dims.y * V.dims.z) return;
+    uint f = flags[c];
+    if (f == OBSTACLE) f = FLUID;
+    if (vote[c] >= 2 && f == FLUID) f = OBSTACLE;
+    flags[c] = f;
+}

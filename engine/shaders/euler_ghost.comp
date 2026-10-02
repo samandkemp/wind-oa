@@ -1,0 +1,51 @@
+#version 450
+// Image-point ghost state for every solid cell next to fluid. The flow is
+// interpolated at the image point x_g + dn n, the mirror of the ghost
+// centre across the true wall (phi = 0), at least 0.75 cells out so it
+// samples fluid; the ghost holds that state with its
+// normal velocity reversed (curvature-corrected, ccst). gpw keeps the
+// pressure interpolated to the true wall, for the forces. THEORY 8.6.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "euler_common.glsl"
+#include "euler_buffers.glsl"
+#include "euler_flux.glsl"
+
+void main() {
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= uint(N().x * N().y * N().z)) return;
+    float ok = 0.0;
+    if (flags[c] != FLUID && P.bc.w == 1) {
+        const ivec3 p = coords(c);
+        bool near = false;
+        for (int ax = 0; ax < 3; ++ax) {
+            const ivec3 e = e3(ax);
+            if (in_grid(p + e) && !solid(p + e)) near = true;
+            if (in_grid(p - e) && !solid(p - e)) near = true;
+        }
+        if (near) {
+            const vec3 g = grad_phi(p);
+            float d = -phi[c];
+            if (length(g) > 0.3 && d > -0.5) {
+                const vec3 n = normalize(g);
+                d = max(d, 0.0);
+                const vec3 xg = vec3(p) + 0.5;
+                const float dn = d + max(d, 0.75);  // ghost -> image
+                const vec3 xi = xg + dn * n;
+                float ws;
+                S w = interp_fluid(xi, ws);
+                if (ws > 0.2) {
+                    w = s_mul(w, 1.0 / ws);
+                    const S gsv = ccst(w, n, xi, dn);
+                    store_gs(c, gsv);
+                    // the WALL lies (dn - d) from the image, d from the ghost
+                    const float f = (dn - d) / max(dn, 1e-6);
+                    gpw[c] = w.e + f * (gsv.e - w.e);
+                    gn[c] = vec4(n, 1.0);
+                    ok = 1.0;
+                }
+            }
+        }
+    }
+    gn[c].w = ok;
+}

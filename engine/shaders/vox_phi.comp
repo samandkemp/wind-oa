@@ -1,0 +1,15 @@
+#version 450
+// Signed distance, pass 2: phi in cells, negative where the flags are
+// solid, clamped to +-4 (band + 1 where nothing was near).
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "vox_common.glsl"
+
+void main() {
+    const int c = linear_id();
+    if (c >= V.dims.x * V.dims.y * V.dims.z) return;
+    const int q = shell[c];
+    const float d = (q != SHELL_EMPTY) ? float(q) / 4096.0 : V.fparam.x + 1.0;
+    const float sgn = (flags[c] != FLUID) ? -1.0 : 1.0;
+    phi[c] = sgn * min(d, 4.0);
+}

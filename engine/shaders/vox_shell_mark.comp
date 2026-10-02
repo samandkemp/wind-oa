@@ -1,0 +1,30 @@
+#version 450
+// Thin-feature shell, pass 1: one thread per triangle.
+// Every cell whose unit cube the triangle intersects (the conservative
+// "supercover" no D3Q19 link can cross) records, via one atomicMin, the
+// packed key (quantised distance to the triangle << TRI_BITS | triangle) --
+// so each cell ends up holding its nearest marking triangle.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "vox_common.glsl"
+
+void main() {
+    const int t = linear_id();
+    if (t >= V.dims.w) return;
+    const vec3 a = tri_vertex(t, 0), b = tri_vertex(t, 1), c = tri_vertex(t, 2);
+    ivec3 lo, hi;
+    tri_cell_box(t, 0.0, lo, hi);
+    for (int x = lo.x; x <= hi.x; ++x) {
+        for (int y = lo.y; y <= hi.y; ++y) {
+            for (int z = lo.z; z <= hi.z; ++z) {
+                const vec3 pc = vec3(x, y, z) + 0.5;
+                if (tri_box_overlap(pc, a, b, c)) {
+                    const vec3 q = closest_on_tri(pc, a, b, c);
+                    const float d2 = min(dot(q - pc, q - pc), 0.75);
+                    const int qd = int(d2 / 0.75 * 2047.0);
+                    atomicMin(shell[cell_of(ivec3(x, y, z))], (qd << TRI_BITS) | t);
+                }
+            }
+        }
+    }
+}
