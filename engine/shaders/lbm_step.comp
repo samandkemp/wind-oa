@@ -128,13 +128,17 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
                 handled = true;
             }
         }
-        // y: free-slip specular / periodic (THEORY 3.4)
+        // y: free-slip specular / periodic (THEORY 3.4). Specular: the
+        // population that left through the face re-enters with its normal
+        // component reversed, so the source is the mirror image of sy across
+        // the face (the cell's own row) -- each outgoing population is taken
+        // exactly once and the face conserves mass.
         if (!handled && (sy < 0 || sy >= ny)) {
             if (MODE_Y == 1) {
                 sy = (sy + ny) % ny;
             } else {
                 ii = SPEC_Y[ii];
-                sy = y - E[ii].y;
+                sy = sy < 0 ? -1 - sy : 2 * ny - 1 - sy;
             }
         }
         // z: free-slip specular / periodic
@@ -143,7 +147,7 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
                 sz = (sz + nz) % nz;
             } else {
                 ii = SPEC_Z[ii];
-                sz = z - E[ii].z;
+                sz = sz < 0 ? -1 - sz : 2 * nz - 1 - sz;
             }
         }
 

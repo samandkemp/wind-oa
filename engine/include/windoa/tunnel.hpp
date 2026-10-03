@@ -3,18 +3,21 @@
 // freestream (startup ramp + slew limit), spinning parts under the wall-
 // speed cap, the rolling road / fixed ground, force coefficients (EMA over
 // solver steps), the settling monitor, the divergence guard, inlet
-// turbulence, dye, and the settled-flow cache.
+// turbulence, dye, and the settled-flow cache; and the measurements on top
+// of the flow: time averages, the wake survey, probes and spectra.
 //
 // A frontend (the app, a gate, a tool) calls the setters, then advance()
 // repeatedly; everything GPU-side is submitted through the Context from the
 // calling thread. The app runs it on a worker thread and never touches it
 // from the UI thread (commands are posted to the worker).
-// Specification: docs/THEORY.md, THEORY 9 (coefficients: 4.4).
+// Specification: docs/THEORY.md, THEORY 9 (coefficients: 4.4; statistics
+// and signals: 12).
 #pragma once
 
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -27,8 +30,10 @@
 #include "windoa/dye.hpp"
 #include "windoa/euler.hpp"
 #include "windoa/flow_cache.hpp"
+#include "windoa/flow_stats.hpp"
 #include "windoa/lbm.hpp"
 #include "windoa/mesh.hpp"
+#include "windoa/spectrum.hpp"
 #include "windoa/voxeliser.hpp"
 
 namespace windoa {
@@ -69,6 +74,9 @@ struct TunnelSettings {
     float mach_slew = 0.004f;           // per batch
     double develop_flow_throughs = 2.0; // impulsive start: developing this long
     double force_ema_time = 60.0;       // sim time (cell sound-crossings)
+    // Statistics and signals (THEORY 12)
+    int analysis_every = 25;             // batches between wake-survey / spectrum refreshes
+    double history_flow_throughs = 16.0; // signal history kept for the spectra
 };
 
 // The app's solver for these settings -- the single source of truth, so a
@@ -108,6 +116,43 @@ Placement default_placement(const catalogue::Entry& e, const TunnelSettings& s,
 
 enum class AreaMode : int { Frontal = 0, Planform = 1, Manual = 2 };
 
+inline constexpr int kMaxProbes = 4;
+
+// What the measurements on top of the flow found (THEORY 12), refreshed
+// every TunnelSettings::analysis_every batches. Spectra are in cycles per
+// solver step; probe components are u_x, u_y, u_z and rho.
+struct TunnelAnalysis {
+    std::uint64_t version = 0;
+    // time averaging (12.1)
+    int avg_samples = 0;
+    double avg_flow_throughs = 0.0;
+    // wake survey (12.2): a control-volume momentum balance of the mean flow
+    // between the upstream plane and the survey plane, beside the force
+    // balance's mean over the same window
+    bool wake_valid = false;
+    int x_upstream = 0, x_survey = 0;
+    double cd_wake = 0.0, cd_balance = 0.0;
+    double mass_imbalance = 0.0;              // relative change of the mass flux between the planes
+    bool includes_floor = false;              // ground mode: the floor's shear is inside the volume
+    std::vector<float> profile_y, profile_uy; // <u_x> / U along y at the survey plane
+    std::vector<float> profile_z, profile_uz; // <u_x> / U along z
+    // spectra of the developed signal (12.3)
+    double l_ref = 1.0, u_ref = 0.05; // Strouhal scales: the body's height, the freestream
+    double window_steps = 0.0;
+    Spectrum lift;        // of Cl
+    double st_lift = 0.0; // peak frequency x l_ref / u_ref
+    // The side walls reflect sound: transverse standing waves at multiples
+    // of f_acoustic = c_s / (2 max(ny, nz)) show in every spectrum. The
+    // shedding peak is the strongest one below 0.8 f_acoustic.
+    double f_acoustic = 0.0;  // cycles per step
+    double st_shedding = 0.0; // 0 when the lift has no peak below the first mode
+    int n_probes = 0;
+    std::array<std::array<Spectrum, 4>, kMaxProbes> probe_spec;
+    // histories for plotting (decimated): solver step, Cl, probe values
+    std::vector<double> hist_t, hist_cl;
+    std::array<std::array<std::vector<float>, 4>, kMaxProbes> hist_probe;
+};
+
 struct TunnelStatus {
     std::string phase; // PAUSED / RAMPING / the settling status
     std::string model_label;
@@ -140,6 +185,12 @@ struct TunnelStatus {
     bool dye_on = false;
     std::uint64_t geometry_version = 0;
     std::uint64_t flow_epoch = 0; // bumps on every reset / restore
+    // statistics and signals
+    bool averaging = false;        // switched on
+    bool averaging_active = false; // on, and the flow is developed: sampling
+    int avg_samples = 0;
+    double avg_flow_throughs = 0.0;
+    std::uint64_t analysis_version = 0;
     // transonic mode
     bool transonic = false;
     float mach_applied = 0.0f, mach_command = 0.8f, peak_mach = 0.0f;
@@ -198,6 +249,24 @@ class Tunnel {
     void reset_flow(const std::string& reason); // from rest; never the cache
     void skip_develop() { develop_.finish(); }
 
+    // -- statistics and signals (THEORY 12) -------------------------------------
+    // Time averaging: while on, every batch of a developed flow adds a sample
+    // weighted by its steps. A new operating point clears the window, which
+    // refills once the flow has settled again.
+    void set_averaging(bool on);
+    void restart_averaging() { clear_statistics(false); }
+    const FlowStats* stats() const { return stats_.get(); } // null until first switched on
+    // Probes: up to kMaxProbes positions (cells) whose (u, rho) are recorded
+    // every batch.
+    void set_probes(const std::vector<std::array<float, 3>>& positions);
+    // The wake-survey plane, in cells (< 0: half-way between the body and
+    // the sponge). Kept behind the body and clear of the sponge.
+    void set_wake_plane(int x) { wake_x_ = x; }
+    int wake_plane() const;
+    // The latest analysis (refreshed every analysis_every batches).
+    const TunnelAnalysis& analysis() const { return analysis_; }
+    void refresh_analysis();
+
     // -- running ---------------------------------------------------------------
     // One batch of `steps` solver steps with everything around them: ramp /
     // slew, belt speed, dye, forces, guard, settling, cache. No-op if paused.
@@ -214,6 +283,8 @@ class Tunnel {
     void diverged(float umax, int n_bad);
     void maybe_save_settled_flow();
     void build_dye_nozzles();
+    void clear_statistics(bool signals_too);
+    void record_signals(const lbm::MeanForces& mf);
     std::string operating_point_key() const;
     geometry::Mesh placed_mesh() const;
     double q_dyn() const;
@@ -270,6 +341,26 @@ class Tunnel {
     std::string cache_key_, cache_saved_for_, cache_note_;
     int cache_entries_ = 0;
     std::uint64_t flow_epoch_ = 0;
+
+    // statistics and signals
+    struct SignalSample {
+        std::int64_t step = 0;
+        float cd = 0, cl = 0, cs = 0;
+        std::uint32_t probe_epoch = 0;
+        std::array<std::array<float, 4>, kMaxProbes> probe{};
+    };
+    std::unique_ptr<FlowStats> stats_;
+    bool averaging_ = false;
+    std::array<double, 3> force_sum_{};
+    double force_w_ = 0.0, avg_ft_ = 0.0;
+    std::vector<std::array<float, 3>> probes_;
+    std::vector<std::size_t> probe_cells_;
+    std::uint32_t probe_epoch_ = 0;
+    std::deque<SignalSample> signals_;
+    std::int64_t signal_start_ = -1; // the step the flow was first developed at
+    int wake_x_ = -1, body_x_max_ = 0;
+    TunnelAnalysis analysis_;
+    std::uint64_t analysis_version_ = 0;
 
     // transonic
     std::unique_ptr<euler::Solver> euler_;

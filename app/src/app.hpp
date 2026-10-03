@@ -3,6 +3,7 @@
 // the graphics queue. Panels: Tunnel (run status,
 // forces, flow speed, turbulence), Model (catalogue menu, placement, attitude,
 // reference area, spin), View (renderer, fields, overlays), Compare (A/B),
+// Analysis (time averaging, the wake survey, probes and spectra),
 // colour legends along the top, Cd / Cl / Cm plots along the bottom.
 #pragma once
 
@@ -38,9 +39,10 @@ struct Options {
     bool transonic = false; // start in transonic mode
     bool f16 = false;       // f16 distribution storage (faster, approximate)
     std::string show;       // e.g. "q,dye,lines,nosmoke,slice" (tests / screenshots)
-    std::string field;      // speed|pressure|vorticity|vortx|mach|schlieren
+    std::string field;      // speed|pressure|vorticity|vortx|mach|schlieren|mean|turb
     float spin = -1.0f;     // >= 0: spin on at this ratio
     float aoa = 0.0f;
+    float zoom = 0.0f; // > 0: camera distance x zoom, aimed at the model
 };
 
 // One model the menu can load: a catalogue entry or an STL in ./models.
@@ -65,6 +67,8 @@ class App {
     void panel_model(const TunnelStatus& st);
     void panel_view(const TunnelStatus& st);
     void panel_compare(const TunnelStatus& st);
+    void panel_analysis(const TunnelStatus& st);
+    void post_probes();
     void legends(const TunnelStatus& st);
     void plot_strip(const TunnelStatus& st);
     void help_window();
@@ -106,6 +110,11 @@ class App {
 
     // view
     render::Settings rs_;
+    int paint_mode_ = 1; // 0 none, 1 Cp, 2 near-wall speed, 3 reversed flow, 4 oil flow
+    bool slice_arrows_ = false;
+    float arrow_spacing_ = 4.0f; // cells
+    int smoke_mode_ = 0;         // 0 streaklines, 1 timelines
+    int pulse_steps_ = 80;       // timeline release interval
     int slice_mode_ =
         0; // 0 off, 1 vertical (x-y at z), 2 horizontal (x-z at y), 3 cross (y-z at x)
     bool show_smoke_ = true, show_streamlines_ = false, show_plots_ = true, show_ui_ = true;
@@ -117,7 +126,18 @@ class App {
     float rake_h_frac_ = 0.10f, rake_w_frac_ = 0.10f, rake_y_ = 0.5f, rake_z_ = 0.5f;
     float render_scale_ = 1.0f, fov_deg_ = 45.0f;
     OrbitCamera camera_;
-    int smoke_id_ = -1, lines_id_ = -1, marker_id_ = -1;
+    int smoke_id_ = -1, lines_id_ = -1, marker_id_ = -1, arrows_id_ = -1;
+
+    // analysis (THEORY 12)
+    bool show_analysis_ = true, analysis_open_ = false;
+    bool averaging_ = false;
+    bool show_planes_ = true, wake_auto_ = true;
+    int wake_x_ = 0;
+    int n_probes_ = 0;
+    std::array<std::array<float, 3>, kMaxProbes> probe_pos_{};
+    int spec_source_ = 0; // 0 lift, 1.. a probe
+    int spec_comp_ = 1;   // probe component: 0 u_x, 1 u_y, 2 u_z, 3 rho
+    TunnelAnalysis analysis_;
 
     // bookkeeping
     std::uint64_t render_value_ = 0;

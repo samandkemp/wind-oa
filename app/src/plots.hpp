@@ -104,4 +104,82 @@ class TimeSeries {
     bool has_range_ = false, pinned_ = false;
 };
 
+// A static x-y plot into the rect [a, b] of a draw list: series sharing
+// axes fitted to their finite values (y from zero when `y_from_zero`; NaN
+// breaks a line), the axis ranges at the corners, an optional highlighted
+// vertical marker at x_marker and dim ones at `guides`.
+struct Series {
+    const std::vector<double>* x;
+    const std::vector<double>* y;
+    ImU32 colour;
+};
+
+inline void plot_xy(ImDrawList* dl, ImVec2 a, ImVec2 b, const std::vector<Series>& series,
+                    const char* x_label, const char* y_label, bool y_from_zero = false,
+                    double x_marker = std::nan(""), const std::vector<double>& guides = {}) {
+    dl->AddRectFilled(a, b, IM_COL32(4, 4, 12, 220), 3.0f);
+    dl->AddRect(a, b, IM_COL32(60, 60, 80, 255), 3.0f);
+    double x0 = 1e300, x1 = -1e300, y0 = y_from_zero ? 0.0 : 1e300, y1 = -1e300;
+    for (const Series& s : series)
+        for (std::size_t i = 0; i < s.x->size() && i < s.y->size(); ++i) {
+            const double x = (*s.x)[i], y = (*s.y)[i];
+            if (!std::isfinite(x) || !std::isfinite(y))
+                continue;
+            x0 = std::min(x0, x);
+            x1 = std::max(x1, x);
+            y0 = std::min(y0, y);
+            y1 = std::max(y1, y);
+        }
+    const float lh = ImGui::GetTextLineHeight();
+    const ImU32 grey = IM_COL32(150, 150, 170, 255);
+    dl->AddText({a.x + 4, a.y + 2}, grey, y_label);
+    if (!(x1 > x0) || !(y1 >= y0)) {
+        dl->AddText({a.x + 4, a.y + 2 + lh}, grey, "(no data yet)");
+        return;
+    }
+    if (y1 - y0 < 1e-12)
+        y1 = y0 + 1e-12;
+    const double pad = 0.08 * (y1 - y0);
+    if (!y_from_zero || y0 < 0.0)
+        y0 -= pad;
+    y1 += pad;
+    const float px0 = a.x + 6, px1 = b.x - 6, py0 = a.y + lh + 6, py1 = b.y - lh - 4;
+    auto X = [&](double x) { return float(px0 + (x - x0) / (x1 - x0) * (px1 - px0)); };
+    auto Y = [&](double y) { return float(py1 - (y - y0) / (y1 - y0) * (py1 - py0)); };
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%.3g", y1);
+    dl->AddText({b.x - 6 - ImGui::CalcTextSize(buf).x, a.y + 2}, grey, buf);
+    std::snprintf(buf, sizeof(buf), "%.3g", y0);
+    dl->AddText({b.x - 6 - ImGui::CalcTextSize(buf).x, py1 - lh}, grey, buf);
+    std::snprintf(buf, sizeof(buf), "%.3g", x0);
+    dl->AddText({px0, b.y - lh - 2}, grey, buf);
+    std::snprintf(buf, sizeof(buf), "%.3g  %s", x1, x_label);
+    dl->AddText({px1 - ImGui::CalcTextSize(buf).x, b.y - lh - 2}, grey, buf);
+    if (y0 < 0.0 && y1 > 0.0)
+        dl->AddLine({px0, Y(0.0)}, {px1, Y(0.0)}, IM_COL32(90, 90, 110, 255));
+    for (const double g : guides)
+        if (g >= x0 && g <= x1)
+            for (float yy = py0; yy < py1; yy += 6.0f) // dashed
+                dl->AddLine({X(g), yy}, {X(g), std::min(yy + 3.0f, py1)},
+                            IM_COL32(120, 160, 220, 150));
+    if (std::isfinite(x_marker) && x_marker >= x0 && x_marker <= x1)
+        dl->AddLine({X(x_marker), py0}, {X(x_marker), py1}, IM_COL32(255, 220, 120, 200), 1.0f);
+    for (const Series& s : series) {
+        bool pen = false;
+        ImVec2 last{};
+        for (std::size_t i = 0; i < s.x->size() && i < s.y->size(); ++i) {
+            const double x = (*s.x)[i], y = (*s.y)[i];
+            if (!std::isfinite(x) || !std::isfinite(y)) {
+                pen = false;
+                continue;
+            }
+            const ImVec2 q{X(x), Y(y)};
+            if (pen)
+                dl->AddLine(last, q, s.colour, 1.5f);
+            last = q;
+            pen = true;
+        }
+    }
+}
+
 } // namespace windoa::app

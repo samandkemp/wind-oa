@@ -16,7 +16,7 @@ layout(push_constant) uniform Params {
     vec4 right;  // xyz, -
     vec4 up;     // xyz, -
     ivec4 img;   // width, height, count, mode (0 points, 1 segments)
-    vec4 misc;   // radius (cells, points), alpha, -, -
+    vec4 misc;   // radius (cells, points), alpha, depth bias (cells), -
 } P;
 
 layout(std430, binding = 0) coherent buffer Image { uint image[]; };
@@ -38,7 +38,9 @@ vec4 project(vec3 p) {
 void blend(int ix, int iy, float dist, vec3 c, float a) {
     if (ix < 0 || iy < 0 || ix >= P.img.x || iy >= P.img.y) return;
     const int k = iy * P.img.x + ix;
-    if (dist >= depth[k]) return;
+    // the bias lets items lying in the slice plane (arrows, timelines,
+    // probes) show on it: the slice registers its hit a little early
+    if (dist >= depth[k] + P.misc.z) return;
     const vec4 old = unpackUnorm4x8(image[k]);
     image[k] = packUnorm4x8(vec4(mix(old.rgb, c, a), 1.0));
 }
@@ -55,12 +57,13 @@ void main() {
         const float r = clamp(P.misc.x / (s.z * P.eye.w) * 0.5 * float(P.img.y), 0.7, 6.0);
         const int ri = int(ceil(r));
         const int cx = int(floor(s.x)), cy = int(floor(s.y));
-        const vec3 c = colours[i].rgb;
+        const vec4 c = colours[i];  // alpha 0: hidden (a timeline particle between pulses)
+        if (c.a <= 0.0) return;
         for (int oy = -ri; oy <= ri; ++oy)
             for (int ox = -ri; ox <= ri; ++ox) {
                 const float ddx = float(cx + ox) + 0.5 - s.x, ddy = float(cy + oy) + 0.5 - s.y;
                 const float cov = clamp(r + 0.5 - sqrt(ddx * ddx + ddy * ddy), 0.0, 1.0);
-                if (cov > 0.0) blend(cx + ox, cy + oy, s.w, c, alpha * cov);
+                if (cov > 0.0) blend(cx + ox, cy + oy, s.w, c.rgb, alpha * cov * c.a);
             }
     } else {
         const vec3 a3 = verts[2 * i].xyz, b3 = verts[2 * i + 1].xyz;

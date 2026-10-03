@@ -25,11 +25,14 @@ const int MODE_VORTICITY = 2;
 const int MODE_VORT_X = 3;
 const int MODE_MACH = 4;
 const int MODE_SCHLIEREN = 5;
+const int MODE_MEAN_SPEED = 6;  // time-averaged (THEORY 12.1)
+const int MODE_TURB = 7;        // turbulence intensity of the averaged window
 
 const int CMODE_COOLWARM = 0;
 const int CMODE_VORT = 1;
 const int CMODE_GREY = 2;
 const int CMODE_MACH = 3;
+const int CMODE_SEQ = 4;  // sequential, for magnitudes from zero
 
 // Solid occupancy block edge, cells (must match render/volume.cpp).
 const int OCC_BLOCK = 4;

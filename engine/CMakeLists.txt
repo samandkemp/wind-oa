@@ -14,6 +14,8 @@ add_library(windoa_engine STATIC
     src/euler.cpp
     src/shapes.cpp
     src/isosurface.cpp
+    src/flow_stats.cpp
+    src/spectrum.cpp
 )
 windoa_add_shaders(windoa_engine
     shaders/lbm_init.comp
@@ -28,6 +30,7 @@ windoa_add_shaders(windoa_engine
     shaders/vox_shell_apply.comp
     shaders/vox_dist_band.comp
     shaders/vox_phi.comp
+    shaders/stats_accumulate.comp
     shaders/dye_step.comp
     shaders/lbm_turb.comp
     shaders/turb_blur.comp

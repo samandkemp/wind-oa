@@ -24,11 +24,12 @@ explained in [`docs/MODEL.md`](MODEL.md), every flag and default is listed in
   - [8. The headless tools](#8-the-headless-tools)
   - [9. Reading the output](#9-reading-the-output)
   - [10. A worked study, end to end](#10-a-worked-study-end-to-end)
-  - [11. Keeping findings honest](#11-keeping-findings-honest)
+  - [11. Averages, the wake survey and spectra](#11-averages-the-wake-survey-and-spectra)
+  - [12. Keeping findings honest](#12-keeping-findings-honest)
 - **Part 4 - Maintaining it**
-  - [12. Testing](#12-testing)
-  - [13. Extending it](#13-extending-it)
-  - [14. Troubleshooting](#14-troubleshooting)
+  - [13. Testing](#13-testing)
+  - [14. Extending it](#14-extending-it)
+  - [15. Troubleshooting](#15-troubleshooting)
 
 # Part 1 - Getting it running
 
@@ -76,7 +77,7 @@ ctest --preset quick
 
 `device_info` lists the GPUs the engine can see and the capabilities it relies on (an asynchronous
 compute queue, f16 storage, linear filtering of 32-bit float images). `ctest --preset quick` runs the
-smoke checks and the eleven short validation gates in about 40 s; every line should read `Passed`.
+smoke checks and the 14 short validation gates in about 80 s; every line should read `Passed`.
 
 ## 2. Running the app
 
@@ -159,19 +160,21 @@ the flow controls.
 | View | Shows |
 |---|---|
 | *surface* smooth / voxel | The body at the wall the solver uses (smooth), or its cells |
-| *paint surface Cp* | Pressure coefficient on the model: red compression, blue suction, against an upstream reference plane (a Pitot-static) |
+| *surface paint* | What the model is painted with: **pressure (Cp)**, red compression and blue suction against an upstream reference plane (a Pitot-static); **near-wall speed**, the flow one cell off the surface, which scales with the skin friction; **reversed flow**, blue where the near-wall flow runs upstream (separated); or **oil flow**, streaks along the near-wall flow as in a tunnel oil-film test |
 | *field* + *flow haze* | The chosen field through the tunnel, translucent; undisturbed flow is invisible |
-| *field slice* | The same field on a plane: vertical, horizontal or cross-stream |
-| *smoke streaklines* | Particles released continuously from the smoke wand (the cyan rectangle), like tunnel smoke |
+| *field slice* | The same field on a plane: vertical, horizontal or cross-stream; optionally with a **flow texture (LIC)**, noise smeared along the in-plane flow so every streamline shows at once, and **velocity arrows** on a grid |
+| *smoke* | Particles from the smoke wand (the cyan rectangle): **streaklines**, released continuously like tunnel smoke, or **timelines**, a line released across the wand every few steps like a pulsed hydrogen-bubble wire, whose bending shows the velocity profile |
 | *dye smoke* | A transported concentration from nozzles on the wand, which fills the wake; coloured by local speed (violet still, yellow fast) or white |
 | *streamlines* | Instantaneous field lines; they differ from smoke when the wake is unsteady |
 | *vortex cores (Q)* | Where rotation beats strain, as translucent shells (green at the threshold, amber at 4x); the threshold adapts to the flow's own vorticity |
+| *mean reversed flow* | Translucent teal shells where the time-averaged streamwise flow runs backwards: the mean recirculation bubbles (needs time averaging) |
 
 The fields are **speed** (deviation from the freestream: blue slower, red faster), **pressure**
 (Cp), **|vorticity|**, **streamwise vorticity** (signed, so trailing vortex pairs show as blue and
-orange tubes), **Mach** (blue subsonic, white at the sonic line, red supersonic) and **schlieren**
-(density gradients as white light, which shows shocks). The legends along the top follow what is
-on.
+orange tubes), **Mach** (blue subsonic, white at the sonic line, red supersonic), **schlieren**
+(density gradients as white light, which shows shocks), and two that need time averaging: **mean
+speed** and **turbulence intensity** (the rms of the fluctuations, 0 - 20 % of U). The legends
+along the top follow what is on.
 
 ### 3.5 Compare and the plots
 
@@ -180,7 +183,22 @@ a sandbox at this Reynolds number. Along the bottom the Cd, Cl and Cm plots scro
 ever expands, so small fluctuations never look like waves, and *refit plots* refocuses on the recent
 history (which happens by itself once settled).
 
-### 3.6 Screenshots and scripted runs
+### 3.6 The Analysis panel
+
+- *average the flow* accumulates the mean and the variance of every cell once the flow has
+  settled; a new operating point restarts the window, which refills once the flow settles again.
+  It feeds the mean-speed and turbulence fields, the reversed-flow shells and the wake survey.
+- The **wake survey** measures the drag a second way: from the fall in the averaged flow's
+  momentum between an upstream plane and a survey plane behind the model (both drawn in the
+  view). It is shown beside the force balance's mean over the same window, with the wake profile
+  at the survey plane. The two agree within about 1 % once a few flow-throughs are averaged.
+- **Probes** (up to four, coloured crosses in the view) record the velocity and density at a
+  point. The **spectrum** of the lift or of a probe component gives the shedding frequency as a
+  Strouhal number, $\mathrm{St} = f h / U$ on the body's height. Dashed lines mark the tunnel's
+  acoustic modes: sound ringing between the side walls, which shows in every spectrum and is not
+  shedding.
+
+### 3.7 Screenshots and scripted runs
 
 P saves a PNG of the window, panels included, to `screenshots/`. For a reproducible picture, the
 app can be scripted from the command line:
@@ -189,8 +207,10 @@ app can be scripted from the command line:
 windoa_app --model airliner --aoa 6 --show "q,lines,nosmoke" --warmup 8000 --frames 120 --shot out.png
 ```
 
-`--warmup` develops the flow before the first frame, `--frames` exits after that many, and `--shot`
-saves the last one. The view flags are listed in REFERENCE.
+`--warmup` develops the flow before the first frame, `--frames` exits after that many, `--shot`
+saves the last one and `--zoom` moves the camera nearer the model. The view flags, including the
+new views and the analysis (`avg`, `recirc`, `lic`, `arrows`, `timelines`, `oil`, `probes`), are
+listed in REFERENCE.
 
 # Part 2 - Building situations
 
@@ -289,7 +309,7 @@ The tools drive the engine without a window, so a study can run unattended and r
 
 | Tool | For |
 |---|---|
-| `tunnel_run` | The app's sandbox headless: any catalogue model, speed, spin, angle, turbulence, dye or f16, reporting settled means |
+| `tunnel_run` | The app's sandbox headless: any catalogue model, speed, spin, angle, turbulence, dye or f16, reporting settled means, the lift spectrum and, with `--average`, the wake survey |
 | `lbm_run` | A sphere or any STL in a bare solver, with the collision and boundary options exposed |
 | `euler_run sphere M` | A sphere in the compressible solver at Mach M |
 | `bench` | Throughput at each preset |
@@ -305,9 +325,11 @@ build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 300 --steps 
 `tunnel_run` prints ten progress lines and a summary:
 
 ```
-step   30000  u 0.0500  Cd +0.7173  Cl +0.0595  Cm +0.0089  max|u| 0.065  SETTLED after 2.5 flow-throughs  (3371 MLUPS)
-second-half mean: Cd 0.7163 (sd 0.0021)  Cl 0.0629 (sd 0.0050)  over 150 batches
-spin scale 1.000, cache: saved to cache (0.3 s) (1 entries)
+step   30000  u 0.0500  Cd +0.7146  Cl +0.0598  Cm +0.0090  max|u| 0.065  SETTLED after 2.5 flow-throughs  (3272 MLUPS)
+second-half mean: Cd 0.7135 (sd 0.0021)  Cl 0.0627 (sd 0.0048)  over 150 batches
+lift spectrum over 16000 steps: peak St 0.116 (period 2938 steps, amplitude 0.00474); next peaks at St 1.026 0.978  (h 17 cells; acoustic modes every St 1.022)
+shedding (strongest peak below the first acoustic mode): St 0.116
+spin scale 1.000, cache: saved to cache (0.5 s) (1 entries)
 ```
 
 | Field | Meaning |
@@ -318,6 +340,8 @@ spin scale 1.000, cache: saved to cache (0.3 s) (1 entries)
 | phase | RAMPING, DEVELOPING, SETTLED (with the flow-throughs it took to settle) or NOT SETTLED |
 | MLUPS | Throughput so far |
 | second-half mean | The mean and standard deviation of the smoothed coefficients over the second half of the run |
+| lift spectrum | The strongest peaks of the lift's spectrum over the developed flow, as Strouhal numbers on the body's height, and the spacing of the tunnel's acoustic modes |
+| shedding | The strongest lift peak below the first acoustic mode: the shedding frequency |
 | spin scale | Below 1 when the wall-speed cap limited the requested spin |
 
 The standard deviation is of smoothed, correlated values, so it understates the uncertainty of the
@@ -330,23 +354,47 @@ throughput varies from run to run.
 **Question:** does half-precision storage change the Ahmed body's drag?
 
 ```
-build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 300 --steps 100
-build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 300 --steps 100 --f16
+build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 300 --steps 100 --no-cache
+build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 300 --steps 100 --no-cache --f16
 ```
 
 | Storage | Throughput | Settled after | Second-half mean Cd | sd |
 |---|---|---|---|---|
-| f32 | 3,371 MLUPS | 2.5 flow-throughs | 0.7163 | 0.0021 |
-| f16 | 4,380 MLUPS | 3.6 flow-throughs | 0.7214 | 0.0046 |
+| f32 | 3,272 MLUPS | 2.5 flow-throughs | 0.7135 | 0.0021 |
+| f16 | 4,369 MLUPS | 3.1 flow-throughs | 0.7190 | 0.0053 |
 
-Half precision is 30 % faster per step, and its mean is 0.7 % higher. However, its scatter is 2.2
-times larger, so matching f32's confidence in the mean needs $(0.0046 / 0.0021)^2 \approx 4.8$
-times as many samples, and the noisier signal also took 1.4 times as long to settle. At 1.3 times
-the speed, the same confidence costs about 3.7 times the wall-clock time. The faster storage is
+Half precision is 34 % faster per step, and its mean is 0.8 % higher. However, its scatter is 2.5
+times larger, so matching f32's confidence in the mean needs $(0.0053 / 0.0021)^2 \approx 6.4$
+times as many samples, and the noisier signal also took 1.2 times as long to settle. At 1.34
+times the speed, the same confidence costs about 4.8 times the wall-clock time; and its lift
+spectrum carries a spurious peak at St 0.61. The faster storage is
 therefore slower for this kind of question, which is why it stays opt-in; it remains useful where
 a picture, not a mean, is the goal.
 
-## 11. Keeping findings honest
+## 11. Averages, the wake survey and spectra
+
+Three measurements sit on top of the flow (THEORY §12). They read the solver's fields and never
+write them, so switching them on changes nothing about the flow.
+
+- **Time averages** turn an unsteady wake into its mean: the mean recirculation bubble, the mean
+  wake deficit and the turbulence intensity. Average over several shedding cycles; a window
+  shorter than a few periods leaves the last cycle's imprint.
+- **The wake survey** is a second measurement of the drag, from a control-volume momentum
+  balance of the averaged flow. In free air it agrees with the force balance within about 1 %
+  (V25); a larger difference means the window is still short or the survey plane sits too close
+  to the body. In ground mode the floor's shear lies inside the volume, so the survey includes
+  it.
+- **Spectra** of the lift and of probes give frequencies. The Strouhal number reported for the
+  lift is the strongest peak below the tunnel's first acoustic mode; peaks at St of order one and
+  above, at the dashed lines, are sound between the side walls.
+
+Headless, `tunnel_run --average --probe X,Y,Z` reports all three at the end of the run:
+
+```
+build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 1500 --steps 21 --average
+```
+
+## 12. Keeping findings honest
 
 - A finding should name its grid, speed, size, reference area and storage precision, and the
   window it averaged over.
@@ -358,12 +406,12 @@ a picture, not a mean, is the goal.
 
 # Part 4 - Maintaining it
 
-## 12. Testing
+## 13. Testing
 
 | Command | Runs | Time |
 |---|---|---|
-| `ctest --preset quick` | The smoke checks and the eleven short gates | about 40 s |
-| `ctest --preset dev` | Everything, all 23 gates included | about 13 minutes |
+| `ctest --preset quick` | The smoke checks and the 14 short gates | about 80 s |
+| `ctest --preset dev` | Everything, all 26 gates included | about 13 minutes |
 | `ctest --preset dev -R V17` | One test by name | - |
 
 ### The validation layers
@@ -385,36 +433,36 @@ Both must print PASS after any change that is not meant to alter the physics. Th
 the build tree; if it is wiped, regenerate them from a known-good build with `--save` before making
 changes.
 
-## 13. Extending it
+## 14. Extending it
 
-### 13.1 Adding a catalogue model
+### 14.1 Adding a catalogue model
 
 Add a builder function to `engine/src/catalogue.cpp` that returns a `geometry::Mesh` authored nose
 towards $-x$, and register it with `add(group, id, label, builder, size, ground, spinners)` in
 `build_entries()`. Then run `tunnel_run --catalogue`: every model must voxelise inside the tunnel at
 its default placement (CTest `P2_catalogue` runs the same check).
 
-### 13.2 Adding a tunable
+### 14.2 Adding a tunable
 
 Add the field, with a comment giving its unit and reason, to `TunnelSettings` in
 `engine/include/windoa/tunnel.hpp`; tunables live there rather than as literals in the code. If it
 changes the flow, add it to the flow-cache key in `Tunnel::operating_point_key`, and list it in
 REFERENCE.
 
-### 13.3 Adding a validation gate
+### 14.3 Adding a validation gate
 
 New physics needs a new gate before it is made fast. Name the external reference first, write the
 gate as an executable under `validation/` that prints what it compared against and exits non-zero
 on failure, and register it in `validation/CMakeLists.txt` with `windoa_gate(...)` (adding `LONG` if
 it takes over a minute). The full procedure is in [`docs/VALIDATION.md`](VALIDATION.md#adding-one).
 
-### 13.4 Adding a shader
+### 14.4 Adding a shader
 
 Write the GLSL under the module's `shaders/` directory and add it with
 `windoa_add_shaders(<target> shaders/x.comp)`; it is compiled at build time and available as
 `windoa::spv::x` from `#include "x_spv.hpp"`. Shaders are never loaded from disk at run time.
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 ### Setup
 
@@ -436,5 +484,11 @@ Write the GLSL under the module's `shaders/` directory and add it with
 
 - **Two runs disagree.** Check that everything except the studied variable matched (section 7),
   including the storage precision and the reference area.
+- **The spectrum's strongest peak is at St of order one or above.** That is an acoustic mode of
+  the tunnel (the dashed lines), not shedding; the shedding Strouhal number is reported
+  separately, below the first mode.
+- **The wake survey and the force balance differ by more than about 1 %.** Average for longer,
+  move the survey plane further behind the body, and check the ground mode (the floor's shear
+  counts in the survey).
 - **A gate fails after a change.** Understand why before changing any tolerance;
   [`docs/VALIDATION.md`](VALIDATION.md) explains what each gate checks.

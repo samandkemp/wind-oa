@@ -95,8 +95,11 @@ ImU32 ramp(const std::vector<Stop>& s, float t) {
     return ImGui::ColorConvertFloat4ToU32({s.back().r, s.back().g, s.back().b, 1.0f});
 }
 
-const char* kFieldNames[] = {"speed vs freestream",  "pressure (Cp)",     "|vorticity|",
-                             "streamwise vorticity", "local Mach number", "schlieren (shocks)"};
+const char* kFieldNames[] = {"speed vs freestream",   "pressure (Cp)",
+                             "|vorticity|",           "streamwise vorticity",
+                             "local Mach number",     "schlieren (shocks)",
+                             "mean speed (averaged)", "turbulence intensity (averaged)"};
+const std::vector<Stop> kRecirc = {{0.0f, 0.25f, 0.75f, 0.85f}, {1.0f, 0.10f, 0.35f, 0.95f}};
 
 } // namespace
 
@@ -133,13 +136,16 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
     tracers_ = std::make_unique<render::Tracers>(*ctx_, ts_.nx, ts_.ny, ts_.nz);
     for (int k = 0; k < SimWorker::kSlots; ++k) {
         const SimWorker::Snapshot& sn = sim_->snapshot(k);
-        renderer_->set_sources(k, {sn.flags.get(), sn.macro.get(), sn.aux.get(), sn.dye.get()});
+        renderer_->set_sources(k, {sn.flags.get(), sn.macro.get(), sn.aux.get(), sn.dye.get(),
+                                   sn.mean.get(), sn.m2.get()});
         tracers_->set_sources(k, *sn.flags, *sn.macro);
     }
     smoke_id_ = renderer_->add_splat_source({&tracers_->smoke_pos(), &tracers_->smoke_colours()});
     lines_id_ = renderer_->add_splat_source({&tracers_->line_verts(), &tracers_->line_colours()});
     marker_id_ =
         renderer_->add_splat_source({&tracers_->marker_verts(), &tracers_->marker_colours()});
+    arrows_id_ =
+        renderer_->add_splat_source({&tracers_->arrow_verts(), &tracers_->arrow_colours()});
 
     VkQueryPoolCreateInfo qi{};
     qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -191,9 +197,31 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
         show_help_ = true;
     if (has("voxel"))
         rs_.surface = render::Surface::Voxel;
-    static const char* kFieldIds[] = {"speed", "pressure", "vorticity",
-                                      "vortx", "mach",     "schlieren"};
-    for (int k = 0; k < 6; ++k)
+    if (has("avg"))
+        averaging_ = true;
+    if (has("recirc"))
+        rs_.recirculation = true;
+    if (has("lic"))
+        rs_.slice_lic = true;
+    if (has("arrows"))
+        slice_arrows_ = true;
+    if (has("timelines"))
+        smoke_mode_ = 1;
+    if (has("nopaint"))
+        paint_mode_ = 0;
+    if (has("wallspeed"))
+        paint_mode_ = 2;
+    if (has("reversed"))
+        paint_mode_ = 3;
+    if (has("oil"))
+        paint_mode_ = 4;
+    if (has("analysis"))
+        analysis_open_ = true;
+    if (has("probes"))
+        n_probes_ = 2; // placed beside the model once it is known
+    static const char* kFieldIds[] = {"speed", "pressure",  "vorticity", "vortx",
+                                      "mach",  "schlieren", "mean",      "turb"};
+    for (int k = 0; k < 8; ++k)
         if (o.field == kFieldIds[k])
             rs_.field = static_cast<render::Field>(k);
     choose_model(start);
@@ -210,6 +238,8 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
     }
     if (show_dye_)
         sim_->post([](Tunnel& t) { t.set_dye(true); });
+    if (averaging_)
+        sim_->post([](Tunnel& t) { t.set_averaging(true); });
     if (o.transonic) { // start in transonic mode (its natural view)
         sim_->post([](Tunnel& t) { t.set_transonic(true); });
         rs_.field = render::Field::Mach;
@@ -226,6 +256,19 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
         sim_->set_running(true);
     }
     sim_->flush();
+    if (o.zoom > 0.0f) { // scripted close-ups
+        camera_.target = sim_->status().placed_centre;
+        camera_.distance *= o.zoom;
+    }
+    if (n_probes_ > 0) { // scripted: probes in the wake (centreline, shear layer)
+        const TunnelStatus st = sim_->status();
+        const float L = placement_.length_cells;
+        probe_pos_[0] = {st.placed_centre[0] + 0.8f * L, st.placed_centre[1], st.placed_centre[2]};
+        probe_pos_[1] = {st.placed_centre[0] + 0.8f * L, st.placed_centre[1] + st.ext_y_half,
+                         st.placed_centre[2]};
+        post_probes();
+        sim_->flush();
+    }
 }
 
 App::~App() {
@@ -445,6 +488,12 @@ void App::record_frame(const Swapchain::Frame& f, const SimWorker::Frame& sf,
         last_snap_steps_ = sf.steps;
         const float u_ref = std::max(st.u_applied, 1e-3f);
         const bool lbm = !sf.transonic; // tracers integrate in lattice time
+        tracers_->set_timelines(smoke_mode_ == 1 ? pulse_steps_ : 0);
+        const std::vector<std::array<float, 3>> probes(probe_pos_.begin(),
+                                                       probe_pos_.begin() + n_probes_);
+        const bool planes = show_planes_ && averaging_ && lbm && analysis_.wake_valid;
+        tracers_->set_overlay(planes ? analysis_.x_upstream : -1, planes ? analysis_.x_survey : -1,
+                              probes);
         if (lbm)
             tracers_->record(cmd, sf.slot, steps, u_ref, show_smoke_, show_streamlines_);
 
@@ -456,7 +505,8 @@ void App::record_frame(const Swapchain::Frame& f, const SimWorker::Frame& sf,
             // Cp divides by u^2: while the inlet ramps it is startup noise over
             // a tiny dynamic pressure, so the body stays plain until a third of
             // the way; the haze fades in with the speed.
-            s.paint_cp = rs_.paint_cp && st.u_applied > 0.3f * st.u_command;
+            s.paint_surface = paint_mode_ > 0 && st.u_applied > 0.3f * st.u_command;
+            s.stats_inv_weight = sf.stats_inv_weight;
             const float frac = std::min(1.0f, st.u_applied / std::max(st.u_command, 1e-3f));
             s.haze_gain = rs_.haze_gain * frac * frac;
             s.dye = show_dye_ && sf.dye;
@@ -467,13 +517,27 @@ void App::record_frame(const Swapchain::Frame& f, const SimWorker::Frame& sf,
             s.gamma = euler::kGamma;
             s.dye = false;
             s.vortex_cores = false;
+            s.paint_surface = paint_mode_ > 0;
+            s.stats_inv_weight = 0.0f;
+            s.recirculation = false;
+        }
+        s.paint = static_cast<render::Paint>(std::max(paint_mode_ - 1, 0));
+        std::uint32_t arrow_segments = 0;
+        if (slice_arrows_ && s.slice_axis >= 0) {
+            const int dims[3] = {ts_.nx, ts_.ny, ts_.nz};
+            arrow_segments = tracers_->record_arrows(cmd, sf.slot, s.slice_axis,
+                                                     s.slice_pos * float(dims[s.slice_axis]),
+                                                     arrow_spacing_, s.u_ref);
         }
         std::vector<render::SplatDraw> splats;
         if (lbm && show_smoke_) {
-            splats.push_back(
-                {smoke_id_, render::Tracers::kSmokeParticles, false, smoke_radius_, 0.85f});
-            splats.push_back({marker_id_, 4, true, 0.0f, 0.9f});
+            splats.push_back({smoke_id_, render::Tracers::kSmokeParticles, false, smoke_radius_,
+                              0.85f, smoke_mode_ == 1 ? 1.0f : 0.0f});
         }
+        if (lbm && (show_smoke_ || n_probes_ > 0 || planes))
+            splats.push_back({marker_id_, tracers_->marker_segments(), true, 0.0f, 0.9f, 1.0f});
+        if (arrow_segments > 0)
+            splats.push_back({arrows_id_, arrow_segments, true, 0.0f, 0.9f, 1.0f});
         if (lbm && show_streamlines_)
             splats.push_back({lines_id_, render::Tracers::line_segments(), true, 0.0f, 0.8f});
         renderer_->record(cmd, camera_.view(fov_deg_), s, sf.slot, sf.geometry_version, splats);
@@ -604,6 +668,8 @@ void App::handle_keys(const TunnelStatus& st) {
 
 void App::ui(const TunnelStatus& st) {
     update_title(st);
+    if (st.analysis_version != analysis_.version)
+        analysis_ = sim_->analysis();
     if (show_plots_)
         plot_strip(st);
     legends(st);
@@ -615,6 +681,7 @@ void App::ui(const TunnelStatus& st) {
     panel_model(st);
     panel_compare(st);
     panel_view(st);
+    panel_analysis(st);
 }
 
 namespace {
@@ -856,14 +923,21 @@ void App::panel_view(const TunnelStatus& st) {
     int surf = static_cast<int>(rs_.surface);
     if (ImGui::Combo("surface", &surf, kSurface, 3))
         rs_.surface = static_cast<render::Surface>(surf);
-    ImGui::Checkbox("paint surface Cp", &rs_.paint_cp);
-    ImGui::SetItemTooltip("Pressure coefficient of the air touching the model: red compression,\n"
-                          "blue suction -- against an upstream reference plane (a Pitot-static).");
+    static const char* kPaint[] = {"none", "pressure (Cp)", "near-wall speed", "reversed flow",
+                                   "oil flow"};
+    ImGui::Combo("surface paint", &paint_mode_, kPaint, 5);
+    ImGui::SetItemTooltip(
+        "Cp: pressure of the air touching the model (red compression, blue suction).\n"
+        "Near-wall speed: the flow one cell off the surface, which scales with the skin\n"
+        "friction. Reversed flow: blue where the near-wall flow runs upstream (separated).\n"
+        "Oil flow: streaks along the near-wall flow, as in a tunnel oil-film test.");
     int field = static_cast<int>(rs_.field);
     if (ImGui::Combo("field", &field, kFieldNames, IM_ARRAYSIZE(kFieldNames))) {
         rs_.field = static_cast<render::Field>(field);
         rs_.haze_floor = -1.0f;
     }
+    if (field >= 6 && st.avg_samples == 0)
+        ImGui::TextColored({1.0f, 0.75f, 0.35f, 1.0f}, "  needs time averaging (Analysis panel)");
     ImGui::Checkbox("flow haze (3D, translucent)", &rs_.haze);
     ImGui::SetItemTooltip("The field through the whole tunnel; undisturbed flow is transparent,\n"
                           "so only what the model changes shows. 'haze floor' sets the cut.");
@@ -875,13 +949,30 @@ void App::panel_view(const TunnelStatus& st) {
     }
     static const char* kSlice[] = {"off", "vertical (x-y)", "horizontal (x-z)", "cross (y-z)"};
     ImGui::Combo("field slice", &slice_mode_, kSlice, 4);
-    if (slice_mode_)
+    if (slice_mode_) {
         ImGui::SliderFloat("  slice pos", &rs_.slice_pos, 0.02f, 0.98f, "%.2f");
+        ImGui::Checkbox("  flow texture (LIC)", &rs_.slice_lic);
+        ImGui::SetItemTooltip("Line-integral convolution: noise smeared along the in-plane flow,\n"
+                              "so the slice shows every streamline at once.");
+        ImGui::Checkbox("  velocity arrows", &slice_arrows_);
+        if (slice_arrows_)
+            ImGui::SliderFloat("  arrow spacing", &arrow_spacing_, 2.0f, 12.0f, "%.0f cells");
+    }
     ImGui::Separator();
     if (st.transonic) {
         ImGui::TextDisabled("(smoke, dye, streamlines, vortex cores: subsonic only)");
     } else {
-        ImGui::Checkbox("smoke streaklines", &show_smoke_);
+        ImGui::Checkbox("smoke", &show_smoke_);
+        if (show_smoke_) {
+            static const char* kSmoke[] = {"streaklines (wand)", "timelines (pulsed wire)"};
+            ImGui::Combo("  smoke as", &smoke_mode_, kSmoke, 2);
+            ImGui::SetItemTooltip(
+                "Streaklines: continuous smoke from the wand. Timelines: a line of\n"
+                "particles released across the wand every few steps, as from a pulsed\n"
+                "hydrogen-bubble wire; their deformation shows the velocity profile.");
+            if (smoke_mode_ == 1)
+                ImGui::SliderInt("  pulse every", &pulse_steps_, 20, 300, "%d steps");
+        }
         ImGui::Checkbox("dye smoke (volumetric)", &show_dye_);
         ImGui::SetItemTooltip(
             "A transported concentration from nozzles on the smoke wand: fills and\n"
@@ -903,6 +994,12 @@ void App::panel_view(const TunnelStatus& st) {
             "thresholded at a multiple of the flow's own RMS: the dominant cores.");
         if (rs_.vortex_cores)
             ImGui::SliderFloat("  Q threshold", &rs_.q_sense, 0.1f, 10.0f, "%.2f");
+        ImGui::Checkbox("mean reversed flow", &rs_.recirculation);
+        ImGui::SetItemTooltip("Translucent shells where the time-averaged streamwise flow runs\n"
+                              "backwards: the mean recirculation bubbles. Needs time averaging.");
+        if (rs_.recirculation && st.avg_samples == 0)
+            ImGui::TextColored({1.0f, 0.75f, 0.35f, 1.0f},
+                               "  needs time averaging (Analysis panel)");
     }
     if (!st.transonic && (show_smoke_ || show_dye_)) {
         ImGui::Checkbox("smoke tracks model", &rake_track_);
@@ -932,6 +1029,192 @@ void App::panel_view(const TunnelStatus& st) {
     ImGui::SliderFloat("render scale", &render_scale_, 0.25f, 1.0f, "%.2f");
     ImGui::SliderFloat("field of view", &fov_deg_, 20.0f, 90.0f, "%.0f deg");
     ImGui::TextDisabled("RMB orbit, MMB pan, wheel zoom, WASD/QE, F focus");
+    ImGui::End();
+}
+
+void App::post_probes() {
+    const std::vector<std::array<float, 3>> p(probe_pos_.begin(), probe_pos_.begin() + n_probes_);
+    sim_->post([p](Tunnel& t) { t.set_probes(p); });
+}
+
+// Time averaging, the wake survey, probes and spectra (THEORY 12).
+void App::panel_analysis(const TunnelStatus& st) {
+    place(0.505f, 0.46f, 0.24f, 0.35f);
+    ImGui::SetNextWindowCollapsed(!analysis_open_, ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Analysis")) {
+        ImGui::End();
+        return;
+    }
+    const TunnelAnalysis& a = analysis_;
+    const ImVec4 warn{1.0f, 0.75f, 0.35f, 1.0f};
+    const float plot_h = 110.0f * ImGui::GetStyle().FontScaleDpi;
+    auto plot_area = [&](float h) {
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const float w = ImGui::GetContentRegionAvail().x;
+        ImGui::Dummy({w, h});
+        return std::pair<ImVec2, ImVec2>{p0, {p0.x + w, p0.y + h}};
+    };
+
+    ImGui::SeparatorText("time averaging");
+    if (st.transonic)
+        ImGui::TextDisabled("(subsonic only)");
+    if (ImGui::Checkbox("average the flow", &averaging_)) {
+        const bool on = averaging_;
+        sim_->post([on](Tunnel& t) { t.set_averaging(on); });
+    }
+    ImGui::SetItemTooltip(
+        "Accumulate the mean and the variance of every cell while the flow is\n"
+        "developed; a new operating point restarts the window. Feeds the mean-speed\n"
+        "and turbulence fields, the reversed-flow shells and the wake survey.");
+    if (averaging_) {
+        ImGui::SameLine();
+        if (ImGui::Button("restart"))
+            sim_->post([](Tunnel& t) { t.restart_averaging(); });
+        if (st.averaging_active)
+            ImGui::Text("%d samples over %.2f flow-throughs", st.avg_samples, st.avg_flow_throughs);
+        else
+            ImGui::TextDisabled("waiting for the flow to settle");
+    }
+
+    ImGui::SeparatorText("wake survey");
+    if (!averaging_) {
+        ImGui::TextDisabled("needs time averaging");
+    } else if (!a.wake_valid) {
+        ImGui::TextDisabled("collecting the mean flow...");
+    } else {
+        ImGui::Text("momentum balance   Cd %.4f", a.cd_wake);
+        ImGui::Text("force balance      Cd %.4f   (%+.2f %%)", a.cd_balance,
+                    (a.cd_wake / std::max(std::abs(a.cd_balance), 1e-12) - 1.0) * 100.0);
+        ImGui::SetItemTooltip(
+            "Two measurements of one drag: the fall in the mean flow's momentum flux\n"
+            "between the upstream plane and the survey plane, and the force on the\n"
+            "model averaged over the same window (THEORY 12.2).");
+        ImGui::TextDisabled("planes x = %d and %d;  mass flux change %.1e", a.x_upstream,
+                            a.x_survey, a.mass_imbalance);
+        if (a.includes_floor)
+            ImGui::TextColored(warn, "ground mode: the floor's shear is inside the volume");
+        std::vector<double> y(a.profile_y.begin(), a.profile_y.end()),
+            uy(a.profile_uy.begin(), a.profile_uy.end()), z(a.profile_z.begin(), a.profile_z.end()),
+            uz(a.profile_uz.begin(), a.profile_uz.end());
+        const auto [p0, p1] = plot_area(plot_h);
+        plot_xy(ImGui::GetWindowDrawList(), p0, p1,
+                {{&y, &uy, IM_COL32(255, 140, 50, 255)}, {&z, &uz, IM_COL32(80, 180, 255, 255)}},
+                "cells", "mean u_x / U: across y, z");
+    }
+    ImGui::Checkbox("show planes", &show_planes_);
+    ImGui::SameLine();
+    if (ImGui::Checkbox("auto plane", &wake_auto_)) {
+        const int x = wake_auto_ ? -1 : (a.x_survey > 0 ? a.x_survey : ts_.nx / 2);
+        wake_x_ = x < 0 ? wake_x_ : x;
+        sim_->post([x](Tunnel& t) { t.set_wake_plane(x); });
+    }
+    if (!wake_auto_ && ImGui::SliderInt("survey plane x", &wake_x_, 1, ts_.nx - 2)) {
+        const int x = wake_x_;
+        sim_->post([x](Tunnel& t) { t.set_wake_plane(x); });
+    }
+
+    ImGui::SeparatorText("probes and spectra");
+    int n = n_probes_;
+    if (ImGui::SliderInt("probes", &n, 0, kMaxProbes)) {
+        // new probes start in the wake: centreline, shear layer, further
+        // downstream, and upstream as a freestream reference
+        const float L = placement_.length_cells;
+        const auto c = st.placed_centre;
+        const std::array<std::array<float, 3>, kMaxProbes> defaults = {
+            {{c[0] + 0.8f * L, c[1], c[2]},
+             {c[0] + 0.8f * L, c[1] + st.ext_y_half, c[2]},
+             {c[0] + 1.4f * L, c[1], c[2]},
+             {std::max(4.0f, c[0] - 0.6f * L), c[1], c[2]}}};
+        for (int i = n_probes_; i < n; ++i) {
+            probe_pos_[i] = defaults[i];
+            probe_pos_[i][0] = std::min(probe_pos_[i][0], float(ts_.nx - ts_.outlet_sponge - 2));
+        }
+        n_probes_ = n;
+        spec_source_ = std::min(spec_source_, n_probes_);
+        post_probes();
+    }
+    for (int i = 0; i < n_probes_; ++i) {
+        ImGui::PushID(i);
+        const auto& pc = render::Tracers::kProbeColours[i];
+        ImGui::ColorButton("##c", {pc[0], pc[1], pc[2], 1.0f}, ImGuiColorEditFlags_NoTooltip,
+                           {ImGui::GetFrameHeight(), ImGui::GetFrameHeight()});
+        ImGui::SameLine();
+        if (ImGui::DragFloat3("x y z", probe_pos_[i].data(), 0.25f, 0.0f, float(ts_.nx - 1),
+                              "%.1f")) {
+            probe_pos_[i][1] = std::clamp(probe_pos_[i][1], 0.0f, float(ts_.ny - 1));
+            probe_pos_[i][2] = std::clamp(probe_pos_[i][2], 0.0f, float(ts_.nz - 1));
+            post_probes();
+        }
+        ImGui::PopID();
+    }
+    std::vector<std::string> names{"lift (Cl)"};
+    for (int i = 0; i < n_probes_; ++i)
+        names.push_back("probe " + std::to_string(i + 1));
+    std::vector<const char*> cnames;
+    for (const auto& s : names)
+        cnames.push_back(s.c_str());
+    ImGui::Combo("signal", &spec_source_, cnames.data(), int(cnames.size()));
+    if (spec_source_ > 0) {
+        static const char* kComp[] = {"u_x", "u_y", "u_z", "rho (pressure)"};
+        ImGui::Combo("component", &spec_comp_, kComp, 4);
+    }
+    const bool probe = spec_source_ > 0 && spec_source_ <= a.n_probes;
+    const Spectrum& sp = probe ? a.probe_spec[spec_source_ - 1][spec_comp_] : a.lift;
+    if (sp.freq.empty()) {
+        ImGui::TextDisabled(st.developing ? "waiting for the flow to settle"
+                                          : "collecting the developed signal...");
+    } else {
+        const double st_scale = a.l_ref / std::max(a.u_ref, 1e-9); // St per (cycles / step)
+        const double st_peak = sp.peak_freq * st_scale;
+        const double st_ac = a.f_acoustic * st_scale; // the first acoustic mode, as St
+        if (!probe && a.st_shedding > 0.0)
+            ImGui::Text("shedding St %.3f   (period %.0f steps)", a.st_shedding,
+                        st_scale / a.st_shedding);
+        if (sp.peak_amp > 0.0) {
+            const double mode = st_peak / std::max(st_ac, 1e-12);
+            const bool acoustic = std::abs(mode - std::round(mode)) < 0.05 && mode > 0.8;
+            ImGui::Text("strongest peak St %.3f   (period %.0f steps)%s", st_peak,
+                        1.0 / sp.peak_freq, acoustic ? "  = acoustic mode" : "");
+        } else {
+            ImGui::TextDisabled("no peak: the signal is steady");
+        }
+        ImGui::SetItemTooltip(
+            "St = f h / U with h = %.0f cells, the body's height across the flow.\n"
+            "Window: %.0f steps of the developed flow. Dashed lines: the tunnel's\n"
+            "transverse acoustic modes (sound between the side walls, St %.2f apart).",
+            a.l_ref, a.window_steps, st_ac);
+        std::vector<double> stx, amp;
+        for (std::size_t k = 1; k < sp.freq.size(); ++k) {
+            const double s = sp.freq[k] * st_scale;
+            if (s > std::max(2.0, 3.0 * st_peak))
+                break;
+            stx.push_back(s);
+            amp.push_back(sp.amp[k]);
+        }
+        const auto [p0, p1] = plot_area(plot_h);
+        std::vector<double> modes;
+        for (int m = 1; m <= 8; ++m)
+            modes.push_back(m * st_ac);
+        plot_xy(ImGui::GetWindowDrawList(), p0, p1, {{&stx, &amp, IM_COL32(255, 220, 120, 255)}},
+                "St", "amplitude spectrum", true,
+                !probe && a.st_shedding > 0.0 ? a.st_shedding : st_peak, modes);
+    }
+    // the signal's recent history
+    std::vector<double> ht = a.hist_t, hv;
+    if (probe)
+        hv.assign(a.hist_probe[spec_source_ - 1][spec_comp_].begin(),
+                  a.hist_probe[spec_source_ - 1][spec_comp_].end());
+    else
+        hv = a.hist_cl;
+    if (!ht.empty()) {
+        const ImU32 col = probe ? ImGui::ColorConvertFloat4ToU32(
+                                      {render::Tracers::kProbeColours[spec_source_ - 1][0],
+                                       render::Tracers::kProbeColours[spec_source_ - 1][1],
+                                       render::Tracers::kProbeColours[spec_source_ - 1][2], 1.0f})
+                                : IM_COL32(69, 171, 255, 255);
+        const auto [p0, p1] = plot_area(0.8f * plot_h);
+        plot_xy(ImGui::GetWindowDrawList(), p0, p1, {{&ht, &hv, col}}, "step", "history");
+    }
     ImGui::End();
 }
 
@@ -969,6 +1252,12 @@ void App::help_window() {
     ImGui::Text("    panel) and flow topology; treat absolute Cd as qualitative.");
     ImGui::BulletText("Speed haze shows DEVIATION from the freestream: blue slower, red faster.");
     ImGui::BulletText("Transonic: inviscid Euler, Mach 0.3-1.6 -- try the schlieren field.");
+    ImGui::SeparatorText("Measuring it");
+    ImGui::BulletText("Analysis panel: average the flow once SETTLED, then the mean-speed and");
+    ImGui::Text("    turbulence fields, the reversed-flow shells and the wake survey work.");
+    ImGui::BulletText("Probes record the flow at points; the spectrum gives the shedding");
+    ImGui::Text("    frequency as a Strouhal number (St = f h / U).");
+    ImGui::BulletText("Surface paint: Cp, near-wall speed, reversed flow or oil-flow streaks.");
     ImGui::SeparatorText("More");
     ImGui::TextDisabled("docs/GUIDE.md (operating it), docs/MODEL.md (how it works),");
     ImGui::TextDisabled("docs/REFERENCE.md (every control and default)");
@@ -984,25 +1273,34 @@ void App::legends(const TunnelStatus& st) {
     };
     std::vector<Entry> list;
     const bool field_shown = rs_.haze || slice_mode_ != 0;
-    if (rs_.paint_cp || field_shown) {
-        if (field_shown) {
-            static const char* titles[] = {"speed vs freestream", "Cp colour scale",
-                                           "|vorticity| / U",     "streamwise vorticity",
-                                           "local Mach number",   "schlieren  |grad rho|"};
-            static const char* ends[] = {"blue slower .. red faster",
-                                         "blue suction .. red stagnation",
-                                         "white weak .. red strong",
-                                         "blue / orange = opposite spin",
-                                         "blue subsonic, white M = 1, red super",
-                                         "bright = shocks and expansions"};
-            const int f = static_cast<int>(rs_.field);
-            const std::vector<Stop>* s = f == 3 ? &kVort : f == 5 ? &kGrey : &kCoolwarm;
-            (void)st;
-            list.push_back({s, titles[f], ends[f]});
-        } else {
-            list.push_back({&kCoolwarm, "Cp colour scale", "blue suction .. red stagnation"});
-        }
+    const int f = static_cast<int>(rs_.field);
+    if (field_shown) {
+        static const char* titles[] = {"speed vs freestream",   "Cp colour scale",
+                                       "|vorticity| / U",       "streamwise vorticity",
+                                       "local Mach number",     "schlieren  |grad rho|",
+                                       "mean speed (averaged)", "turbulence intensity"};
+        static const char* ends[] = {"blue slower .. red faster",
+                                     "blue suction .. red stagnation",
+                                     "white weak .. red strong",
+                                     "blue / orange = opposite spin",
+                                     "blue subsonic, white M = 1, red super",
+                                     "bright = shocks and expansions",
+                                     "blue slower .. red faster (mean)",
+                                     "0 .. 20 %% of U (rms of the fluctuations)"};
+        const std::vector<Stop>* s = f == 3   ? &kVort
+                                     : f == 5 ? &kGrey
+                                     : f == 7 ? &kDye
+                                              : &kCoolwarm;
+        list.push_back({s, titles[f], ends[f]});
     }
+    if (paint_mode_ == 1 && !(field_shown && f == 1))
+        list.push_back({&kCoolwarm, "surface Cp", "blue suction .. red stagnation"});
+    else if (paint_mode_ == 2)
+        list.push_back({&kDye, "surface: near-wall speed", "still .. 1.2 U (skin friction)"});
+    else if (paint_mode_ == 3)
+        list.push_back({&kCoolwarm, "surface: near-wall flow", "blue reversed .. red forward"});
+    if (!st.transonic && rs_.recirculation && st.avg_samples > 0)
+        list.push_back({&kRecirc, "mean reversed flow", "time-averaged u_x < 0"});
     if (!st.transonic && show_dye_ && st.dye_on && rs_.dye_by_speed)
         list.push_back({&kDye, "dye smoke: local speed", "violet still .. yellow 1.5 U"});
     if (!st.transonic && rs_.vortex_cores)
@@ -1011,7 +1309,7 @@ void App::legends(const TunnelStatus& st) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const float w = 270.0f * ImGui::GetStyle().FontScaleDpi;
     float y = vp->WorkPos.y + 6.0f;
-    for (std::size_t k = 0; k < list.size() && k < 3; ++k) {
+    for (std::size_t k = 0; k < list.size() && k < 4; ++k) {
         ImGui::SetNextWindowPos({vp->WorkPos.x + 0.5f * (vp->WorkSize.x - w), y});
         ImGui::SetNextWindowSize({w, 0});
         ImGui::SetNextWindowBgAlpha(0.72f);

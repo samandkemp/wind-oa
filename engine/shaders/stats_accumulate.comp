@@ -1,0 +1,32 @@
+#version 450
+// One sample of the time-averaged statistics (THEORY 12.1): the weighted
+// Welford update of the mean and the sum of squared deviations, per cell and
+// per component of macro = (u.xyz, rho),
+//   W' = W + w,   d = x - mean,   mean' = mean + (w / W') d,
+//   m2' = m2 + w d (x - mean').
+// The density is carried as rho - 1, so its f32 mean keeps the digits that
+// matter (|rho - 1| ~ 1e-4) instead of rounding them into the 1.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "lattice.glsl"
+
+layout(push_constant) uniform Params {
+    uvec4 n;  // cells, -, -, -
+    vec4 w;   // w / W', w, -, -
+} P;
+
+layout(std430, binding = 0) readonly buffer Macro { vec4 macro[]; };
+layout(std430, binding = 1) buffer Mean { vec4 mean[]; };
+layout(std430, binding = 2) buffer M2 { vec4 m2[]; };
+
+void main() {
+    const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
+    if (c >= P.n.x) return;
+    vec4 x = macro[c];
+    x.w -= 1.0;
+    const vec4 m = mean[c];
+    const vec4 d = x - m;
+    const vec4 m_new = m + P.w.x * d;
+    mean[c] = m_new;
+    m2[c] += P.w.y * d * (x - m_new);
+}

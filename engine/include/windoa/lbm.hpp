@@ -139,6 +139,9 @@ class Solver {
     void set_state(std::span<const float> f); // refreshes rho / u too
     std::vector<float> velocity();            // [x][y][z][3]
     std::vector<float> density();             // [x][y][z]
+    // The live (u.xyz, rho) of a few cells, e.g. probes: one small copy per
+    // cell, not a full-grid download.
+    std::vector<std::array<float, 4>> macro_at(std::span<const std::size_t> cells);
 
     // -- GPU views (read-only; for the renderer) ---------------------------------
     // macro_buffer(k): (u.xyz, rho) per cell as vec4, for the pair k = 0, 1;
@@ -207,6 +210,7 @@ class Solver {
     int turb_span_ = 0;
     std::array<float, 3> turb_params_{-1.0f, 0.0f, 0.0f}; // length, span, seed built
     std::unique_ptr<Buffer> turb_patch_;
+    std::unique_ptr<Buffer> probe_buf_; // macro_at readback
     std::unique_ptr<ComputeKernel> turb_;
 };
 

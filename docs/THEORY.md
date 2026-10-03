@@ -30,6 +30,7 @@ therefore never renumbered.
 - [9. The sandbox loop](#9-the-sandbox-loop)
 - [10. What the renderer derives](#10-what-the-renderer-derives)
 - [11. Performance identities](#11-performance-identities)
+- [12. Statistics and signals](#12-statistics-and-signals)
 - [References](#references)
 
 ## Conventions these sections share
@@ -88,7 +89,9 @@ A passive dye on its own D3Q7 lattice (§6) and a synthetic, divergence-free inl
 ### 0.6 Measurement - what the numbers are
 
 Forces by momentum exchange, reduced deterministically (§4); a detector that decides when the
-coefficients have settled; and a cache that restores a settled flow exactly (§9).
+coefficients have settled; a cache that restores a settled flow exactly (§9); and, on top of the
+flow, time averages, a wake survey that recovers the drag from a momentum balance, and spectra of
+the forces and of probes (§12).
 
 ### 0.7 Two properties that cut across all six
 
@@ -282,7 +285,7 @@ $\mathbf{u}$, or the outlet imposes a stale velocity for one step.
 
 ### 3.3 Absorbing sponge
 
-Acoustically, the pressure outlet is a pressure-release end, which reflects sound: 68 % of an
+Acoustically, the pressure outlet is a pressure-release end, which reflects sound: 69 % of an
 incident pressure pulse returns up the tunnel. A band of width $W$ cells before the outlet
 therefore relaxes the post-collision state towards a target equilibrium:
 
@@ -291,14 +294,21 @@ $$f_i^* \leftarrow f_i^* + \sigma \left(f_i^{\mathrm{eq}}(1, \mathbf{u}_t) - f_i
 
 The target velocity $\mathbf{u}_t$ is the full freestream (target 1, the app's choice) or the
 local velocity (target 0, density only). With $W = 24$ and target 1 the reflection falls to
-1.0 %, and the Ahmed body's drag moves by 0.18 % (V10).
+1.0 %, and the Ahmed body's drag moves by 0.20 % (V10).
 
 ### 3.4 Free-slip and periodic faces
 
-On a free-slip $y$ or $z$ face, a pull that leaves the grid is reflected specularly: the
-direction's normal component is flipped (the `SPEC_Y` / `SPEC_Z` tables) and the pull is taken
-from inside the domain. This is an inviscid wall, so the tunnel's side walls grow no boundary
-layer. Any axis may instead be periodic, in which case the pull wraps around.
+On a free-slip $y$ or $z$ face, a population that streams out through the face re-enters the
+same row of cells with its normal component reversed: specular reflection, the `SPEC_Y` /
+`SPEC_Z` tables. The pull of a cell on the face is therefore taken from the mirror image of its
+source across the face, which lies in the cell's own row (for a diagonal direction, the
+neighbour along the face). Each outgoing population is taken exactly once, so the face conserves
+mass and exchanges no tangential momentum: an inviscid wall, on which the tunnel's side walls
+grow no boundary layer. Taking the reflected population from the row inside the face instead
+creates and destroys mass wherever the populations vary across the wall; the inlet and outlet
+hide that from the tunnel's total mass, but not from a control-volume balance, which read 3 - 5 %
+low until the faces were made to mirror (V2 checks the local conservation, V25 the balance). Any
+axis may instead be periodic, in which case the pull wraps around.
 
 ### 3.5 Half-way bounce-back
 
@@ -362,7 +372,7 @@ level moves.
 
 | Gate | Property | Checked against |
 |---|---|---|
-| V2 | The open tunnel holds its density; the anchor pins it and leaves u exact | Invariants: drift < 1e-8 per step; u bit-identical |
+| V2 | The open tunnel holds its density and conserves mass locally; the anchor pins it and leaves u exact | Invariants: drift < 1e-8 per step; the mass flux through every x-face equal to 1e-4; u bit-identical |
 | V8 | Moving walls give the Magnus force with the right sign and growth | Physical sign and monotonicity; 1.5 < abs(Cl) < 9 at spin ratio 2 |
 | V9 | Interpolated bounce-back places the wall at fraction q | Shifted-wall Poiseuille, u_max within 1.5 % |
 | V10 | The sponge absorbs sound without changing the answer | Reflection < 0.05; Ahmed Cd within 1 % |
@@ -874,6 +884,11 @@ frame.
   picture lags the solver by up to a batch.
 - **Smoothed cores.** The box filter that makes Q usable also widens the cores; they show where
   vortices are, not how thin they are.
+- **Surface flow at the grid's resolution.** The near-wall velocity is sampled one cell off a
+  staircase wall (§10.7): the skin friction it shows is qualitative, and the oil-flow streaks
+  give directions, not magnitudes.
+- **Projected flow on the slice.** The slice texture and arrows show the in-plane component
+  (§10.8, §10.9); a strong flow through the plane shows as short, broken streaks.
 
 ### 10.5 Iso-surfaces by marching cubes
 
@@ -900,6 +915,51 @@ cores are ray-marched (§10.3); it is a headless building block, gated on its ow
 | Gate | Property | Checked against |
 |---|---|---|
 | V16 | Marching cubes extracts the iso-surface of a sampled field | Two analytic spheres (R 20 about a cell corner, R 12.3 off-grid): closed and oriented, V - E + F = 2, vertices within 0.02 cells, every normal outward, area and volume within 1 % |
+
+### 10.7 Surface flow: near-wall speed, reversed flow and oil flow
+
+The model's surface can be painted with what the air does just outside it. At a surface point
+$\mathbf{x}$ with the smooth normal $\mathbf{n}$, the velocity is sampled one cell out, over
+fluid cells only, and its normal component removed:
+
+$$\mathbf{u}_t = \mathbf{u}(\mathbf{x} + \mathbf{n}) - \left[\mathbf{u}(\mathbf{x} + \mathbf{n})
+\cdot \mathbf{n}\right]\mathbf{n}.$$
+
+- **Near-wall speed**, $|\mathbf{u}_t| / U$ on a sequential map. With the no-slip wall about a
+  cell away, it is proportional to the wall shear stress, $\tau_w \approx \rho \nu |\mathbf{u}_t|
+  / d$ with $d \approx 1$ cell, at the resolution the grid affords.
+- **Reversed flow**, $u_{t,x} / U$ on the diverging map: blue where the near-wall flow runs
+  upstream, the signature of separated flow.
+- **Oil flow**, the oil-film test of a physical tunnel: white noise smeared along
+  $\mathbf{u}_t$ over the surface by a line-integral convolution,
+
+  $$I(\mathbf{x}_0) = \frac{\sum_k w_k\, N(\mathbf{x}_k)}{\sum_k w_k}, \qquad
+  \mathbf{x}_{k \pm 1} = \mathbf{x}_k \pm h\, \frac{\mathbf{u}_t}{|\mathbf{u}_t|},$$
+
+  with tent weights $w_k$, 16 steps each way, and the normal re-estimated at every step. The
+  streaks follow the skin-friction lines; they converge onto separation lines and fan out from
+  attachment lines. The noise grain is sized to about three pixels at the viewing distance.
+
+### 10.8 Line-integral convolution on the slice
+
+The same convolution, along the in-plane flow (the slice-normal component removed), stepping
+within the plane and stopping at solids, 24 steps each way. The brightness it gives modulates
+the field's colour, so the slice shows the field and every in-plane streamline at once: foci,
+saddles, the shear layers and the shedding. It is a picture of the projected, instantaneous
+flow, not a measured quantity.
+
+### 10.9 Arrows and timelines
+
+**Arrows** sample the in-plane velocity on a regular grid over the slice and draw it as a shaft
+and two barbs, scaled so that the freestream spans 0.8 of the grid spacing; arrows in solid
+cells, or shorter than 0.08 of the spacing, are hidden.
+
+**Timelines** replace the smoke's continuous emission with a pulsed line, as from a hydrogen-
+bubble wire: 200 particles across the wand's height are released together every $T$ steps
+(110 slots of 200, each released every $110\,T$ steps and advected like the smoke), so each line
+marks the fluid that crossed the wire at one instant. Its deformation is the velocity profile
+integrated over its age: a boundary layer lags, a wake bows back, a shear layer rolls up. Every
+fifth line is highlighted so the sequence reads.
 
 ## 11. Performance identities
 
@@ -943,11 +1003,121 @@ same for the Euler solver. A code motion that "cannot change the arithmetic" did
 the collision outputs changed bits through fused multiply-add contraction), which is why both
 checks exist.
 
+## 12. Statistics and signals
+
+The measurements made on top of the flow: time averages of every cell, the drag recovered from a
+momentum balance of the averaged flow, and the spectra of the forces and of probe signals. Each
+is optional and reads the solver's fields without writing them, so with all of it off the flow
+steps exactly as before (§0.7).
+
+### 12.1 Time averages
+
+While averaging is on, each batch of a developed flow adds one sample per cell of
+$x \in (u_x, u_y, u_z, \rho - 1)$, weighted by the batch's steps $w$. The running mean and the
+sum of squared deviations are updated in place by the weighted Welford recurrence:
+
+$$W' = W + w, \qquad \delta = x - \bar{x}, \qquad \bar{x}' = \bar{x} + \frac{w}{W'}\,\delta, \qquad
+M_2' = M_2 + w\,\delta\,(x - \bar{x}'),$$
+
+with the variance $\sigma^2 = M_2 / W$. The update is relative to the sample rather than to a
+growing total, so the f32 mean loses no precision over a long window; the density is carried as
+$\rho - 1$ for the same reason, since its useful digits are those of a deviation of order
+$10^{-4}$. The window opens when the settling detector first reports the flow developed (§9.5)
+and restarts at every new operating point.
+
+Three fields are derived from it: the mean speed, $(|\bar{\mathbf{u}}| - U) / U$; the turbulence
+intensity of the window,
+
+$$\mathrm{Tu} = \frac{1}{U}\sqrt{\tfrac13\left(\sigma_x^2 + \sigma_y^2 + \sigma_z^2\right)};$$
+
+and the mean reversed-flow region, $\bar{u}_x < 0$, which is the time-averaged recirculation
+bubble behind a bluff body (the instantaneous field reverses in different places at every
+moment).
+
+### 12.2 The wake survey
+
+A control volume spans the tunnel between the upstream reference plane $x_1$ (§10.2) and a
+survey plane $x_2$ behind the body. The free-slip side faces carry no $x$-force, so for a
+statistically stationary flow the drag equals the fall in the $x$-momentum flux between the
+two planes:
+
+$$D = \Phi(x_1) - \Phi(x_2), \qquad
+\Phi(x) = \sum_{\text{fluid cells of the plane}}
+\left[\bar{\rho}\left(\bar{u}_x^2 + \sigma_x^2\right) + \bar{\rho}\, c_s^2
+- 2 \bar{\rho}\, \nu\, \frac{\partial \bar{u}_x}{\partial x}\right],$$
+
+the momentum flux (with the Reynolds stress through the variance), the pressure and the viscous
+normal stress, each cell standing for one unit of area. The survey is a second, independent
+measurement of the same force: it is shown beside the force balance's mean over the same
+window, and in a steady or stationary flow the two agree (V25). It needs the side faces to
+conserve mass (§3.4) and both planes to be clear of the body and of the sponge, which relaxes the
+flow towards the freestream and is therefore a momentum source. The survey plane defaults to
+half-way between the body's rear and the sponge. In ground mode the floor lies inside the
+volume, so the survey measures the body's drag plus the floor's shear.
+
+### 12.3 Spectra and the Strouhal number
+
+Two kinds of signal are recorded every batch: the batch-mean force coefficients (the dashboard's
+smoothing would filter the shedding) and the probe values (§12.4). A spectrum is taken of the
+developed part of the last 16 flow-throughs. The samples are resampled by linear interpolation
+onto $N = 2^k$ uniform points (at least as many as there are samples), the mean is removed, a Hann
+window applied, and a radix-2 FFT taken; the single-sided amplitude of bin $k$ is
+$A_k = 4|X_k|/N$, since the window's coherent gain is one half, so a tone of amplitude $A$ reads
+close to $A$. A peak is the strongest local maximum above $f_{\min} = 2/T$ for a window of
+length $T$, located between bins by the vertex of the parabola through the logarithms of the
+three amplitudes around it. The Strouhal number is
+
+$$\mathrm{St} = \frac{f\,h}{U},$$
+
+with $h$ the body's height, its cells' extent across the flow in $y$.
+
+The free-slip faces reflect sound perfectly, so transverse standing waves ring at
+
+$$f_n = \frac{n\, c_s}{2\, n_y} \qquad (n = 1, 2, \ldots),$$
+
+and likewise across $z$. The start-up ramp and the shedding excite them and the low viscosity
+barely damps them, so they appear in every spectrum: for a 17-cell body at $U = 0.05$ on the fast
+grid, $f_1$ corresponds to St 1.02, against shedding near St 0.1 - 0.2. The shedding Strouhal
+number reported is therefore the strongest peak below $0.8 f_1$, and the spectrum plot marks the
+acoustic modes.
+
+### 12.4 Probes
+
+Up to four probe cells have their $(\mathbf{u}, \rho)$ read from the solver's live macroscopic
+buffer at the end of every batch: one 16-byte copy each, not a download of the grid. A probe on
+the centreline of a vortex street sees the transverse velocity oscillate at the shedding
+frequency and the streamwise velocity at twice it, because a vortex of either sign passes once
+per half cycle; one beside the centreline sees both at the shedding frequency.
+
+### 12.5 Deliberate limitations
+
+- **Batch sampling.** Every signal and every average is sampled once per batch (about 20 steps
+  in the app), so frequencies above half the batch rate alias; the means are unaffected.
+- **The survey's stresses.** The viscous stress uses the molecular viscosity; the eddy
+  viscosity's normal stress is left out, a fraction of a per cent on the app's own flow (V25).
+- **Cells as area elements.** The plane integrals are sums of cell-centred means, second-order
+  accurate like the solver.
+- **Subsonic only.** Averages, the survey and the probes describe the lattice flow; they clear
+  when the tunnel switches to transonic mode.
+- **Spectral resolution.** A window of length $T$ resolves frequencies to $1/T$; on the fast grid
+  16 flow-throughs at $U = 0.05$ are about 82,000 steps, ample for shedding but not for drift
+  slower than a few flow-throughs.
+
+### 12.6 Validation gates (V24 - V26)
+
+| Gate | Property | Checked against |
+|---|---|---|
+| V24 | The averaging accumulator is exact and the mean wake of a vortex street has its published structure | A double-precision host accumulation; a steady flow's identity; the symmetric mean wake, $v_{\mathrm{rms}}$ peaking on the centreline and $u_{\mathrm{rms}}$ off it |
+| V25 | The wake survey recovers the drag | The force balance over the same window: a steady sphere within 1 %, the app's tunnel within 2 % |
+| V26 | Spectra find frequencies, the shedding Strouhal number and the acoustic modes | Tones at uneven sampling; St 0.196 for the cylinder at Re 200; $v$ at $f$ and $u$ at $2f$ on the centreline; a standing sound wave at $c_s / (2 n_y)$ |
+
 ## References
 
 - Bourke, P. (1994). Polygonising a scalar field. paulbourke.net/geometry/polygonise.
 - Bouzidi, M., Firdaouss, M. and Lallemand, P. (2001). Momentum transfer of a Boltzmann-lattice
   fluid with boundaries. *Physics of Fluids* 13, 3452.
+- Cabral, B. and Leedom, L. C. (1993). Imaging vector fields using line integral convolution.
+  *Proceedings of SIGGRAPH 93*, 263.
 - Dadone, A. and Grossman, B. (2004). Ghost-cell method for inviscid two-dimensional flows on
   Cartesian grids. *AIAA Journal* 42(12), 2499.
 - Ghia, U., Ghia, K. N. and Shin, C. T. (1982). High-Re solutions for incompressible flow using
@@ -969,4 +1139,8 @@ checks exist.
   method involving curved geometry. *Physical Review E* 65, 041203.
 - Toro, E. F. (2009). *Riemann Solvers and Numerical Methods for Fluid Dynamics*, 3rd edition.
   Springer.
+- Welford, B. P. (1962). Note on a method for calculating corrected sums of squares and
+  products. *Technometrics* 4(3), 419.
+- West, D. H. D. (1979). Updating mean and variance estimates: an improved method.
+  *Communications of the ACM* 22(9), 532.
 - AGARD Advisory Report 211 (1985). Test cases for inviscid flow field methods.

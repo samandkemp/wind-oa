@@ -16,6 +16,7 @@ windoa_add_shaders(windoa_render
     shaders/vol_splat.comp
     shaders/smoke.comp
     shaders/streamlines.comp
+    shaders/arrows.comp
 )
 target_include_directories(windoa_render PUBLIC include)
 target_link_libraries(windoa_render PUBLIC windoa_engine)

@@ -5,8 +5,10 @@
 //   Q         smoothed-velocity Q-criterion + an adaptive RMS threshold,
 //             reduced on the device (no host round trip)
 //   march     one ray per pixel, front to back: model surface (voxel or
-//             smooth, optionally Cp-painted), slice plane, vortex cores,
-//             dye smoke, field haze, box edges; writes a depth buffer
+//             smooth, optionally painted with Cp, near-wall speed, reversed
+//             flow or oil-flow streaks), slice plane (optionally with a
+//             LIC texture), vortex cores, mean reversed-flow shells, dye
+//             smoke, field haze, box edges; writes a depth buffer
 //   splats    depth-tested points / segments (smoke, streamlines, markers)
 // Solid-derived fields (occupancy blocks, blurred indicator) are rebuilt
 // whenever the caller's geometry version changes.
@@ -37,8 +39,12 @@ enum class Field : int {
     Vorticity = 2,
     VortX = 3,
     Mach = 4,
-    Schlieren = 5
+    Schlieren = 5,
+    MeanSpeed = 6, // of the time-averaged window (needs Sources::mean)
+    Turbulence = 7 // turbulence intensity of the window (needs Sources::m2)
 };
+// What the model surface is painted with (THEORY 10.2, 10.7).
+enum class Paint : int { Cp = 0, WallSpeed = 1, Reversed = 2, OilFlow = 3 };
 enum class Surface : int { Hidden = 0, Voxel = 1, Smooth = 2 };
 
 // Noise floor below which a sample is transparent, per field, in the
@@ -51,6 +57,9 @@ struct Sources {
     const Buffer* macro = nullptr; // vec4 per cell: u.xyz, rho (Euler: p)
     const Buffer* aux = nullptr;   // float per cell: Euler rho (optional)
     const Buffer* dye = nullptr;   // float per cell: dye concentration (optional)
+    // time averages (optional): vec4 per cell, as engine FlowStats
+    const Buffer* mean = nullptr; // <u>, <rho> - 1
+    const Buffer* m2 = nullptr;   // sum of w (x - <x>)^2
 };
 
 struct View {
@@ -66,9 +75,15 @@ struct Settings {
     float haze_gain = 1.0f;
     float haze_floor = -1.0f; // < 0: default_floor(field)
     Surface surface = Surface::Smooth;
-    bool paint_cp = true;
+    bool paint_surface = true;
+    Paint paint = Paint::Cp;
     int slice_axis = -1;    // -1 none, else 0 / 1 / 2
     float slice_pos = 0.5f; // fraction of the domain along slice_axis
+    bool slice_lic = false; // LIC texture of the in-plane flow on the slice
+    // time averages: 1 / their weight (0 = none in this slot), and the
+    // translucent shells where the mean streamwise flow runs backwards
+    float stats_inv_weight = 0.0f;
+    bool recirculation = false;
     bool box = true;
     bool vortex_cores = false;
     float q_sense = 1.0f; // threshold = 3 x rms(Q > 0) x q_sense
@@ -94,6 +109,7 @@ struct SplatDraw {
     bool segments = false;
     float radius = 0.2f; // points: world radius in cells
     float alpha = 0.85f;
+    float depth_bias = 0.0f; // cells: draw this far behind the marched surface
 };
 
 class VolumeRenderer {
@@ -152,10 +168,11 @@ class VolumeRenderer {
     Buffer qfield_;
     Buffer qpartials_;
     Buffer qstat_;
-    Buffer zero_;  // stands in for an absent dye / aux source
-    Buffer speed_; // |u| per cell (dye colour), from vol_prepare
+    Buffer zero_;   // stands in for an absent dye / aux source
+    Buffer speed_;  // |u| per cell (dye colour), from vol_prepare
+    Buffer recirc_; // <u_x> / U per cell (reversed-flow shells), from vol_prepare
     // what the march samples, as 3-D textures (hardware trilinear)
-    Image3D t_field_, t_raw_, t_blur_, t_q_, t_dye_, t_speed_;
+    Image3D t_field_, t_raw_, t_blur_, t_q_, t_dye_, t_speed_, t_recirc_;
 
     ComputeKernel prepare_;
     ComputeKernel occ_kernel_;

@@ -24,8 +24,12 @@ SimWorker::SimWorker(Context& ctx, const TunnelSettings& s, const std::filesyste
         sn.flags = std::make_unique<Buffer>(ctx, cells * 4);
         sn.dye = std::make_unique<Buffer>(ctx, cells * 4);
         sn.aux = std::make_unique<Buffer>(ctx, cells * 4);
+        sn.mean = std::make_unique<Buffer>(ctx, cells * 16);
+        sn.m2 = std::make_unique<Buffer>(ctx, cells * 16);
         ctx.fill_zero(*sn.dye);
         ctx.fill_zero(*sn.aux);
+        ctx.fill_zero(*sn.mean);
+        ctx.fill_zero(*sn.m2);
     }
     sim_tl_ = ctx.create_timeline(0);
     render_tl_ = ctx.create_timeline(0);
@@ -61,6 +65,11 @@ void SimWorker::flush() {
 TunnelStatus SimWorker::status() const {
     std::lock_guard<std::mutex> lock(mu_);
     return status_;
+}
+
+TunnelAnalysis SimWorker::analysis() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return analysis_;
 }
 
 SimWorker::Frame SimWorker::acquire(std::uint64_t render_value) {
@@ -103,6 +112,10 @@ void SimWorker::publish() {
     const bool geo = sn.geometry_version != st.render_geometry;
     Dye* dye = tunnel_->dye();
     const bool dye_on = st.dye_on && dye && !e;
+    // the time averages, when they have changed since this slot copied them
+    const FlowStats* stats = tunnel_->stats();
+    const int samples = stats && !e ? stats->samples() : 0;
+    const bool stats_copy = samples > 0 && samples != sn.stats_samples;
     const std::uint64_t v = ++sim_value_;
     ctx_.submit_and_wait(
         [&](VkCommandBuffer cmd) {
@@ -117,10 +130,16 @@ void SimWorker::publish() {
                     copy(cmd, s.flag_buffer(), *sn.flags);
                 if (dye_on)
                     copy(cmd, dye->concentration_buffer(), *sn.dye);
+                if (stats_copy) {
+                    copy(cmd, stats->mean(), *sn.mean);
+                    copy(cmd, stats->m2(), *sn.m2);
+                }
             }
         },
         sim_tl_, v);
     sn.geometry_version = st.render_geometry;
+    if (stats_copy || samples == 0)
+        sn.stats_samples = samples;
 
     std::lock_guard<std::mutex> lock(mu_);
     Frame f;
@@ -131,9 +150,12 @@ void SimWorker::publish() {
     f.flow_epoch = st.flow_epoch;
     f.dye = dye_on;
     f.transonic = e != nullptr;
+    f.stats_inv_weight = samples > 0 ? float(1.0 / stats->weight()) : 0.0f;
     slot_meta_[j] = f;
     published_ = f;
     status_ = st;
+    if (tunnel_->analysis().version != analysis_.version)
+        analysis_ = tunnel_->analysis();
 }
 
 void SimWorker::loop() {

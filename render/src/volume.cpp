@@ -25,7 +25,8 @@ constexpr int kMaxSplatSources = 4;
 // vol_march.comp bindings: buffers, and the 3-D textures it samples
 const Slot kMarchLayout[] = {Slot::Buffer,  Slot::Buffer,  Slot::Texture, Slot::Buffer,
                              Slot::Texture, Slot::Texture, Slot::Texture, Slot::Buffer,
-                             Slot::Texture, Slot::Buffer,  Slot::Buffer,  Slot::Texture};
+                             Slot::Texture, Slot::Buffer,  Slot::Buffer,  Slot::Texture,
+                             Slot::Texture};
 const std::span<const Slot> kMarchSlots{kMarchLayout};
 
 // Push-constant blocks; each must match its shader's `Params`.
@@ -35,6 +36,7 @@ struct Dims {
 struct PrepareParams {
     std::int32_t dims[4]; // nx, ny, nz, mode
     float ref[4];         // u_ref, rho_ref, pscale, gamma
+    float stats[4];       // 1 / weight, recirc output on, -, -
 };
 struct QStatParams {
     std::uint32_t n_partials;
@@ -42,7 +44,7 @@ struct QStatParams {
 };
 struct MarchParams {
     std::int32_t dims[4];  // nx, ny, nz, n_steps
-    std::int32_t img[4];   // width, height, feature bits, surface
+    std::int32_t img[4];   // width, height, feature bits, surface | paint << 4
     std::int32_t modes[4]; // cmode, slice_axis, pscale (float bits), -
     float eye[4];          // xyz, tan(fov / 2)
     float fwd[4];          // xyz, aspect
@@ -56,19 +58,21 @@ struct SplatParams {
     float right[4];
     float up[4];
     std::int32_t img[4]; // width, height, count, mode
-    float misc[4];       // radius, alpha, -, -
+    float misc[4];       // radius, alpha, depth bias, -
 };
-static_assert(sizeof(PrepareParams) == 32);
+static_assert(sizeof(PrepareParams) == 48);
 static_assert(sizeof(MarchParams) == 128, "Vulkan guarantees only 128 push-constant bytes");
 static_assert(sizeof(SplatParams) == 96);
 
 // Feature bits (vol_march.comp)
 constexpr std::int32_t F_BOX = 1, F_HAZE = 2, F_PAINT_CP = 4, F_Q = 8, F_DYE = 16,
-                       F_DYE_BY_SPEED = 32;
+                       F_DYE_BY_SPEED = 32, F_RECIRC = 64, F_SLICE_LIC = 128;
 
-// Colour mode per field: 0 coolwarm, 1 vort, 2 grey, 3 Mach.
+// Colour mode per field: 0 coolwarm, 1 vort, 2 grey, 3 Mach, 4 sequential.
 int cmode_of(Field f) {
     switch (f) {
+    case Field::Turbulence:
+        return 4;
     case Field::VortX:
         return 1;
     case Field::Schlieren:
@@ -141,6 +145,10 @@ float default_floor(Field f) {
         return 0.0f;
     case Field::Schlieren:
         return 0.15f;
+    case Field::MeanSpeed:
+        return 0.06f;
+    case Field::Turbulence:
+        return 0.10f; // 2 % intensity
     }
     return 0.06f;
 }
@@ -154,9 +162,10 @@ VolumeRenderer::VolumeRenderer(Context& ctx, int nx, int ny, int nz)
       smooth_tmp_(ctx, cells_ * 16), qfield_(ctx, cells_ * sizeof(float)),
       qpartials_(ctx, std::size_t{cell_groups_.total} * 8), qstat_(ctx, 16),
       zero_(ctx, cells_ * sizeof(float)), speed_(ctx, cells_ * sizeof(float)),
-      t_field_(ctx, nx, ny, nz), t_raw_(ctx, nx, ny, nz), t_blur_(ctx, nx, ny, nz),
-      t_q_(ctx, nx, ny, nz), t_dye_(ctx, nx, ny, nz), t_speed_(ctx, nx, ny, nz),
-      prepare_(ctx, spv::vol_prepare, 5, sizeof(PrepareParams), kSlots),
+      recirc_(ctx, cells_ * sizeof(float)), t_field_(ctx, nx, ny, nz), t_raw_(ctx, nx, ny, nz),
+      t_blur_(ctx, nx, ny, nz), t_q_(ctx, nx, ny, nz), t_dye_(ctx, nx, ny, nz),
+      t_speed_(ctx, nx, ny, nz), t_recirc_(ctx, nx, ny, nz),
+      prepare_(ctx, spv::vol_prepare, 8, sizeof(PrepareParams), kSlots),
       occ_kernel_(ctx, spv::vol_occ, 3, sizeof(Dims), kSlots),
       blur_(ctx, spv::vol_blur, 2, sizeof(Dims), 3),
       smooth_(ctx, spv::vol_smooth, 5, sizeof(Dims), kSlots),
@@ -185,7 +194,10 @@ void VolumeRenderer::set_sources(int slot, const Sources& s) {
     sources_[slot] = s;
     const std::uint32_t k = std::uint32_t(slot);
     const Buffer* aux = s.aux ? s.aux : &zero_;
-    prepare_.bind(k, {s.flags, s.macro, &field_, aux, &speed_});
+    // without statistics the macro buffer stands in (never read: weight 0)
+    const Buffer* mean = s.mean ? s.mean : s.macro;
+    const Buffer* m2 = s.m2 ? s.m2 : s.macro;
+    prepare_.bind(k, {s.flags, s.macro, &field_, aux, &speed_, mean, m2, &recirc_});
     occ_kernel_.bind(k, {s.flags, &occ_, &solid_raw_});
     // separable smoothing: x pass -> vsmooth_ (as scratch), y -> smooth_tmp_,
     // z -> vsmooth_
@@ -266,9 +278,9 @@ void VolumeRenderer::bind_target_dependent() {
         const Sources& s = sources_[k];
         if (!s.flags)
             continue;
-        march_.bind_resources(std::uint32_t(k),
-                              {s.flags, s.macro, &t_field_, &occ_, &t_raw_, &t_blur_, &t_q_,
-                               &qstat_, &t_dye_, pixels_.get(), depth_.get(), &t_speed_});
+        march_.bind_resources(std::uint32_t(k), {s.flags, s.macro, &t_field_, &occ_, &t_raw_,
+                                                 &t_blur_, &t_q_, &qstat_, &t_dye_, pixels_.get(),
+                                                 depth_.get(), &t_speed_, &t_recirc_});
     }
     for (std::size_t k = 0; k < splat_sources_.size(); ++k) {
         splat_.bind(std::uint32_t(k), {pixels_.get(), depth_.get(), splat_sources_[k].verts,
@@ -315,10 +327,14 @@ void VolumeRenderer::record(VkCommandBuffer cmd, const View& view, const Setting
     // Per-cell field
     const Field field = s.field;
     const bool dye_on = s.dye && sources_[slot].dye;
-    const bool prepared = s.haze || s.slice_axis >= 0 || (dye_on && s.dye_by_speed);
+    const bool stats = s.stats_inv_weight > 0.0f && sources_[slot].mean && sources_[slot].m2;
+    const bool recirc = s.recirculation && stats;
+    const bool prepared = s.haze || s.slice_axis >= 0 || (dye_on && s.dye_by_speed) || recirc;
     if (prepared) {
-        const PrepareParams pp{{nx, ny, nz, static_cast<std::int32_t>(field)},
-                               {s.u_ref, s.rho_ref, s.pscale, s.gamma}};
+        const PrepareParams pp{
+            {nx, ny, nz, static_cast<std::int32_t>(field)},
+            {s.u_ref, s.rho_ref, s.pscale, s.gamma},
+            {stats ? s.stats_inv_weight : 0.0f, recirc ? 1.0f : 0.0f, 0.0f, 0.0f}};
         prepare_.record_set(cmd, set, &pp, g.x, g.y);
     }
     // Vortex cores: smooth -> Q (+ partials) -> threshold on the device
@@ -363,6 +379,8 @@ void VolumeRenderer::record(VkCommandBuffer cmd, const View& view, const Setting
             t_dye_.record_copy_from(cmd, *sources_[slot].dye);
         if (q_due)
             t_q_.record_copy_from(cmd, qfield_);
+        if (recirc)
+            t_recirc_.record_copy_from(cmd, recirc_);
         memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
@@ -383,8 +401,12 @@ void VolumeRenderer::record(VkCommandBuffer cmd, const View& view, const Setting
         feat |= F_BOX;
     if (s.haze)
         feat |= F_HAZE;
-    if (s.paint_cp)
+    if (s.paint_surface)
         feat |= F_PAINT_CP;
+    if (recirc)
+        feat |= F_RECIRC;
+    if (s.slice_lic && s.slice_axis >= 0)
+        feat |= F_SLICE_LIC;
     if (s.vortex_cores)
         feat |= F_Q;
     if (s.dye && sources_[slot].dye)
@@ -400,7 +422,7 @@ void VolumeRenderer::record(VkCommandBuffer cmd, const View& view, const Setting
     mp.img[0] = std::int32_t(width_);
     mp.img[1] = std::int32_t(height_);
     mp.img[2] = feat;
-    mp.img[3] = static_cast<std::int32_t>(s.surface);
+    mp.img[3] = static_cast<std::int32_t>(s.surface) | (static_cast<std::int32_t>(s.paint) << 4);
     mp.modes[0] = cmode_of(field);
     mp.modes[1] = s.slice_axis;
     mp.modes[2] = std::bit_cast<std::int32_t>(s.pscale);
@@ -436,6 +458,7 @@ void VolumeRenderer::record(VkCommandBuffer cmd, const View& view, const Setting
         sp.img[3] = d.segments ? 1 : 0;
         sp.misc[0] = d.radius;
         sp.misc[1] = d.alpha;
+        sp.misc[2] = d.depth_bias;
         splat_.record_set(cmd, std::uint32_t(d.source), &sp, (d.count + 63) / 64);
     }
 

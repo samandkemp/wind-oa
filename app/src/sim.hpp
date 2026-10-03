@@ -39,7 +39,10 @@ class SimWorker {
         std::unique_ptr<Buffer> flags; // uint per cell
         std::unique_ptr<Buffer> dye;   // float per cell (zeros when dye is off)
         std::unique_ptr<Buffer> aux;   // float per cell: Euler rho (transonic)
+        std::unique_ptr<Buffer> mean;  // vec4 per cell: time-averaged u, rho - 1
+        std::unique_ptr<Buffer> m2;    // vec4 per cell: summed squared deviations
         std::uint64_t geometry_version = UINT64_MAX;
+        int stats_samples = -1; // the averaging sample count the copies hold
     };
 
     // What a frame renders: a published slot and the value to wait for.
@@ -50,7 +53,8 @@ class SimWorker {
         std::int64_t steps = 0;             // solver steps at the snapshot
         std::uint64_t flow_epoch = 0;
         bool dye = false;
-        bool transonic = false; // macro = (u, p), aux = rho
+        bool transonic = false;        // macro = (u, p), aux = rho
+        float stats_inv_weight = 0.0f; // 1 / averaging weight (0: no averages yet)
     };
 
     SimWorker(Context& ctx, const TunnelSettings& s, const std::filesystem::path& cache_dir);
@@ -71,6 +75,9 @@ class SimWorker {
     void set_max_steps_per_second(float s) { max_sps_ = s; }
 
     TunnelStatus status() const;
+    // The latest measurements (wake survey, spectra), refreshed by the
+    // tunnel every analysis_every batches.
+    TunnelAnalysis analysis() const;
     double mlups() const { return mlups_.load(); }
     double ms_per_step() const { return ms_per_step_.load(); }
     int last_batch_steps() const { return last_batch_.load(); }
@@ -99,6 +106,7 @@ class SimWorker {
     std::deque<std::function<void(Tunnel&)>> commands_;
     std::uint64_t posted_ = 0, done_ = 0;
     TunnelStatus status_;
+    TunnelAnalysis analysis_;
     Frame published_;
     std::array<std::uint64_t, kSlots> last_read_{}; // render value of the last frame per slot
     std::array<Frame, kSlots> slot_meta_{};

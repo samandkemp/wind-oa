@@ -1,7 +1,7 @@
 # Validation
 
 Every model in wind-oa ships with a **gate**: an executable that checks it against an external
-reference and exits non-zero if it misses. There are 23 of them, V1 - V23, and they are the backbone
+reference and exits non-zero if it misses. There are 26 of them, V1 - V26, and they are the backbone
 of the project: they are the evidence that the solvers compute the right physics, not merely
 plausible pictures.
 
@@ -35,15 +35,15 @@ away.
 
 | Kind | What it proves | Example |
 |---|---|---|
-| **Closed form** | The solver converges to the analytic answer | The Poiseuille parabola; the exact Riemann solution of the shock tube; the oblique-shock relations of the wedge; the iso-surface of a sphere's distance field |
+| **Closed form** | The solver converges to the analytic answer | The Poiseuille parabola; the exact Riemann solution of the shock tube; the oblique-shock relations of the wedge; the iso-surface of a sphere's distance field; a standing sound wave between the side walls |
 | **Published data** | The solver reproduces experiment or benchmark computation | The Ghia cavity profiles; sphere drag at Re 100 and 300; the Strouhal number at Re 200; the NACA 0012 at Mach 0.8 |
-| **Identity or invariant** | A property that must hold whatever the numbers | Mass conservation; a switched-off subsystem equals its absence bit for bit; a cache restore matches a never-restored control |
+| **Identity or invariant** | A property that must hold whatever the numbers | Mass conservation, globally and through every plane; a switched-off subsystem equals its absence bit for bit; a cache restore matches a never-restored control; the wake survey's momentum balance against the force balance |
 
 ## Running them
 
 ```
 ctest --preset dev                 # every gate and the smoke checks (about 13 minutes)
-ctest --preset quick               # skip the gates labelled long (about 40 s)
+ctest --preset quick               # skip the gates labelled long (about 80 s)
 ctest --preset dev -L gate         # the gates only
 ctest --preset dev -R V17          # one gate
 ```
@@ -62,39 +62,39 @@ last printed it.
 |---|---|---|---|
 | V1 | BGK + Guo recovers the analytic channel flow | Poiseuille parabola, relative L2 < 1 % | L2 0.074 % |
 | V3 | Lid-driven cavity at Re 1000, with the mass anchor | Ghia et al. (1982), RMS < 0.03 | RMS 0.0064 |
-| V4 | Regularised collision: Poiseuille, the LES cavity, spheres at Re 1000 and 10,000 | Parabola; Ghia (RMS < 0.05); sphere drag, bands 50 and 60 %, and stability | L2 0.065 %; RMS 0.0085; Cd 0.667 / 0.665, stable |
+| V4 | Regularised collision: Poiseuille, the LES cavity, spheres at Re 1000 and 10,000 | Parabola; Ghia (RMS < 0.05); sphere drag, bands 50 and 60 %, and stability | L2 0.065 %; RMS 0.0085; Cd 0.676 / 0.658, stable |
 | V5 | Recursive regularisation recovers the same viscosity | Parabola, L2 < 1 % | L2 0.050 %; at cs = 0 the driven cavity is stable to tau 0.52 (plain regularised) and 0.53 (RR) |
 
 ### §3 Boundary conditions
 
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
-| V2 | The open tunnel holds its density; the anchor pins it and leaves u exact | Drift < 1e-8 per step; u bit-identical | Drift +1.5e-10 per step; u unchanged |
+| V2 | The open tunnel holds its density and conserves mass locally; the anchor pins it and leaves u exact | Drift < 1e-8 per step; the mass flux through every x-face equal to 1e-4; u bit-identical | Drift +2.7e-10 per step; face mass flux spread 4.2e-5; u unchanged |
 | V8 | Moving walls produce the Magnus force | Sign, monotonic growth, 1.5 < abs(Cl) < 9 at spin ratio 2 | Cl -2.78 / -5.59 at ratios 1 / 2 |
-| V9 | Interpolated bounce-back places the wall at fraction q | Shifted-wall Poiseuille, u_max within 1.5 % | 0.16 - 0.70 %; sphere Cd 1.172 -> 1.165 with IBB |
-| V10 | The sponge absorbs sound without changing the answer | Reflection < 0.05; Ahmed Cd within 1 % | R 0.685 -> 0.010; Cd +0.18 %, force noise down 7x |
+| V9 | Interpolated bounce-back places the wall at fraction q | Shifted-wall Poiseuille, u_max within 1.5 % | 0.16 - 0.70 %; sphere Cd 1.171 -> 1.165 with IBB |
+| V10 | The sponge absorbs sound without changing the answer | Reflection < 0.05; Ahmed Cd within 1 % | R 0.687 -> 0.010; Cd +0.20 %, force noise down 8x |
 
 ### §4 Forces and coefficients
 
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
-| V6 | Sphere drag at Re 100 and 300 | Schiller-Naumann, within 15 % | Cd 1.214 / 0.768 (11 / 12 %) |
+| V6 | Sphere drag at Re 100 and 300 | Schiller-Naumann, within 15 % | Cd 1.212 / 0.766 (11 / 12 %) |
 | V7 | Vortex shedding off a cylinder at Re 200 | St = 0.196, within 15 % | St 0.212 (8 %) |
-| V14 | Ahmed body: low-Re drag band, slant lift, recirculating wake | Low-Re bands: 0.6 < Cd < 1.8, Cl > 0, reverse flow behind the base | Cd 1.413, Cl +0.221, reverse flow behind the base |
-| V15 | Ahmed drag falls with Reynolds number | The published trend | Cd 1.424 -> 1.138 -> 1.176 over Re 1,250 - 20,000 |
+| V14 | Ahmed body: low-Re drag band, slant lift, recirculating wake | Low-Re bands: 0.6 < Cd < 1.8, Cl > 0, reverse flow behind the base | Cd 1.400, Cl +0.168, reverse flow behind the base |
+| V15 | Ahmed drag falls with Reynolds number | The published trend | Cd 1.411 -> 1.136 -> 1.212 over Re 1,250 - 20,000 |
 
 ### §5 Geometry
 
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
 | V12 | Thick bodies exact, thin sheets sealed, overlapping parts a union | The exact centre-inside set; a D3Q19 flood fill; the union plus a fillet | All three exact |
-| V13 | The triangle-mesh pipeline reproduces the analytic sphere | Solid count and drag within 5 % | 2,176 cells (3.2 %), Cd 1.236 (1.9 %) |
+| V13 | The triangle-mesh pipeline reproduces the analytic sphere | Solid count and drag within 5 % | 2,176 cells (3.2 %), Cd 1.235 (1.8 %) |
 
 ### §6 - §7 Transport
 
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
-| V20 | Dye advects at U, spreads with D = (tau - 1/2)/4, never leaks, stays bounded | The analytic Gaussian blob; exact zero beyond a wall; 0 <= C <= 1.1 | Variance within 0.9 %, mass 0.04 %; leak exactly 0; C <= 1.062 |
+| V20 | Dye advects at U, spreads with D = (tau - 1/2)/4, never leaks, stays bounded | The analytic Gaussian blob; exact zero beyond a wall; 0 <= C <= 1.1 | Variance within 0.9 %, mass 0.04 %; leak exactly 0; C <= 1.060 |
 | V21 | Inlet turbulence is solenoidal, at the requested intensity, and quiet | Closed form; the request within 25 %; non-solenoidal noise | Divergence 4e-8; Tu 1.75 % for 2 %; one fifth of the noise's sound |
 
 ### §8 The compressible Euler solver
@@ -110,7 +110,7 @@ last printed it.
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
 | V11 | The guard sees a blow-up; spin at the cap is stable; long windows are exact | Poisoned fields; 8,000 healthy steps; a double-precision sum | All detected; healthy at U 0.05 and 0.11; window exact to 5e-7 |
-| V22 | The settling detector is right on synthetic and real signals | Five synthetic invariants; the long-run mean within 2 % | All five; cold start settles within 1.4 %, warm restart within 0.3 % |
+| V22 | The settling detector is right on synthetic and real signals | Five synthetic invariants; the long-run mean within 2 % | All five; cold start settles within 1.4 %, warm restart within 0.2 % |
 | V23 | A restored flow is the settled flow | A never-restored control | Means identical to 0.00 %, frames within 0.1 % |
 
 ### §10 What the renderer derives
@@ -118,6 +118,14 @@ last printed it.
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
 | V16 | Marching cubes extracts the iso-surface of a sampled field | Two analytic spheres: closed and oriented, V - E + F = 2, vertices within 0.02 cells, normals outward, area and volume within 1 % | Closed, V - E + F = 2; radial error 0.006 / 0.010 cells; area -0.08 / -0.21 %, volume -0.15 / -0.39 % |
+
+### §12 Statistics and signals
+
+| Gate | Property | Checked against | Result |
+|---|---|---|---|
+| V24 | Time averages are exact, and the mean vortex street has its published structure | A double-precision host accumulation; a steady flow's identity; the symmetric mean wake, v_rms peaking on the centreline and u_rms off it | Accumulator within 2.7e-8; mean = instantaneous to the f32 floor; mean wake symmetric to 1e-4 U (instantaneous 1.9 U); u_rms peaks 0.82 D off the centreline |
+| V25 | The wake survey recovers the drag | The force balance over the same window: steady sphere within 1 %, the app's tunnel within 2 % | 0.34 % and 0.56 % at two planes; 0.52 % on the app's Ahmed body; mass flux equal to 7e-5 |
+| V26 | Spectra find frequencies, the shedding Strouhal number and the acoustic modes | Tones at uneven sampling; St 0.196 at Re 200; v at f and u at 2f on the centreline; c_s / (2 n_y) for a standing sound wave | Tones within 0.08 %; St 0.212 (zero crossings 0.212); probes exact to 0.03 %; sound wave within 0.01 % |
 
 ## Where they live, and why there
 

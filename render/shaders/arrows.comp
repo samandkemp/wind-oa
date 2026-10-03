@@ -1,0 +1,73 @@
+#version 450
+// Velocity arrows on the slice (THEORY 10.9): one thread per arrow on a
+// regular grid over the slice plane. The in-plane velocity, sampled
+// trilinearly at the grid point, is drawn as a shaft and two barbs (three
+// segments for vol_splat), scaled so the freestream spans `scale` of the
+// grid spacing. Arrows in solid cells, or too short to read, are hidden
+// (alpha 0).
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "vol_common.glsl"
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, slice axis
+    ivec4 grid;  // arrows along the plane's first and second in-plane axes, -, -
+    vec4 misc;   // plane position (cells), spacing (cells), u_ref, scale
+} P;
+
+layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 1) readonly buffer Macro { vec4 macro[]; };
+layout(std430, binding = 2) writeonly buffer Verts { vec4 verts[]; };     // segment pairs
+layout(std430, binding = 3) writeonly buffer Colours { vec4 colours[]; };  // per segment
+
+ivec3 N;
+
+vec3 sample_u(vec3 p) {  // trilinear velocity, cell centres at i + 0.5
+    const vec3 g = clamp(p - 0.5, vec3(0.0), vec3(N) - 1.001);
+    const ivec3 i0 = ivec3(g);
+    const vec3 f = g - vec3(i0);
+    vec3 acc = vec3(0.0);
+    for (int dx = 0; dx < 2; ++dx)
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dz = 0; dz < 2; ++dz) {
+                const float w = (dx == 1 ? f.x : 1.0 - f.x) * (dy == 1 ? f.y : 1.0 - f.y) *
+                                (dz == 1 ? f.z : 1.0 - f.z);
+                acc += w * macro[cell_index(i0.x + dx, i0.y + dy, i0.z + dz, N)].xyz;
+            }
+    return acc;
+}
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= P.grid.x * P.grid.y) return;
+    N = P.dims.xyz;
+    const int axis = P.dims.w;
+    const int a = axis == 0 ? 1 : 0, b = axis == 2 ? 1 : 2;
+    const float spacing = P.misc.y;
+    vec3 c;
+    c[axis] = P.misc.x;
+    c[a] = (float(i % P.grid.x) + 0.5) * spacing;
+    c[b] = (float(i / P.grid.x) + 0.5) * spacing;
+    vec3 u = sample_u(c);
+    u[axis] = 0.0;
+    const vec3 v = u / max(P.misc.z, 1e-9) * spacing * P.misc.w;
+    const float len = length(v);
+    const ivec3 cc = clamp(ivec3(c), ivec3(0), N - 1);
+    const bool hidden = flags[cell_index(cc.x, cc.y, cc.z, N)] != FLUID || len < 0.08 * spacing;
+    const vec3 dir = len > 1e-9 ? v / len : vec3(1.0, 0.0, 0.0);
+    vec3 nrm = vec3(0.0);
+    nrm[axis] = 1.0;
+    const vec3 side = cross(nrm, dir) * 0.15 * len;
+    const vec3 tail = c - 0.5 * v, head = c + 0.5 * v, back = head - 0.3 * len * dir;
+    verts[6 * i + 0] = vec4(tail, 1.0);
+    verts[6 * i + 1] = vec4(head, 1.0);
+    verts[6 * i + 2] = vec4(head, 1.0);
+    verts[6 * i + 3] = vec4(back + side, 1.0);
+    verts[6 * i + 4] = vec4(head, 1.0);
+    verts[6 * i + 5] = vec4(back - side, 1.0);
+    // dark, so they read on every field colour (the freestream is white)
+    const vec4 col = hidden ? vec4(0.0) : vec4(0.05, 0.05, 0.08, 0.9);
+    colours[3 * i + 0] = col;
+    colours[3 * i + 1] = col;
+    colours[3 * i + 2] = col;
+}

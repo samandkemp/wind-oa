@@ -2,14 +2,24 @@
 // tool (not a gate).
 //
 //   tunnel_run [--preset fast|balanced|fine] [--model ID] [--batches N]
-//              [--steps S] [--spin R] [--dye] [--tu PCT] [--aoa DEG]
+//              [--steps S] [--spin R] [--dye] [--tu PCT] [--aoa DEG] [--f16]
+//              [--average] [--probe X,Y,Z ...] [--no-cache]
+//   --average   time averaging once settled; reports the wake survey
+//   --probe     a probe at (X, Y, Z) cells (up to 4); reports its spectrum
+//   --no-cache  never restore or save a settled flow (a fresh development)
+// The summary gives the second-half means and the lift spectrum's peak as
+// a Strouhal number on the body's height (THEORY 12.3).
 //   tunnel_run --catalogue    voxelise every catalogue model at its default
 //                           placement: triangles, cells, areas, bounds
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #include "windoa/catalogue.hpp"
 #include "windoa/context.hpp"
@@ -21,7 +31,8 @@ int main(int argc, char** argv) {
     std::string preset = "fast", model_id = "ahmed_25deg";
     int batches = 40, steps = 50;
     float spin = -1.0f, tu = 0.0f, aoa = 0.0f;
-    bool dye = false, catalogue_check = false, f16 = false;
+    bool dye = false, catalogue_check = false, f16 = false, average = false, no_cache = false;
+    std::vector<std::array<float, 3>> probes;
     for (int a = 1; a < argc; ++a) {
         const std::string s = argv[a];
         auto next = [&]() { return a + 1 < argc ? argv[++a] : ""; };
@@ -45,7 +56,15 @@ int main(int argc, char** argv) {
             f16 = true;
         else if (s == "--catalogue")
             catalogue_check = true;
-        else {
+        else if (s == "--average")
+            average = true;
+        else if (s == "--no-cache")
+            no_cache = true;
+        else if (s == "--probe") {
+            std::array<float, 3> q{};
+            if (sscanf_s(next(), "%f,%f,%f", &q[0], &q[1], &q[2]) == 3)
+                probes.push_back(q);
+        } else {
             std::printf("unknown argument: %s\n", s.c_str());
             return 2;
         }
@@ -54,7 +73,12 @@ int main(int argc, char** argv) {
         Context ctx;
         TunnelSettings ts = tunnel_preset(preset);
         ts.storage_f16 = f16;
-        Tunnel tunnel(ctx, ts, "cache/flow");
+        const std::filesystem::path cache_dir =
+            no_cache ? std::filesystem::temp_directory_path() / "windoa_tunnel_run_nocache"
+                     : std::filesystem::path("cache/flow");
+        if (no_cache)
+            std::filesystem::remove_all(cache_dir);
+        Tunnel tunnel(ctx, ts, cache_dir);
         std::printf("device: %s, grid %d x %d x %d\n", ctx.gpu().name.c_str(), ts.nx, ts.ny, ts.nz);
 
         if (catalogue_check) {
@@ -92,6 +116,10 @@ int main(int argc, char** argv) {
             tunnel.set_spin(true, spin);
         if (tu > 0.0f)
             tunnel.set_turbulence(tu);
+        if (average)
+            tunnel.set_averaging(true);
+        if (!probes.empty())
+            tunnel.set_probes(probes);
         if (dye) {
             const TunnelStatus st = tunnel.status();
             tunnel.set_dye(true);
@@ -160,8 +188,41 @@ int main(int argc, char** argv) {
                         mcd, std::sqrt(std::max(sq_cd / n_avg - mcd * mcd, 0.0)), mcl,
                         std::sqrt(std::max(sq_cl / n_avg - mcl * mcl, 0.0)), n_avg);
         }
+        tunnel.refresh_analysis();
+        const TunnelAnalysis& a = tunnel.analysis();
+        if (a.lift.peak_amp > 0.0) {
+            const auto pk = spectral_peaks(a.lift, 3, 2.0 / std::max(a.window_steps, 1.0));
+            std::printf("lift spectrum over %.0f steps: peak St %.3f (period %.0f steps, "
+                        "amplitude %.3g); next peaks at St",
+                        a.window_steps, a.st_lift, 1.0 / a.lift.peak_freq, a.lift.peak_amp);
+            for (std::size_t k = 1; k < pk.size(); ++k)
+                std::printf(" %.3f", pk[k] * a.l_ref / a.u_ref);
+            std::printf("  (h %.0f cells; acoustic modes every St %.3f)\n", a.l_ref,
+                        a.f_acoustic * a.l_ref / a.u_ref);
+            if (a.st_shedding > 0.0)
+                std::printf("shedding (strongest peak below the first acoustic mode): St %.3f\n",
+                            a.st_shedding);
+        }
+        for (int i = 0; i < a.n_probes; ++i) {
+            static const char* kComp[] = {"u_x", "u_y", "u_z", "rho"};
+            std::printf("probe %d:", i + 1);
+            for (int k = 0; k < 4; ++k)
+                std::printf("  %s St %.3f (amp %.2g)", kComp[k],
+                            a.probe_spec[i][k].peak_freq * a.l_ref / a.u_ref,
+                            a.probe_spec[i][k].peak_amp);
+            std::printf("\n");
+        }
+        if (average)
+            std::printf("averaged %.2f flow-throughs (%d samples); wake survey %s: Cd %.4f vs the "
+                        "force balance's %.4f (%+.2f %%), mass flux change %.1e\n",
+                        a.avg_flow_throughs, a.avg_samples, a.wake_valid ? "valid" : "not ready",
+                        a.cd_wake, a.cd_balance,
+                        a.wake_valid ? (a.cd_wake / a.cd_balance - 1.0) * 100.0 : 0.0,
+                        a.mass_imbalance);
         std::printf("spin scale %.3f, cache: %s (%d entries)\n", st.spin_scale,
                     st.cache_note.c_str(), st.cache_entries);
+        if (no_cache)
+            std::filesystem::remove_all(cache_dir);
         return 0;
     } catch (const std::exception& ex) {
         std::printf("FAIL: %s\n", ex.what());

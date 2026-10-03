@@ -2,7 +2,11 @@
 // Pass 2: one ray per pixel, front to back with a running transmittance,
 // compositing the model surface (voxel or smooth, optionally Cp-painted),
 // an opaque slice plane, Q-criterion vortex cores, dye smoke, the field
-// haze and the tunnel box edges.
+// haze, the mean reversed-flow region and the tunnel box edges.
+// The surface can be painted with Cp, the near-wall speed, the near-wall
+// streamwise direction (reversed flow) or oil-flow streaks, and the slice
+// can carry a line-integral-convolution texture of its in-plane flow
+// (THEORY 10.7, 10.8).
 // Also writes each pixel's depth (ray distance to the first opaque hit,
 // 1e30 if none) so the smoke / streamline splats can be depth-tested.
 //
@@ -28,12 +32,23 @@ const int F_PAINT_CP = 4;
 const int F_Q = 8;
 const int F_DYE = 16;
 const int F_DYE_BY_SPEED = 32;
+const int F_RECIRC = 64;     // mean reversed-flow shells (needs t_recirc)
+const int F_SLICE_LIC = 128; // LIC texture on the slice
+
+// Surface paint (P.img.w >> 4), with F_PAINT_CP as the on switch
+const int PAINT_CP = 0;
+const int PAINT_WALL_SPEED = 1;
+const int PAINT_REVERSED = 2;
+const int PAINT_OIL = 3;
+const float WALL_SPEED_SPAN = 1.2;  // near-wall |u_t| / U in [0, 1.2] fills the map
+const int LIC_STEPS = 16;           // samples each way along a surface streak
+const int LIC_SLICE_STEPS = 24;     // and along a slice streak (cheap: no normals)
 const float DYE_SPEED_SPAN = 1.5;  // dye colour spans |u| / U in [0, 1.5]
 
 // 128 bytes -- the guaranteed push-constant minimum; all vec4 (std430-safe).
 layout(push_constant) uniform Params {
     ivec4 dims;   // nx, ny, nz, n_steps
-    ivec4 img;    // width, height, feature bits, surface
+    ivec4 img;    // width, height, feature bits, surface | paint << 4
     ivec4 modes;  // cmode, slice_axis (-1 = none), pscale (float bits), -
     vec4 eye;     // xyz, tan(fov / 2)
     vec4 fwd;     // xyz, aspect
@@ -57,6 +72,7 @@ layout(binding = 8) uniform sampler3D t_dye;
 layout(std430, binding = 9) writeonly buffer Image { uint image[]; };
 layout(std430, binding = 10) writeonly buffer Depth { float depth[]; };
 layout(binding = 11) uniform sampler3D t_speed;  // |u| per cell
+layout(binding = 12) uniform sampler3D t_recirc;  // <u_x> / U per cell (F_RECIRC)
 
 ivec3 N;
 
@@ -93,10 +109,11 @@ vec3 qcoremap(float t) {
     return mix(vec3(0.30, 0.95, 0.50), vec3(0.85, 0.55, 0.30), clamp(t, 0.0, 1.0));
 }
 
-vec3 fieldcolor(float sv, int cmode) {
+vec3 fieldcolour(float sv, int cmode) {
     const float t = 0.5 + 0.5 * clamp(sv, -1.0, 1.0);
     if (cmode == CMODE_VORT) return vortmap(t);
     if (cmode == CMODE_GREY) return vec3(0.88, 0.92, 1.0) * clamp(sv, 0.0, 1.0);
+    if (cmode == CMODE_SEQ) return dyemap(clamp(sv, 0.0, 1.0));
     return coolwarm(t);
 }
 
@@ -106,7 +123,7 @@ ivec3 cell_of(vec3 p) { return ivec3(clamp(p, vec3(0.0), vec3(N - 1))); }
 bool is_solid_cell(ivec3 c) { return flags[cell_index(c.x, c.y, c.z, N)] != FLUID; }
 
 // Trilinear sample of a cell-centred scalar (nearest-cell looks blocky).
-// `which`: 0 field, 1 solid_raw, 2 solid_blur, 3 Q, 4 dye, 5 |u| (GLSL
+// `which`: 0 field, 1 solid_raw, 2 solid_blur, 3 Q, 4 dye, 5 |u|, 6 <u_x> / U (GLSL
 // cannot pass a buffer as an argument).
 float trilinear(int which, vec3 p) {
     // hardware trilinear; clamp-to-edge = the old clamp of p - 1/2 to [0, N - 1]
@@ -117,6 +134,7 @@ float trilinear(int which, vec3 p) {
     case 2: return textureLod(t_blur, uvw, 0.0).r;
     case 3: return textureLod(t_q, uvw, 0.0).r;
     case 4: return textureLod(t_dye, uvw, 0.0).r;
+    case 6: return textureLod(t_recirc, uvw, 0.0).r;
     default: return textureLod(t_speed, uvw, 0.0).r;
     }
 }
@@ -166,6 +184,101 @@ vec3 smooth_normal(vec3 p) {
     return length(g) < 1e-6 ? vec3(0.0, 1.0, 0.0) : normalize(-g);
 }
 
+// Trilinear velocity over FLUID cells only (solid cells hold stale values).
+vec3 fluid_trilinear_u(vec3 p) {
+    const vec3 g = clamp(p - 0.5, vec3(0.0), vec3(N) - 1.001);
+    const ivec3 i0 = ivec3(g);
+    const vec3 t = g - vec3(i0);
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    for (int dx = 0; dx < 2; ++dx)
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dz = 0; dz < 2; ++dz) {
+                const uint c = cell_index(i0.x + dx, i0.y + dy, i0.z + dz, N);
+                if (flags[c] == FLUID) {
+                    const float w = (dx == 1 ? t.x : 1.0 - t.x) * (dy == 1 ? t.y : 1.0 - t.y) *
+                                    (dz == 1 ? t.z : 1.0 - t.z);
+                    acc += w * macro[c].xyz;
+                    wsum += w;
+                }
+            }
+    return wsum > 1e-6 ? acc / wsum : vec3(0.0);
+}
+
+// White noise on a lattice of spacing 1 / freq: the texture a line-integral
+// convolution smears along the flow.
+float lic_noise(vec3 p, float freq) {
+    const ivec3 c = ivec3(floor(p * freq));
+    uint h = uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u;
+    h = h * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    return float((h >> 22u) ^ h) * (1.0 / 4294967296.0);
+}
+
+// The flow along the surface at p: the velocity one cell out along the
+// normal, with its normal component removed (THEORY 10.7).
+vec3 wall_flow(vec3 p, vec3 nrm) {
+    const vec3 u = fluid_trilinear_u(p + nrm);
+    return u - dot(u, nrm) * nrm;
+}
+
+// Oil-flow streaks: the noise averaged along the near-wall flow over the
+// surface (a tent filter), so streaks follow the skin-friction lines and
+// break up where the flow separates or stalls.
+float surface_lic(vec3 p0, vec3 n0, float freq) {
+    float acc = lic_noise(p0, freq), wsum = 1.0;
+    const float h = 0.35 / freq;
+    for (int dir = -1; dir <= 1; dir += 2) {
+        vec3 p = p0, nrm = n0;
+        for (int k = 1; k <= LIC_STEPS; ++k) {
+            const vec3 ut = wall_flow(p, nrm);
+            const float s = length(ut);
+            if (s < 1e-7) break;
+            p += float(dir) * h * ut / s;
+            nrm = smooth_normal(p);
+            const float w = 1.0 - float(k) / float(LIC_STEPS + 1);
+            acc += w * lic_noise(p, freq);
+            wsum += w;
+        }
+    }
+    return acc / wsum;
+}
+
+// The same along the slice's in-plane flow (axis = the slice normal).
+float slice_lic(vec3 p0, int axis, float freq) {
+    float acc = lic_noise(p0, freq), wsum = 1.0;
+    const float h = 0.35 / freq;
+    for (int dir = -1; dir <= 1; dir += 2) {
+        vec3 p = p0;
+        for (int k = 1; k <= LIC_SLICE_STEPS; ++k) {
+            vec3 u = fluid_trilinear_u(p);
+            u[axis] = 0.0;
+            const float s = length(u);
+            if (s < 1e-7) break;
+            p += float(dir) * h * u / s;
+            if (any(lessThan(p, vec3(0.0))) || any(greaterThanEqual(p, vec3(N))) ||
+                is_solid_cell(cell_of(p)))
+                break;
+            const float w = 1.0 - float(k) / float(LIC_SLICE_STEPS + 1);
+            acc += w * lic_noise(p, freq);
+            wsum += w;
+        }
+    }
+    return acc / wsum;
+}
+
+// Contrast of a LIC average (white noise averaged over ~LIC_STEPS samples
+// has a narrow spread about 1/2), mapped to a brightness factor.
+float lic_shade(float l) {
+    return clamp(0.5 + 2.6 * (l - 0.5), 0.0, 1.0);
+}
+
+// Noise frequency for a grain about three pixels wide at distance t.
+float lic_freq(float t, float tan_half, int height) {
+    const float px = 2.0 * t * tan_half / float(height); // cells per pixel
+    return clamp(0.33 / max(px, 1e-4), 0.5, 4.0);
+}
+
 void main() {
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     const int W = P.img.x, H = P.img.y;
@@ -177,7 +290,9 @@ void main() {
     const bool paint_cp = (feat & F_PAINT_CP) != 0;
     const bool show_q = (feat & F_Q) != 0, show_dye = (feat & F_DYE) != 0;
     const bool dye_by_speed = (feat & F_DYE_BY_SPEED) != 0;
-    const int surface = P.img.w, cmode = P.modes.x, slice_axis = P.modes.y;
+    const int surface = P.img.w & 15, paint_mode = P.img.w >> 4;
+    const int cmode = P.modes.x, slice_axis = P.modes.y;
+    const bool show_recirc = (feat & F_RECIRC) != 0, slice_tex = (feat & F_SLICE_LIC) != 0;
     const float pscale = intBitsToFloat(P.modes.z);
     const float dye_gain = P.haze.w;
     const float q_thresh = show_q ? qstat.x : 1e30;
@@ -287,13 +402,29 @@ void main() {
                                                            cell_of(p + 0.5 * d).z, N)];
                     const bool model_cell = hit_flag == 1u || hit_flag == FLUID;
                     vec3 col = (model_cell ? vec3(0.80, 0.81, 0.84) : vec3(0.36, 0.37, 0.41)) * diff;
-                    if (paint_cp && model_cell) {
+                    if (paint_cp && model_cell && paint_mode == PAINT_CP) {
                         // Pressure half a cell back along the ray over FLUID
                         // cells only (the single last fluid cell striped every
                         // voxel staircase).
                         const float rho_s = fluid_trilinear_rho(p - d * (0.5 + 0.5 * dt), last_rho);
                         const float cp = (rho_s - rho_ref) * pscale * inv_q;
                         col = coolwarm(0.5 + 0.5 * clamp(cp, -1.0, 1.0)) * diff;
+                    } else if (paint_cp && model_cell) {
+                        // Near-wall flow, from the smooth normal whatever the
+                        // surface style (a voxel normal is a staircase).
+                        const vec3 sn = smooth_normal(p);
+                        const vec3 ut = wall_flow(p, sn);
+                        if (paint_mode == PAINT_WALL_SPEED) {
+                            col = dyemap(length(ut) / (WALL_SPEED_SPAN * max(u_ref, 1e-9))) * diff;
+                        } else if (paint_mode == PAINT_REVERSED) {
+                            col = coolwarm(0.5 + 0.5 * clamp(ut.x / (0.5 * max(u_ref, 1e-9)), -1.0, 1.0)) *
+                                  diff;
+                        } else {  // oil flow: pale streaks on a mid-grey film
+                            const float l = surface_lic(p, sn, lic_freq(t, tan_half, H));
+                            const float k = clamp(0.5 + 1.8 * (l - 0.5), 0.0, 1.0);
+                            const vec3 ground = vec3(0.30, 0.31, 0.34), streak = vec3(0.95, 0.94, 0.88);
+                            col = mix(ground, streak, k) * diff;
+                        }
                     }
                     acc += trans * col;
                     trans = 0.0;
@@ -305,7 +436,14 @@ void main() {
 
                 if (slice_axis >= 0) {  // an opaque cut
                     if (abs(p[slice_axis] - slice_pos * dims[slice_axis]) < 0.6 * dt + 0.35) {
-                        acc += trans * fieldcolor(trilinear(0, p), cmode);
+                        vec3 scol = fieldcolour(trilinear(0, p), cmode);
+                        if (slice_tex) {
+                            vec3 ps = p;
+                            ps[slice_axis] = slice_pos * dims[slice_axis];
+                            const float l = lic_shade(slice_lic(ps, slice_axis, lic_freq(t, tan_half, H)));
+                            scol *= 0.45 + 0.75 * l;
+                        }
+                        acc += trans * scol;
                         trans = 0.0;
                         hit_t = t;
                         break;
@@ -323,6 +461,16 @@ void main() {
                         const float w = 3.0 * (0.35 + 0.65 * shell);
                         dens += w;
                         col += w * qcoremap(shell);
+                    }
+                }
+
+                if (show_recirc) {  // the mean flow runs backwards: translucent teal shells
+                    const float ur = trilinear(6, p);
+                    if (ur < 0.0) {
+                        const float k = clamp(-ur / 0.3, 0.0, 1.0);
+                        const float w = 2.5 * (0.35 + 0.65 * k);
+                        dens += w;
+                        col += w * mix(vec3(0.25, 0.75, 0.85), vec3(0.10, 0.35, 0.95), k);
                     }
                 }
 
@@ -345,7 +493,7 @@ void main() {
                     if (dev > 0.0) {
                         const float hd = haze_gain * min(dev, 3.0);
                         dens += hd;
-                        col += hd * fieldcolor(sv, cmode);
+                        col += hd * fieldcolour(sv, cmode);
                     }
                 }
 

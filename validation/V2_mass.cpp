@@ -3,7 +3,9 @@
 //
 // Identity / invariant references:
 //   A. the open tunnel (inlet + pressure outlet) holds its density level
-//      unaided: |drift| < 1e-8 per step;
+//      unaided: |drift| < 1e-8 per step; and conserves mass locally: in the
+//      steady flow the exact mass flux through every x-face is the same, to
+//      1e-4 (the free-slip side faces neither create nor destroy mass);
 //   B. enforce_mass() pins the mean density to 1 and leaves the velocity
 //      field exactly unchanged (rho and rho u scale together);
 //   C. with the anchor every 500 steps the closed cavity stays bounded,
@@ -18,6 +20,9 @@
 using namespace windoa;
 
 namespace {
+
+// e_x per D3Q19 direction (engine/shaders/lattice.glsl order).
+constexpr int kEx[lbm::Q] = {0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, 0, 0, 0, 0};
 
 void part_a(Context& ctx, gate::Gate& g) {
     g.section("A: open tunnel (inlet + pressure outlet), sphere obstacle");
@@ -50,6 +55,42 @@ void part_a(Context& ctx, gate::Gate& g) {
     const double drift = (rho1 - rho0) / 20000.0;
     g.note("mean rho after 2,000 steps %.6f, after 22,000 %.6f", rho0, rho1);
     g.check(std::abs(drift) < 1e-8, "open tunnel drift %+.3e per step (|.| < 1e-8)", drift);
+
+    // Local conservation: in the steady flow the mass crossing every x-face
+    // per step -- the post-collision populations that stream across it --
+    // is the same at each face. A side face that took its reflected
+    // population from the wrong row would create and destroy mass along the
+    // walls; the inlet and outlet would hide that from the drift above.
+    const auto f = s.get_state();
+    const std::size_t n = s.cells();
+    std::vector<double> flux;
+    for (int x = 4; x < NX - 4; x += 4) {
+        if (x >= 22 && x <= 42)
+            continue; // faces through the sphere (x 24 - 40) hold solid cells
+        double fx = 0.0;
+        for (int y = 0; y < NY; ++y)
+            for (int z = 0; z < NZ; ++z) {
+                const std::size_t cell = (std::size_t(x) * NY + y) * NZ + z;
+                const std::size_t next = cell + std::size_t(NY) * NZ; // the cell at x + 1
+                for (int i = 0; i < lbm::Q; ++i) {
+                    if (kEx[i] == 1)
+                        fx += f[std::size_t(i) * n + cell];
+                    else if (kEx[i] == -1)
+                        fx -= f[std::size_t(i) * n + next];
+                }
+            }
+        flux.push_back(fx);
+    }
+    double lo = flux[0], hi = flux[0], mean = 0.0;
+    for (const double v : flux) {
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+        mean += v / double(flux.size());
+    }
+    g.check((hi - lo) / mean < 1e-4,
+            "mass flux through %zu x-faces: %.4f, spread %.1e (< 1e-4): the side faces conserve "
+            "mass",
+            flux.size(), mean, (hi - lo) / mean);
 }
 
 // The closed cavity: 48^2 fluid cells, tau 0.6, laminar, lid 0.1

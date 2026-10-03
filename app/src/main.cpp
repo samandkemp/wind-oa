@@ -12,9 +12,12 @@
 //   --shot FILE         with --frames: save the last frame, UI included
 //   --warmup STEPS      run the solver this many steps before the first frame
 //   --show LIST         view toggles, comma-separated: q, dye, lines, nosmoke,
-//                       slice, nohaze, voxel (for scripted screenshots)
-//   --field NAME        speed|pressure|vorticity|vortx|mach|schlieren
+//                       slice, nohaze, voxel, avg, recirc, lic, arrows,
+//                       timelines, nopaint, wallspeed, reversed, oil,
+//                       analysis, probes (for scripted screenshots)
+//   --field NAME        speed|pressure|vorticity|vortx|mach|schlieren|mean|turb
 //   --spin R / --aoa D  spin ratio (models with spinners) / pitch at start
+//   --zoom F            camera distance x F, aimed at the model (F < 1 nearer)
 //
 // Controls: RMB orbit, MMB pan, wheel zoom, WASD pan, Q / E zoom, F focus on
 // the model, Space pause, H hide panels, P screenshot, Esc quit.
@@ -60,6 +63,8 @@ int main(int argc, char** argv) {
             o.spin = float(std::atof(next().c_str()));
         else if (s == "--aoa")
             o.aoa = float(std::atof(next().c_str()));
+        else if (s == "--zoom")
+            o.zoom = float(std::atof(next().c_str()));
         else {
             std::fprintf(stderr, "unknown argument: %s\n", s.c_str());
             return 2;

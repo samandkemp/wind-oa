@@ -21,11 +21,12 @@ and validation gates as VN.
 7. [From triangles to cells](#7-from-triangles-to-cells)
 8. [A session, from choosing a model to a settled number](#8-a-session-from-choosing-a-model-to-a-settled-number)
 9. [Dye and inlet turbulence](#9-dye-and-inlet-turbulence)
-10. [Transonic mode](#10-transonic-mode)
-11. [What is drawn, and from what](#11-what-is-drawn-and-from-what)
-12. [The identity discipline](#12-the-identity-discipline)
-13. [Performance, and why it cannot change results](#13-performance-and-why-it-cannot-change-results)
-14. [Where to change things](#14-where-to-change-things)
+10. [Measuring the flow: averages, the wake survey and spectra](#10-measuring-the-flow-averages-the-wake-survey-and-spectra)
+11. [Transonic mode](#11-transonic-mode)
+12. [What is drawn, and from what](#12-what-is-drawn-and-from-what)
+13. [The identity discipline](#13-the-identity-discipline)
+14. [Performance, and why it cannot change results](#14-performance-and-why-it-cannot-change-results)
+15. [Where to change things](#15-where-to-change-things)
 
 ## 1. The shape of it
 
@@ -36,7 +37,7 @@ flowchart LR
     app["app/<br/>Win32 window, Dear ImGui panels,<br/>the simulation worker"] --> render
     render["render/<br/>volume ray march, Q cores,<br/>smoke and streamlines"] --> engine
     tools["tools/<br/>headless runners, benchmark,<br/>bit-identity checks"] --> engine
-    validation["validation/<br/>the V1-V23 gates"] --> engine
+    validation["validation/<br/>the V1-V26 gates"] --> engine
     engine["engine/<br/>Vulkan context, LBM and Euler solvers,<br/>dye, voxeliser, catalogue, Tunnel"]
 ```
 
@@ -50,7 +51,7 @@ flowchart LR
 - **`tools/`** and **`validation/`** drive the engine directly, without a window.
 
 `engine/` never includes a window or GUI header. That boundary keeps the physics testable
-headless, which is what lets 23 gates run the same code the app runs.
+headless, which is what lets 26 gates run the same code the app runs.
 
 ## 2. How the parts couple
 
@@ -103,9 +104,9 @@ the tunnel works three orders of magnitude lower, so absolute drag coefficients 
 *comparisons* are what it is for (§4.5).
 
 Time is easiest to read in **flow-throughs**: one flow-through is the time for the freestream to
-cross the tunnel, $n_x / U = 256 / 0.05 = 5{,}120$ steps on the fast grid. At the 3,371 million
-lattice updates per second measured in the sandbox, the fast grid advances 1,429 steps a second,
-so one flow-through takes 3.6 s. A wake typically settles in 2 - 4.5 flow-throughs; the Ahmed body
+cross the tunnel, $n_x / U = 256 / 0.05 = 5{,}120$ steps on the fast grid. At the 3,272 million
+lattice updates per second measured in the sandbox, the fast grid advances 1,386 steps a second,
+so one flow-through takes 3.7 s. A wake typically settles in 2 - 4.5 flow-throughs; the Ahmed body
 from rest settled after 14,000 steps (2.55 flow-throughs, about 10 s).
 
 ## 4. One solver step, end to end
@@ -140,23 +141,23 @@ always in the same order, so a run repeats bit for bit (§4.3).
 | Inlet plane (x = 0) | Pinned to the freestream equilibrium every step | §3.1 |
 | Outlet (x = n_x - 1) | Density pinned to 1, velocity from the last interior plane one step earlier | §3.2 |
 | The last 24 cells | Relaxed towards the freestream, absorbing sound | §3.3 |
-| Side walls | Free-slip: no friction, no boundary layer | §3.4 |
+| Side walls | Free-slip: a mirror for the populations, so no friction, no boundary layer, no mass gained or lost, and sound reflected perfectly | §3.4 |
 | The model | Bounce-back at every link: a no-slip wall half a cell outside its cells | §3.5 |
 | Spinning parts, rolling road | Bounce-back plus the wall's own velocity | §3.7 |
 
-The outlet's sound reflection is the reason for the sponge: without it, 68 % of a pressure pulse
+The outlet's sound reflection is the reason for the sponge: without it, 69 % of a pressure pulse
 returned up the tunnel and fogged both the picture and the drag signal. With it, 1.0 % returns, and
-the Ahmed body's drag moves by 0.18 % (V10).
+the Ahmed body's drag moves by 0.20 % (V10).
 
 ## 6. Forces, and turning them into coefficients
 
 The force on the model is summed from every link between a fluid cell and a model cell (§4.1). For
 the Ahmed body on the fast grid, the frontal area is 432 cells (the number of cells in the model's
 shadow along the flow), and the dynamic pressure at $U = 0.05$ is
-$q = \tfrac12 U^2 = 0.00125$. Its settled drag coefficient of 0.716 therefore corresponds to a
+$q = \tfrac12 U^2 = 0.00125$. Its settled drag coefficient of 0.714 therefore corresponds to a
 force of
 
-$$F_x = C_D\, q\, A = 0.716 \times 0.00125 \times 432 = 0.387$$
+$$F_x = C_D\, q\, A = 0.714 \times 0.00125 \times 432 = 0.386$$
 
 in lattice units per step: a sum of order 0.4, which is why the window adds once per step rather
 than once per link (§4.3).
@@ -247,7 +248,39 @@ in through the inlet at the freestream speed. Being divergence-free is what keep
 same intensity of ordinary noise made five times as much sound (V21). At 1 % it changed the Ahmed
 body's drag by 0.75 %.
 
-## 10. Transonic mode
+## 10. Measuring the flow: averages, the wake survey and spectra
+
+A wake that sheds is never still, so the numbers worth having from it are averages and
+frequencies (§12). All three measurements read the solver's fields and never write them.
+
+**Time averages.** With averaging on, every batch of a settled flow adds a sample to a running
+mean and variance of each cell's velocity and density, updated in place on the GPU. Each update
+is taken relative to the sample (Welford's recurrence), so a long window loses no precision in
+f32. From them come the mean-speed and turbulence-intensity fields and the mean recirculation
+bubble. On the shedding cylinder of V24, thirty cycles of averaging leave the mean wake symmetric
+to 0.01 % of U, while every instantaneous field is asymmetric by more than U; the transverse
+fluctuation peaks on the centreline and the streamwise one off it, as in a Karman street.
+
+**The wake survey.** Between the upstream reference plane and a survey plane behind the model,
+the drag must equal the fall in the averaged flow's momentum flux, because the side walls carry no
+streamwise force. The survey sums the momentum flux, the pressure and the viscous stress over
+each plane's fluid cells and sets the result beside the force balance's mean over the same
+window: two independent measurements of one force. On the app's Ahmed body they agree to 0.5 %
+(V25).
+
+**Spectra and probes.** The batch-mean lift and up to four probes are recorded every batch, and
+their spectra are taken over the developed part of the last 16 flow-throughs; a peak's frequency
+becomes a Strouhal number on the body's height. Sound rings between the side walls at multiples of
+$c_s / (2 n_y)$, every 333 steps on the fast grid, and shows in every spectrum, so the shedding
+peak is reported separately, below the first acoustic mode. On the cylinder of V7 the lift
+spectrum gives St 0.212 (published 0.196), and a probe on the wake centreline sees the transverse
+velocity at the shedding frequency and the streamwise velocity at twice it (V26).
+
+**The code path:** `FlowStats` and `plane_momentum_flux` (`engine/src/flow_stats.cpp`,
+`stats_accumulate.comp`); `spectrum` (`engine/src/spectrum.cpp`); `Tunnel::record_signals` and
+`Tunnel::refresh_analysis` (`engine/src/tunnel.cpp`).
+
+## 11. Transonic mode
 
 The lattice Boltzmann solver cannot form shocks. Switching the regime to TRANSONIC hands the same
 tunnel and model to the compressible Euler solver (§8): the body is voxelised into the Euler grid
@@ -261,24 +294,33 @@ In the Euler solver's units the freestream speed *is* the Mach number and the so
 so time is counted in cell sound-crossings. It develops for two flow-throughs after a switch or a
 new model.
 
-## 11. What is drawn, and from what
+## 12. What is drawn, and from what
 
 Each frame the renderer runs a few compute passes over the latest snapshot:
 
-1. **Prepare:** the chosen field (speed, pressure, vorticity, Mach or schlieren) is computed once
-   per cell into a normalised value (§10.1).
+1. **Prepare:** the chosen field (speed, pressure, vorticity, Mach, schlieren, or from the
+   averages the mean speed and the turbulence intensity) is computed once per cell into a
+   normalised value (§10.1, §12.1), with the mean streamwise velocity when the reversed-flow
+   shells are on.
 2. **Q** (every third frame): the vortex-core criterion from a smoothed velocity, with an adaptive
    threshold computed on the GPU (§10.3).
 3. **March:** one ray per pixel, front to back, accumulating the model surface, the slice plane,
-   the vortex cores, the dye and the field haze. Opacity comes from the deviation from the
-   freestream, so undisturbed air is transparent and only what the model changes shows.
-4. **Splats:** smoke particles and streamline segments, depth-tested against the marched image.
+   the vortex cores, the mean reversed-flow shells, the dye and the field haze. Opacity comes from
+   the deviation from the freestream, so undisturbed air is transparent and only what the model
+   changes shows. The surface can be painted with Cp, with the speed or direction of the flow one
+   cell off it, or with oil-flow streaks: noise smeared along that near-wall flow by a
+   line-integral convolution, so the streaks trace the skin-friction lines (§10.7). The slice can
+   carry the same texture of its in-plane flow (§10.8).
+4. **Splats:** smoke particles (streaklines, or timelines from a pulsed line), streamline
+   segments, velocity arrows on the slice, the probe crosses and the wake-survey planes,
+   depth-tested against the marched image (§10.9).
 
 The ray march samples 3-D textures, so the GPU's texture units do the trilinear interpolation. On
 the fast grid a frame's rendering costs about 0.7 ms of GPU time with the haze alone, and
-1.5 - 2 ms with vortex cores, dye and streamlines on as well.
+1.5 - 2 ms with vortex cores, dye and streamlines on as well; the slice texture and the oil-flow
+paint add about 0.3 - 0.5 ms each at 1600 x 900.
 
-## 12. The identity discipline
+## 13. The identity discipline
 
 Every optional feature reduces to an exact identity when it is off (§0.7). A tunnel with no
 spinning parts, no inlet turbulence and no dye steps bit for bit as it did before those features
@@ -288,7 +330,7 @@ inlet turbulence intensity, for example) skip their work entirely at zero. This 
 safe to add a feature: if the result with it off changes at all, something else has been changed
 too.
 
-## 13. Performance, and why it cannot change results
+## 14. Performance, and why it cannot change results
 
 The solver runs at about 3,550 million lattice updates per second in f32 (about 4,800 with the
 optional half-precision storage); the Euler solver runs at about 2,300 million cell-steps per
@@ -297,12 +339,12 @@ alter the arithmetic (§11): writing density and velocity only when they are rea
 force reduction where no model link exists. Each is checked bit for bit against the code with the
 switch off, and against results saved from the kernel as it was before the work (`P4_equiv`).
 
-Half-precision storage is the exception, and it is labelled as one. It is about 30 % faster in the
+Half-precision storage is the exception, and it is labelled as one. It is about a third faster in the
 sandbox, but it at least doubles the batch-to-batch scatter of the drag, so the same confidence in a
 mean costs more time, not less (the Quick start in the README shows the measurement). It is
 therefore off by default.
 
-## 14. Where to change things
+## 15. Where to change things
 
 | To change | Look in |
 |---|---|
@@ -311,17 +353,18 @@ therefore off by default.
 | The compressible solver's options | `euler::Config` in `engine/include/windoa/euler.hpp` |
 | A catalogue model or its spinning parts | `engine/src/catalogue.cpp` |
 | The settling thresholds | `ConvergenceMonitor` in `engine/include/windoa/convergence.hpp` |
-| What is drawn, and how | `render/src/volume.cpp` and `render/shaders/` |
+| What is drawn, and how | `render/src/volume.cpp`, `render/src/tracers.cpp` and `render/shaders/` |
+| Averages, the wake survey, spectra | `engine/src/flow_stats.cpp`, `engine/src/spectrum.cpp`, `Tunnel::refresh_analysis` |
 | The panels | `app/src/app.cpp` |
 
 ### Checking that nothing is broken
 
-- `ctest --preset quick` runs the smoke checks and the eleven short gates in about 40 s.
+- `ctest --preset quick` runs the smoke checks and the 14 short gates in about 80 s.
 - `build\tools\RelWithDebInfo\lbm_equiv --check build\p4_orig` confirms the lattice Boltzmann
   solver still produces the same bits; `euler_run equiv --check build\p4_euler` does the same for
   the Euler solver. A change that is meant to alter the physics will fail these by design: in that
   case, run the gates instead.
-- `ctest --preset dev` runs everything, all 23 gates included, in about 13 minutes.
+- `ctest --preset dev` runs everything, all 26 gates included, in about 13 minutes.
 
 If a gate fails after a change, the reason should be understood before any tolerance is changed:
 see [`docs/VALIDATION.md`](VALIDATION.md).

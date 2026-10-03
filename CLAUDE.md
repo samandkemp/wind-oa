@@ -59,15 +59,19 @@ engine/      headless core (static lib windoa_engine); Vulkan::Vulkan only
   include/windoa/tunnel.hpp    Tunnel: the sandbox (everything the app does
                                that is not UI) + TunnelSettings (tunables)
   include/windoa/convergence.hpp, flow_cache.hpp  settling detector, cache
+  include/windoa/flow_stats.hpp FlowStats (GPU time averages), wake survey
+  include/windoa/spectrum.hpp   spectrum (uneven samples -> Hann -> FFT)
   shaders/                     lbm_*, vox_*, euler_*, dye_*, turb_* + includes
-render/      VolumeRenderer (march, Q cores, dye, splats) + Tracers (smoke,
-             streamlines), reading snapshot buffers; depends on engine
-app/         Win32 + Dear ImGui app: App (panels), SimWorker (Tunnel on a
+render/      VolumeRenderer (march, Q cores, dye, surface paints incl. oil-flow
+             LIC, slice LIC, mean reversed-flow shells, splats) + Tracers
+             (smoke / timelines, streamlines, slice arrows, markers), reading
+             snapshot buffers; depends on engine
+app/         Win32 + Dear ImGui app: App (panels incl. Analysis), SimWorker (Tunnel on a
              thread + snapshot hand-off), Swapchain, OrbitCamera, plots, PNG
 third_party/ imgui (v1.92.9b-docking, vendored unmodified; VERSION.md)
 tools/       device_info, compute_selftest, lbm_run, tunnel_run, euler_run,
              bench, lbm_equiv
-validation/  gates V1-V23 (one exe each, CTest label "gate", "long" for
+validation/  gates V1-V26 (one exe each, CTest label "gate", "long" for
              the > 1 min ones); gate.hpp = ledger + numerics, cases.hpp +
              euler_cases.hpp = setups shared by several gates
 docs/        public, in three tiers under README.md (tier 1): GUIDE.md (use it),
@@ -115,7 +119,7 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
   (RelWithDebInfo; `--build --preset debug` / `release` for the others).
   Any prompt: the VS generator finds MSVC itself.
 - Gates: `ctest --preset dev` (everything, ~13 min), `ctest --preset quick`
-  (skips label `long`, ~40 s), `ctest --preset dev -R V17` (one gate).
+  (skips label `long`, ~80 s), `ctest --preset dev -R V17` (one gate).
 - GPU report: `build\tools\RelWithDebInfo\device_info`
 - App: `build\app\RelWithDebInfo\windoa_app [fast|balanced|fine] [transonic]`
   (finds the repo root itself); scripted: `--show / --field / --warmup /
@@ -159,6 +163,14 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
   source, voxeliser source, spinner definitions, ground mode.
 - Validate a restore against a never-restored CONTROL, not a fixed bar --
   the wake is unsteady.
+- Free-slip faces MIRROR the populations about the face (the cell's own
+  row). Pulling the reflected population from the row inside creates and
+  destroys mass along the walls; the inlet and outlet hide it from the
+  total, but the wake survey read 3 - 5 % low until it was fixed. V2
+  checks the local conservation, V25 the balance, V26 D the acoustics.
+- Perfectly reflecting side walls ring: transverse acoustic modes at
+  n c_s / (2 n_y) (333 steps on the fast grid) show in every spectrum.
+  The shedding St is the strongest peak below 0.8 of the first mode.
 
 ## Engineering rules (add as they are learned)
 
@@ -199,6 +211,10 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
   (the cells at exactly r) and moves V9's Cd by 1 %.
 - Marching cubes interpolates every edge from its lower corner, so shared
   vertices are bit-identical and the soup welds into a closed surface.
+- Splats lying in the slice plane (arrows, timelines, probes) need a depth
+  bias: the slice registers its hit a little in front of the plane.
+- FlowStats stores rho - 1, and plane sums add the 1 in double: f32 rho
+  rounds away the 1e-4 deviations a momentum balance needs.
 - Shell: Bash heredocs collapse doubled backslashes (a `\\n` inside a
   Python string arrives as a newline), so edits touching backslashes go
   through the editor tools or a Python script written with the Write tool.
@@ -246,4 +262,14 @@ handover; read it first in a new session) and `docs/PROGRESS.md` (the log).
   comments lowered; repo pushed to https://github.com/samandkemp/wind-oa
   (origin, main). Owner: the repo reads as a C++ project in its own right,
   so every gate stands on its external reference alone. V16 (marching
-  cubes, `marching_cubes`) added: 23 gates. Open: gating f16.
+  cubes, `marching_cubes`) added: 23 gates.
+- 2026-10-03, features (owner chose: flow statistics, surface + slice
+  visuals, probes + spectra; no big physics yet): GPU time averages (mean
+  speed, turbulence intensity, mean reversed-flow shells), the wake survey
+  (drag from a control-volume momentum balance), probes, spectra with
+  acoustic modes marked; surface paints (near-wall speed, reversed flow,
+  oil-flow LIC), slice LIC, slice arrows, pulsed timelines; Analysis
+  panel; tunnel_run --average / --probe / --no-cache; app --zoom. The
+  survey exposed the free-slip mass defect (owner: fix it); results
+  re-measured, build\p4_orig regenerated. Gates V24 - V26: 26 gates.
+  Open: gating f16.

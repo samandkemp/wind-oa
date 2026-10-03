@@ -211,7 +211,7 @@ void Tunnel::revoxelise() {
     // plane half-way between the inlet and the model's front face.
     const int nx = s_.nx, ny = s_.ny, nz = s_.nz;
     std::vector<std::uint8_t> front(std::size_t(ny) * nz, 0), plan(std::size_t(nx) * nz, 0);
-    int ylo = ny, yhi = -1, zlo = nz, zhi = -1, xlo = nx;
+    int ylo = ny, yhi = -1, zlo = nz, zhi = -1, xlo = nx, xhi = -1;
     for (int x = 0; x < nx; ++x)
         for (int y = 0; y < ny; ++y)
             for (int z = 0; z < nz; ++z) {
@@ -224,6 +224,7 @@ void Tunnel::revoxelise() {
                 zlo = std::min(zlo, z);
                 zhi = std::max(zhi, z);
                 xlo = std::min(xlo, x);
+                xhi = std::max(xhi, x);
             }
     a_frontal_ = std::max(1.0, double(std::count(front.begin(), front.end(), 1)));
     a_planform_ = std::max(1.0, double(std::count(plan.begin(), plan.end(), 1)));
@@ -237,6 +238,7 @@ void Tunnel::revoxelise() {
                      b.hi[1] > ny - 1.0f || b.hi[2] > nz - 1.0f;
     const int x_front = yhi >= 0 ? xlo : nx / 4;
     x_ref_ = std::max(3, x_front / 2);
+    body_x_max_ = yhi >= 0 ? xhi : nx / 2;
     solver_->set_torque_ref({placed_centre_[0], placed_centre_[1], placed_centre_[2]});
 
     if (new_body)
@@ -258,6 +260,7 @@ void Tunnel::set_transonic(bool on) {
     transonic_ = on;
     if (on && (!euler_ || euler_stale_))
         load_euler();
+    clear_statistics(true); // the statistics describe the lattice flow only
     ++flow_epoch_;
 }
 
@@ -509,6 +512,7 @@ void Tunnel::begin_operating_point(const std::string& reason) {
     u_at_develop_ = u_command_;
     cache_key_ = operating_point_key();
     develop_.restart(reason);
+    clear_statistics(true);
     auto hit = cache_.load(cache_key_);
     if (!hit) {
         cache_note_.clear();
@@ -544,6 +548,7 @@ void Tunnel::reset_flow(const std::string& reason) {
     u_at_develop_ = u_command_;
     cache_key_ = operating_point_key();
     cache_saved_for_.clear();
+    clear_statistics(true);
     ++flow_epoch_;
 }
 
@@ -662,6 +667,186 @@ void Tunnel::advance(int steps) {
     develop_.add({mf.force[0] / (q * st.a_ref), mf.force[1] / (q * st.a_ref)}, mf.steps, u_applied_,
                  s_.nx);
     maybe_save_settled_flow();
+    record_signals(mf);
+}
+
+// -- statistics and signals -------------------------------------------------------------
+
+void Tunnel::set_averaging(bool on) {
+    if (on == averaging_)
+        return;
+    averaging_ = on;
+    clear_statistics(false);
+}
+
+void Tunnel::clear_statistics(bool signals_too) {
+    if (stats_)
+        stats_->reset();
+    force_sum_ = {};
+    force_w_ = 0.0;
+    avg_ft_ = 0.0;
+    if (signals_too) {
+        signals_.clear();
+        signal_start_ = -1;
+    }
+    analysis_.avg_samples = 0;
+    analysis_.avg_flow_throughs = 0.0;
+    analysis_.wake_valid = false;
+}
+
+void Tunnel::set_probes(const std::vector<std::array<float, 3>>& positions) {
+    const std::size_t n = std::min<std::size_t>(positions.size(), kMaxProbes);
+    probes_.assign(positions.begin(), positions.begin() + std::ptrdiff_t(n));
+    probe_cells_.clear();
+    for (const auto& q : probes_) {
+        const int x = std::clamp(int(std::floor(q[0])), 0, s_.nx - 1);
+        const int y = std::clamp(int(std::floor(q[1])), 0, s_.ny - 1);
+        const int z = std::clamp(int(std::floor(q[2])), 0, s_.nz - 1);
+        probe_cells_.push_back((std::size_t(x) * s_.ny + y) * s_.nz + z);
+    }
+    ++probe_epoch_; // older samples belong to the old positions
+}
+
+int Tunnel::wake_plane() const {
+    const int last = s_.nx - s_.outlet_sponge - 2; // stay clear of the sponge
+    const int first = std::min(body_x_max_ + 2, last);
+    if (wake_x_ >= 0)
+        return std::clamp(wake_x_, first, last);
+    return std::clamp(body_x_max_ + std::max(2, (last - body_x_max_) / 2), first, last);
+}
+
+void Tunnel::record_signals(const lbm::MeanForces& mf) {
+    const bool developed = !develop_.developing();
+    if (developed && signal_start_ < 0)
+        signal_start_ = steps_done_;
+
+    // Signal history for the spectra: per-batch mean forces (not the EMA,
+    // which would filter the shedding) and the probes at the batch's end.
+    const TunnelStatus st = status();
+    const double qa = q_dyn() * st.a_ref;
+    SignalSample smp;
+    smp.step = steps_done_;
+    smp.cd = float(mf.force[0] / qa);
+    smp.cl = float(mf.force[1] / qa);
+    smp.cs = float(mf.force[2] / qa);
+    smp.probe_epoch = probe_epoch_;
+    if (!probe_cells_.empty()) {
+        const auto v = solver_->macro_at(probe_cells_);
+        for (std::size_t i = 0; i < v.size(); ++i)
+            smp.probe[i] = v[i];
+    }
+    signals_.push_back(smp);
+    const double window = s_.history_flow_throughs * s_.nx / std::max(double(u_applied_), 1e-3);
+    while (signals_.size() > 2 && double(steps_done_ - signals_.front().step) > window)
+        signals_.pop_front();
+
+    // Time averaging of the developed flow.
+    if (averaging_ && developed) {
+        if (!stats_)
+            stats_ = std::make_unique<FlowStats>(ctx_, solver_->cells());
+        stats_->add(solver_->macro_buffer(solver_->live_index()), double(mf.steps));
+        for (int k = 0; k < 3; ++k)
+            force_sum_[k] += mf.force[k] * mf.steps;
+        force_w_ += mf.steps;
+        avg_ft_ += double(mf.steps) * u_applied_ / s_.nx;
+    }
+    if (batch_ % std::max(s_.analysis_every, 1) == 0)
+        refresh_analysis();
+}
+
+void Tunnel::refresh_analysis() {
+    TunnelAnalysis a;
+    a.version = ++analysis_version_;
+    const int nx = s_.nx, ny = s_.ny, nz = s_.nz;
+    const TunnelStatus st = status();
+    const double qa = q_dyn() * st.a_ref;
+    const double u_ref = std::max(double(u_applied_), 1e-6);
+
+    // Time averages and the wake survey (THEORY 12.1, 12.2)
+    a.avg_samples = stats_ ? stats_->samples() : 0;
+    a.avg_flow_throughs = avg_ft_;
+    a.x_upstream = x_ref_;
+    a.x_survey = wake_plane();
+    if (stats_ && stats_->samples() >= 2 && !transonic_ && a.x_survey > a.x_upstream &&
+        a.x_upstream >= 1) {
+        const double nu = kCs2 * (s_.tau - 0.5);
+        const PlaneFlux f1 = plane_momentum_flux(*stats_, flags_, nx, ny, nz, a.x_upstream, nu);
+        const PlaneFlux f2 = plane_momentum_flux(*stats_, flags_, nx, ny, nz, a.x_survey, nu);
+        if (f1.cells > 0 && f1.cells == f2.cells) {
+            a.wake_valid = true;
+            a.cd_wake = (f1.momentum - f2.momentum) / qa;
+            a.cd_balance = force_w_ > 0.0 ? force_sum_[0] / force_w_ / qa : 0.0;
+            a.mass_imbalance = (f2.mass - f1.mass) / std::max(std::abs(f1.mass), 1e-12);
+            a.includes_floor = placement_.ground != catalogue::Ground::Air;
+            // mean wake profiles through the body's centre
+            std::vector<float> mean, var;
+            const std::size_t plane = std::size_t(ny) * nz;
+            stats_->read(std::size_t(a.x_survey) * plane, plane, mean, var);
+            const int yc = std::clamp(int(placed_centre_[1]), 0, ny - 1);
+            const int zc = std::clamp(int(placed_centre_[2]), 0, nz - 1);
+            for (int y = 0; y < ny; ++y) {
+                const std::size_t c = std::size_t(y) * nz + zc;
+                if (flags_[std::size_t(a.x_survey) * plane + c] != lbm::FLUID)
+                    continue;
+                a.profile_y.push_back(float(y) + 0.5f);
+                a.profile_uy.push_back(float(mean[c * 4] / u_ref));
+            }
+            for (int z = 0; z < nz; ++z) {
+                const std::size_t c = std::size_t(yc) * nz + z;
+                if (flags_[std::size_t(a.x_survey) * plane + c] != lbm::FLUID)
+                    continue;
+                a.profile_z.push_back(float(z) + 0.5f);
+                a.profile_uz.push_back(float(mean[c * 4] / u_ref));
+            }
+        }
+    }
+
+    // Spectra of the developed signal (THEORY 12.3)
+    a.u_ref = u_ref;
+    a.l_ref = 2.0 * ext_y_half_;
+    a.n_probes = int(probes_.size());
+    std::vector<double> t, cl, tp;
+    std::array<std::array<std::vector<double>, 4>, kMaxProbes> pv;
+    for (const SignalSample& s : signals_) {
+        if (signal_start_ < 0 || s.step < signal_start_)
+            continue;
+        t.push_back(double(s.step));
+        cl.push_back(s.cl);
+        if (s.probe_epoch == probe_epoch_) {
+            tp.push_back(double(s.step));
+            for (int i = 0; i < a.n_probes; ++i)
+                for (int k = 0; k < 4; ++k)
+                    pv[i][k].push_back(s.probe[i][k]);
+        }
+    }
+    a.f_acoustic = std::sqrt(kCs2) / (2.0 * std::max(ny, nz));
+    if (t.size() >= 32) {
+        a.window_steps = t.back() - t.front();
+        a.lift = spectrum(t, cl, 0, 2.0 / a.window_steps);
+        a.st_lift = a.lift.peak_freq * a.l_ref / u_ref;
+        for (const double f : spectral_peaks(a.lift, 8, 2.0 / a.window_steps))
+            if (f < 0.8 * a.f_acoustic) { // peaks come strongest first
+                a.st_shedding = f * a.l_ref / u_ref;
+                break;
+            }
+    }
+    if (tp.size() >= 32)
+        for (int i = 0; i < a.n_probes; ++i)
+            for (int k = 0; k < 4; ++k)
+                a.probe_spec[i][k] = spectrum(tp, pv[i][k], 0, 2.0 / (tp.back() - tp.front()));
+
+    // Histories for plotting, decimated to at most ~600 points.
+    const std::size_t stride = std::max<std::size_t>(1, signals_.size() / 600);
+    for (std::size_t i = 0; i < signals_.size(); i += stride) {
+        const SignalSample& s = signals_[i];
+        a.hist_t.push_back(double(s.step));
+        a.hist_cl.push_back(s.cl);
+        for (int p = 0; p < a.n_probes; ++p)
+            for (int k = 0; k < 4; ++k)
+                a.hist_probe[p][k].push_back(s.probe_epoch == probe_epoch_ ? s.probe[p][k]
+                                                                           : std::nanf(""));
+    }
+    analysis_ = std::move(a);
 }
 
 TunnelStatus Tunnel::status() const {
@@ -715,6 +900,11 @@ TunnelStatus Tunnel::status() const {
     t.render_geometry = solver_->geometry_version();
     t.mach_command = mach_command_;
     t.mach_applied = mach_applied_;
+    t.averaging = averaging_;
+    t.averaging_active = averaging_ && !develop_.developing() && !transonic_;
+    t.avg_samples = stats_ ? stats_->samples() : 0;
+    t.avg_flow_throughs = avg_ft_;
+    t.analysis_version = analysis_version_;
     if (transonic_ && euler_) {
         // Euler units: rho_inf = 1, c_inf = 1, so q = M^2 / 2 per unit area.
         t.transonic = true;

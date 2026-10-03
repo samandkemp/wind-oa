@@ -488,6 +488,27 @@ std::vector<float> Solver::density() {
     return rho;
 }
 
+std::vector<std::array<float, 4>> Solver::macro_at(std::span<const std::size_t> cells) {
+    std::vector<std::array<float, 4>> out(cells.size());
+    if (cells.empty())
+        return out;
+    const VkDeviceSize bytes = cells.size() * 16;
+    if (!probe_buf_ || probe_buf_->size() < bytes)
+        probe_buf_ = std::make_unique<Buffer>(ctx_, bytes, MemoryUse::Readback);
+    std::vector<VkBufferCopy> regions(cells.size());
+    for (std::size_t i = 0; i < cells.size(); ++i) {
+        if (cells[i] >= n_)
+            throw std::runtime_error("Solver::macro_at: cell outside the grid");
+        regions[i] = {cells[i] * 16, i * 16, 16};
+    }
+    ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+        vkCmdCopyBuffer(cmd, macro_[live()].handle(), probe_buf_->handle(),
+                        std::uint32_t(regions.size()), regions.data());
+    });
+    std::memcpy(out.data(), probe_buf_->data(), bytes);
+    return out;
+}
+
 // -- Moving boundaries ------------------------------------------------------------------
 
 void Solver::clear_wall_velocity() {

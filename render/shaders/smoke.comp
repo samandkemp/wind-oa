@@ -8,6 +8,12 @@
 //   mode 1 (reset): scatter particles downstream of the rake with random
 //     ages, so streaks exist from the first frame (a scatter point inside a
 //     solid restarts at the rake instead).
+// With pulse.x > 0 the rake is a pulsed wire instead (timelines, THEORY
+// 10.9): particles sit in slots of pulse.y along a line across the rake
+// height; slot s is released every slots x pulse.x steps, at phase
+// s x pulse.x, so a fresh line leaves the wire every pulse.x steps and
+// deforms with the flow. A particle between its release and the next is
+// advected; one that has left the flow waits, hidden (alpha 0).
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 64) in;
 #include "vol_common.glsl"
@@ -17,6 +23,7 @@ layout(push_constant) uniform Params {
     vec4 rake;   // x, cy, cz, (unused)
     vec4 half_;  // half_y, half_z, u_ref, max_age
     ivec4 misc;  // n_steps, n_side, seed, mode
+    ivec4 pulse; // period (steps; 0 = streaklines), particles per pulse, clock, -
 } P;
 
 layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
@@ -70,11 +77,62 @@ vec3 emit_point(int i) {
                 P.rake.z + fz * hz + (rnd() - 0.5) * hz / float(max(n - 1, 1)));
 }
 
+// Carry `pos` through `steps` lattice steps (RK2 midpoint, sub-steps of up
+// to 2); false if it entered a solid or left the tunnel.
+bool advect(inout vec3 pos, float steps) {
+    while (steps > 0.0) {
+        const float dt = min(steps, 2.0);
+        const vec3 v1 = sample_u(pos);
+        const vec3 v2 = sample_u(pos + 0.5 * dt * v1);
+        pos += dt * v2;
+        steps -= dt;
+        if (!in_fluid(pos)) return false;
+    }
+    return pos.x <= float(N.x) - 2.0 && pos.x >= 1.0;
+}
+
+void timeline(int i) {
+    const int period = P.pulse.x, per = P.pulse.y;
+    const int slots = max(P.dims.w / per, 1);
+    const int slot = i / per, k = i % per;
+    if (P.misc.w == 1 || slot >= slots) {  // reset: every particle waits
+        part[i] = vec4(0.0, 0.0, 0.0, -1.0);
+        colours[i] = vec4(0.0);
+        return;
+    }
+    const int clock = P.pulse.z, prev = P.pulse.z - P.misc.x;
+    const int cycle = slots * period, phase = slot * period;
+    const int rel = clock >= phase ? clock - (clock - phase) % cycle : -1;  // latest release
+    vec4 q = part[i];
+    float steps = float(P.misc.x);
+    if (rel >= 0 && rel > prev) {  // released during this frame
+        const float fy = (float(k) + 0.5) / float(per) - 0.5;
+        q = vec4(P.rake.x, P.rake.y + 2.0 * fy * P.half_.x, P.rake.z, 0.0);
+        steps = float(clock - rel);
+        // every fifth line highlighted, so the deformation reads
+        colours[i] = (rel / period) % 5 == 0 ? vec4(1.0, 0.72, 0.30, 1.0)
+                                             : vec4(0.90, 0.94, 1.0, 1.0);
+    } else if (q.w < 0.0) {
+        return;  // waiting for its slot's next release
+    }
+    vec3 pos = q.xyz;
+    if (advect(pos, steps)) {
+        part[i] = vec4(pos, q.w + steps);
+    } else {
+        part[i] = vec4(0.0, 0.0, 0.0, -1.0);
+        colours[i] = vec4(0.0);
+    }
+}
+
 void main() {
     const int i = int(gl_GlobalInvocationID.x);
     if (i >= P.dims.w) return;
     N = P.dims.xyz;
     rng_state = pcg(uint(i) * 9781u + uint(P.misc.z) * 6271u + 1u);
+    if (P.pulse.x > 0) {
+        timeline(i);
+        return;
+    }
 
     if (P.misc.w == 1) {  // reset
         vec3 start = emit_point(i);

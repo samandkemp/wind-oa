@@ -70,6 +70,8 @@ that solver.
 | `mach_slew` | float | 0.004 | Largest Mach change per batch (§9.1) |
 | `develop_flow_throughs` | double | 2.0 | Transonic development time, flow-throughs |
 | `force_ema_time` | double | 60 | Transonic dashboard smoothing, in cell sound-crossings |
+| `analysis_every` | int | 25 | Batches between refreshes of the wake survey and the spectra (§12) |
+| `history_flow_throughs` | double | 16 | Length of the signal history the spectra are taken over (§12.3) |
 
 ## Lattice Boltzmann solver options
 
@@ -167,7 +169,7 @@ themselves where they need it.
 ```
 windoa_app [fast|balanced|fine] [subsonic|transonic] [--model ID] [--f16] [--no-vsync]
            [--frames N] [--shot FILE.png] [--warmup STEPS] [--show LIST] [--field NAME]
-           [--spin R] [--aoa DEG]
+           [--spin R] [--aoa DEG] [--zoom F]
 ```
 
 | Flag | Default | Meaning |
@@ -180,10 +182,11 @@ windoa_app [fast|balanced|fine] [subsonic|transonic] [--model ID] [--f16] [--no-
 | `--frames N` | - | Exit after N frames (scripts, smoke tests) |
 | `--shot FILE` | - | With `--frames`: save the last frame as a PNG, panels included |
 | `--warmup STEPS` | 0 | Run the solver this many steps before the first frame |
-| `--show LIST` | - | Comma-separated view toggles: `q`, `dye`, `lines`, `nosmoke`, `slice`, `nohaze`, `voxel`, `help` |
-| `--field NAME` | `speed` | `speed`, `pressure`, `vorticity`, `vortx`, `mach` or `schlieren` |
+| `--show LIST` | - | Comma-separated view toggles: `q`, `dye`, `lines`, `nosmoke`, `slice`, `nohaze`, `voxel`, `help`; `avg` (time averaging), `recirc` (mean reversed-flow shells), `lic` (slice texture), `arrows` (slice arrows), `timelines`, `nopaint`, `wallspeed`, `reversed`, `oil` (surface paint), `analysis` (the Analysis panel open), `probes` (two probes in the wake) |
+| `--field NAME` | `speed` | `speed`, `pressure`, `vorticity`, `vortx`, `mach`, `schlieren`, `mean` (mean speed) or `turb` (turbulence intensity) |
 | `--spin R` | - | Spin ratio for models with spinning parts |
 | `--aoa DEG` | 0 | Starting pitch / angle of attack |
+| `--zoom F` | - | Camera distance times F, aimed at the model (F < 1 is nearer) |
 
 On exit the app prints its throughput and timings.
 
@@ -193,7 +196,8 @@ The app's `Tunnel` without a window: a headless sandbox session.
 
 ```
 tunnel_run [--preset fast|balanced|fine] [--model ID] [--batches N] [--steps S]
-           [--spin R] [--tu PCT] [--aoa DEG] [--dye] [--f16]
+           [--spin R] [--tu PCT] [--aoa DEG] [--dye] [--f16] [--average]
+           [--probe X,Y,Z ...] [--no-cache]
 tunnel_run --catalogue
 ```
 
@@ -207,10 +211,15 @@ tunnel_run --catalogue
 | `--aoa DEG` | 0 | Angle of attack |
 | `--dye` | off | Run the dye from a wand ahead of the model |
 | `--f16` | off | Half-precision storage |
+| `--average` | off | Time averaging once the flow has settled; reports the wake survey (§12.1, §12.2) |
+| `--probe X,Y,Z` | - | A probe at the cell (X, Y, Z); up to four; reports its spectra (§12.4) |
+| `--no-cache` | off | Neither restore nor save a settled flow, so the run develops from rest |
 | `--catalogue` | - | Voxelise every catalogue model at its default placement and report cells, areas and bounds (CTest `P2_catalogue`) |
 
 It prints progress ten times, then the mean and standard deviation of Cd and Cl over the second half
-of the run, and what the flow cache did.
+of the run; the lift spectrum's strongest peaks as Strouhal numbers on the body's height, with the
+acoustic-mode spacing and the shedding peak below the first mode (§12.3); each probe's peak per
+component; the wake survey with `--average`; and what the flow cache did.
 
 ### lbm_run
 
@@ -261,7 +270,7 @@ against the CPU (CTest `P0_compute`).
 
 ### The gates
 
-`V1_poiseuille` to `V23_flow_cache` take no arguments and exit non-zero on failure. Each prints
+`V1_poiseuille` to `V26_spectra` take no arguments and exit non-zero on failure. Each prints
 what it compared against and the measured value. See [`docs/VALIDATION.md`](VALIDATION.md).
 
 ## App controls
@@ -301,23 +310,30 @@ what it compared against and the measured value. See [`docs/VALIDATION.md`](VALI
 | Model | spin wheels / rotors; spin ratio | 0 - 3 | Rim speed over wind speed (§9.3) |
 | Compare | save as A, save as B | - | Snapshot the coefficients and show B - A |
 | View | surface | hidden / voxel / smooth | How the body is drawn |
-| View | paint surface Cp | - | Pressure coefficient on the surface (§10.2) |
-| View | field | speed / pressure / vorticity / streamwise vorticity / Mach / schlieren | The field for the haze and the slice (§10.1) |
+| View | surface paint | none / pressure (Cp) / near-wall speed / reversed flow / oil flow | What the surface shows (§10.2, §10.7) |
+| View | field | speed / pressure / vorticity / streamwise vorticity / Mach / schlieren / mean speed / turbulence intensity | The field for the haze and the slice (§10.1, §12.1); the last two need time averaging |
 | View | flow haze; strength; floor | 0.2 - 4; 0 - 0.5 | The translucent field and its cut-off |
 | View | field slice; slice pos | off / x-y / x-z / y-z; 0.02 - 0.98 | An opaque plane of the field |
-| View | smoke streaklines, streamlines | - | Particle smoke from the wand; instantaneous field lines |
+| View | flow texture (LIC); velocity arrows; arrow spacing | -; -; 2 - 12 cells | The slice's in-plane flow as a texture or as arrows (§10.8, §10.9) |
+| View | smoke; smoke as; pulse every | streaklines / timelines; 20 - 300 steps | Particle smoke from the wand, continuous or as pulsed lines (§10.9) |
+| View | streamlines | - | Instantaneous field lines |
 | View | dye smoke; density; colour by speed | 0.2 - 10 | The transported dye (§6) |
 | View | vortex cores (Q); Q threshold | 0.1 - 10 | Q-criterion shells; threshold in multiples of the adaptive level (§10.3) |
+| View | mean reversed flow | - | Shells where the time-averaged streamwise flow runs backwards (§12.1) |
 | View | smoke tracks / fit model; height, width, y, z, detail | - | The smoke wand's position and size |
 | View | time plots; refit plots; tunnel box | - | The Cd / Cl / Cm strips; the domain outline |
 | View | render quality; render scale; field of view | 32 - 256 steps; 0.25 - 1; 20 - 90 deg | Ray-march samples; resolution; camera |
+| Analysis | average the flow; restart | - | Time averaging of the developed flow (§12.1) |
+| Analysis | show planes; auto plane; survey plane x | -; -; 1 - $n_x - 2$ | The wake survey's planes, drawn in the view, and the survey plane's position (§12.2) |
+| Analysis | probes; x y z | 0 - 4; cells | Probe positions, drawn as coloured crosses (§12.4) |
+| Analysis | signal; component | lift / a probe; u_x, u_y, u_z, rho | The signal whose spectrum and history are plotted (§12.3) |
 
 ## Test presets and labels
 
 | Command | Runs |
 |---|---|
-| `ctest --preset dev` | Everything: the smoke checks and all 23 gates (about 13 minutes) |
-| `ctest --preset quick` | Everything except the label `long` (about 40 s) |
+| `ctest --preset dev` | Everything: the smoke checks and all 26 gates (about 13 minutes) |
+| `ctest --preset quick` | Everything except the label `long` (about 80 s) |
 | `ctest --preset dev -L gate` | The gates only |
 | `ctest --preset dev -R V17` | One test by name |
 
@@ -327,7 +343,7 @@ what it compared against and the measured value. See [`docs/VALIDATION.md`](VALI
 | `P2_catalogue` | - | Every catalogue model voxelises inside the tunnel |
 | `P3_tunnel_smoke` | - | A short headless sandbox session, with dye |
 | `P4_equiv` | - | The performance switches are exact identities |
-| `V1` - `V23` | `gate` (and `long` for the 12 that take over a minute) | The validation gates |
+| `V1` - `V26` | `gate` (and `long` for the 12 that take over a minute) | The validation gates |
 
 ## Files written at run time
 
