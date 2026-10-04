@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 
 #include "lbm_init_spv.hpp"
@@ -38,8 +39,8 @@ constexpr std::uint32_t kStepLocal = 256; // ...and of lbm_step.comp (must match
 constexpr int kStepsPerSubmit = 128;      // keeps each GPU batch well under the OS watchdog
 constexpr std::size_t kAccumVec4 = 5;     // see lbm_reduce.comp
 
-// Specialisation constants 0..8 of lbm_step.comp.
-std::array<std::uint32_t, 12> step_spec(const Config& c) {
+// Specialisation constants of lbm_step.comp.
+std::array<std::uint32_t, 13> step_spec(const Config& c, bool force_field = false) {
     return {static_cast<std::uint32_t>(c.mode_x),
             static_cast<std::uint32_t>(c.mode_y),
             static_cast<std::uint32_t>(c.mode_z),
@@ -51,7 +52,8 @@ std::array<std::uint32_t, 12> step_spec(const Config& c) {
             static_cast<std::uint32_t>(c.sponge_target),
             c.opt_lazy_macro ? 1u : 0u,
             c.opt_sparse_forces ? 1u : 0u,
-            c.storage_f16 ? 1u : 0u};
+            c.storage_f16 ? 1u : 0u,
+            force_field ? 1u : 0u};
 }
 
 // Bytes per stored distribution value, and the kernels' F16 constant.
@@ -84,9 +86,11 @@ Solver::Solver(Context& ctx, const Config& cfg)
       flag_buf_(ctx, n_ * sizeof(std::uint32_t)),
       link_q_(ctx, cfg.use_ibb ? (Q * n_ + 3) / 4 * 4 : 16),
       u_wall_(ctx, cfg.moving_boundaries ? n_ * 16 : 16),
+      force_field_(std::make_unique<Buffer>(ctx, 16)),
       partials_(ctx, std::size_t{2} * groups_for(ctx, n_, kStepLocal).total * 16),
       accum_(ctx, kAccumVec4 * 16), stats_partials_(ctx, std::size_t{groups_.total} * 16),
-      step_(ctx, spv::lbm_step, 8, sizeof(Params), 2, step_spec(cfg)),
+      step_(ctx, spv::lbm_step, 9, sizeof(Params), 2, step_spec(cfg)),
+      step_forced_(ctx, spv::lbm_step, 9, sizeof(Params), 2, step_spec(cfg, true)),
       reduce_(ctx, spv::lbm_reduce, 2, sizeof(Params)),
       init_(ctx, spv::lbm_init, 4, sizeof(Params), 1, f16_spec(cfg)),
       stats_(ctx, spv::lbm_stats, 3, sizeof(Params), 2),
@@ -97,8 +101,9 @@ Solver::Solver(Context& ctx, const Config& cfg)
     // set k reads f_[k] / macro_[k] and writes the other pair.
     for (int k = 0; k < 2; ++k) {
         const int o = 1 - k;
-        step_.bind(k, {&f_[k], &f_[o], &flag_buf_, &macro_[k], &macro_[o], &link_q_, &u_wall_,
-                       &partials_});
+        for (ComputeKernel* sk : {&step_, &step_forced_})
+            sk->bind(k, {&f_[k], &f_[o], &flag_buf_, &macro_[k], &macro_[o], &link_q_, &u_wall_,
+                         &partials_, force_field_.get()});
         stats_.bind(k, {&flag_buf_, &macro_[k], &stats_partials_});
         scale_.bind(k, {&f_[k], &flag_buf_, &macro_[k]});
         refresh_.bind(k, {&f_[k], &flag_buf_, &macro_[k]});
@@ -112,7 +117,7 @@ Solver::Solver(Context& ctx, const Config& cfg)
 
     set_flags(flags_);
     if (cfg.use_ibb) {
-        std::vector<std::uint8_t> half(Q * n_, 128); // 128 ~ half-way: a safe no-op
+        std::vector<std::uint8_t> half(Q * n_, 128); // 128 = exactly half-way: a no-op
         set_link_q(half);
     }
     if (cfg.moving_boundaries)
@@ -194,7 +199,8 @@ void Solver::step(int n_steps, const StepHook& after_each) {
                 // rho / u are written on the steps someone reads them: the
                 // last of the submit, or every step for a per-step hook
                 p.aux[1] = (after_each || s == batch - 1) ? 1.0f : 0.0f;
-                step_.record_set(cmd, static_cast<std::uint32_t>(par), &p, sg.x, sg.y);
+                (force_field_on_ ? step_forced_ : step_)
+                    .record_set(cmd, static_cast<std::uint32_t>(par), &p, sg.x, sg.y);
                 Context::barrier_compute_to_compute(cmd);
                 reduce_.record(cmd, &p, 1);
                 if (turb) { // overwrite the inlet plane the step has written
@@ -511,6 +517,23 @@ std::vector<std::array<float, 4>> Solver::macro_at(std::span<const std::size_t> 
 
 // -- Moving boundaries ------------------------------------------------------------------
 
+void Solver::enable_force_field(bool on) {
+    if (on == force_field_on_)
+        return;
+    force_field_on_ = on;
+    if (on && force_field_->size() < n_ * 16) {
+        force_field_ = std::make_unique<Buffer>(ctx_, n_ * 16);
+        for (int k = 0; k < 2; ++k) {
+            const int o = 1 - k;
+            for (ComputeKernel* sk : {&step_, &step_forced_})
+                sk->bind(k, {&f_[k], &f_[o], &flag_buf_, &macro_[k], &macro_[o], &link_q_, &u_wall_,
+                             &partials_, force_field_.get()});
+        }
+    }
+    if (on)
+        ctx_.fill_zero(*force_field_);
+}
+
 void Solver::clear_wall_velocity() {
     if (!cfg_.moving_boundaries)
         throw std::runtime_error("solver built without moving_boundaries");
@@ -555,6 +578,41 @@ int Solver::set_rotation(Vec3 axis_point, Vec3 omega, std::optional<float> radiu
     if (count > 0) {
         ctx_.upload(u_wall_, u_wall_host_.data(), u_wall_host_.size() * sizeof(float));
     }
+    return count;
+}
+
+int Solver::set_wall_velocity(Vec3 point, Vec3 axis, float radius, float half_len, Vec3 u) {
+    if (!cfg_.moving_boundaries)
+        throw std::runtime_error("solver built without moving_boundaries");
+    const double an = std::sqrt(double(axis[0]) * axis[0] + double(axis[1]) * axis[1] +
+                                double(axis[2]) * axis[2]);
+    const double ax[3] = {axis[0] / std::max(an, 1e-12), axis[1] / std::max(an, 1e-12),
+                          axis[2] / std::max(an, 1e-12)};
+    int count = 0;
+    const int r_cells = int(std::ceil(radius + half_len)) + 1;
+    const int lo[3] = {std::max(0, int(point[0]) - r_cells), std::max(0, int(point[1]) - r_cells),
+                       std::max(0, int(point[2]) - r_cells)};
+    const int hi[3] = {std::min(cfg_.nx - 1, int(point[0]) + r_cells),
+                       std::min(cfg_.ny - 1, int(point[1]) + r_cells),
+                       std::min(cfg_.nz - 1, int(point[2]) + r_cells)};
+    for (int x = lo[0]; x <= hi[0]; ++x)
+        for (int y = lo[1]; y <= hi[1]; ++y)
+            for (int z = lo[2]; z <= hi[2]; ++z) {
+                const std::size_t c = (static_cast<std::size_t>(x) * cfg_.ny + y) * cfg_.nz + z;
+                if (flags_[c] != OBSTACLE)
+                    continue;
+                const double r[3] = {x + 0.5 - point[0], y + 0.5 - point[1], z + 0.5 - point[2]};
+                const double along = r[0] * ax[0] + r[1] * ax[1] + r[2] * ax[2];
+                const double px = r[0] - along * ax[0], py = r[1] - along * ax[1],
+                             pz = r[2] - along * ax[2];
+                if (std::sqrt(px * px + py * py + pz * pz) > radius || std::abs(along) > half_len)
+                    continue;
+                for (int k = 0; k < 3; ++k)
+                    u_wall_host_[4 * c + std::size_t(k)] = u[std::size_t(k)];
+                ++count;
+            }
+    if (count > 0)
+        ctx_.upload(u_wall_, u_wall_host_.data(), u_wall_host_.size() * sizeof(float));
     return count;
 }
 

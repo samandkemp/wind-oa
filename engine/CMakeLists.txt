@@ -16,6 +16,7 @@ add_library(windoa_engine STATIC
     src/isosurface.cpp
     src/flow_stats.cpp
     src/spectrum.cpp
+    src/rotor.cpp
 )
 windoa_add_shaders(windoa_engine
     shaders/lbm_init.comp
@@ -40,6 +41,8 @@ windoa_add_shaders(windoa_engine
     shaders/euler_dt.comp
     shaders/euler_force.comp
     shaders/euler_diag.comp
+    shaders/alm_elements.comp
+    shaders/alm_spread.comp
 )
 target_include_directories(windoa_engine PUBLIC include)
 
@@ -49,6 +52,10 @@ set(WINDOA_PHYSICS_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lbm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/voxeliser.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tunnel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/shapes.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rotor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/alm_elements.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/alm_spread.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/include/windoa/lbm.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/include/windoa/voxeliser.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lattice.glsl

@@ -169,7 +169,7 @@ int main() {
             Voxeliser vox(ctx, t.nx, t.ny, t.nz);
             const auto placed = cases::app::ahmed(vox, t);
             lbm::Solver s(ctx, solver_config(t));
-            s.set_flags(placed.flags);
+            cases::app::place(s, placed);
             s.init_equilibrium(1.0f, {0.0f, 0.0f, 0.0f});
             Dye d(ctx, s);
             std::vector<float> src(s.cells(), 0.0f);

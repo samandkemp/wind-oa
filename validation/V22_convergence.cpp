@@ -157,7 +157,7 @@ int main() {
 
         g.section("B: real flow, cold start (Ahmed, fast preset)");
         auto p0 = cases::app::ahmed(vox, t, 0.0f);
-        s.set_flags(p0.flags);
+        cases::app::place(s, p0);
         s.init_equilibrium(1.0f, {0.0f, 0.0f, 0.0f});
         ConvergenceMonitor mb;
         const auto hb = run(s, t, p0.area, 36000, true, mb);
@@ -165,7 +165,7 @@ int main() {
 
         g.section("C: real flow, warm restart AoA 0 -> AoA 6");
         auto p6 = cases::app::ahmed(vox, t, 6.0f);
-        s.set_flags(p6.flags);
+        cases::app::place(s, p6);
         ConvergenceMonitor mc;
         mc.restart("aoa change");
         const auto hc = run(s, t, p6.area, 34000, false, mc);

@@ -1,9 +1,6 @@
 // Euler solver development runs (the physics checks are the gates V17-V19
-// under validation/: Sod, the voxel wedge, the NACA 0012):
-//   euler_run sphere M          a sphere at Mach M: forces, peak local Mach, speed
-//   euler_run profile           GPU ms per kernel category
-//   euler_run equiv --save DIR | --check DIR
-//                               P4 safety net: three short cases bit for bit
+// under validation/: Sod, the voxel wedge, the NACA 0012). kUsage below is
+// the reference for the command line.
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -63,8 +60,22 @@ int sphere(float mach) {
 
 } // namespace
 
+const char* const kUsage =
+    R"(usage: euler_run sphere [MACH]           a sphere at Mach MACH (default 0.8):
+                                         forces, peak local Mach, speed
+       euler_run profile                 GPU ms per kernel category
+       euler_run equiv --save DIR        save three short cases' results
+       euler_run equiv --check DIR       compare them bit for bit (the safety
+                                         net for performance work)
+       euler_run -h | --help             this text
+)";
+
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
+    if (mode == "-h" || mode == "--help") {
+        std::fputs(kUsage, stdout);
+        return 0;
+    }
     try {
         if (mode == "sphere")
             return sphere(argc > 2 ? float(std::atof(argv[2])) : 0.8f);
@@ -75,7 +86,7 @@ int main(int argc, char** argv) {
             //   euler_run equiv --save DIR | --check DIR
             const std::string how = argc > 2 ? argv[2] : "", dir = argc > 3 ? argv[3] : "";
             if ((how != "--save" && how != "--check") || dir.empty()) {
-                std::printf("usage: euler_run equiv --save DIR | --check DIR\n");
+                std::fputs(kUsage, stderr);
                 return 2;
             }
             Context ctx;
@@ -152,7 +163,8 @@ int main(int argc, char** argv) {
                 std::vector<std::uint8_t> fl(std::size_t(96) * 48 * 48, 0);
                 Voxeliser vox(ctx, 96, 48, 48);
                 vox.voxelise(
-                    geometry::fit_to_box(catalogue::make_sphere(), {36.0f, 24.0f, 24.0f}, 16.0f), fl);
+                    geometry::fit_to_box(catalogue::make_sphere(), {36.0f, 24.0f, 24.0f}, 16.0f),
+                    fl);
                 const std::vector<float> phi = vox.signed_distance(fl);
                 results.push_back(run_case(c, fl, &phi, nullptr, 200));
             }
@@ -199,8 +211,9 @@ int main(int argc, char** argv) {
             euler::Solver s(ctx, c);
             std::vector<std::uint8_t> flags(s.cells(), 0);
             Voxeliser vox(ctx, c.nx, c.ny, c.nz);
-            vox.voxelise(geometry::fit_to_box(catalogue::make_sphere(), {90.0f, 48.0f, 48.0f}, 24.0f),
-                         flags);
+            vox.voxelise(
+                geometry::fit_to_box(catalogue::make_sphere(), {90.0f, 48.0f, 48.0f}, 24.0f),
+                flags);
             s.set_flags(flags);
             s.set_distance(vox.signed_distance(flags));
             s.init_freestream();
@@ -214,7 +227,7 @@ int main(int argc, char** argv) {
                 s.cells() * 50.0 / (total * 1e-3) / 1e6);
             return 0;
         }
-        std::printf("usage: euler_run sphere [MACH] | profile | equiv --save DIR | --check DIR\n");
+        std::fputs(kUsage, stderr);
         return 2;
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());

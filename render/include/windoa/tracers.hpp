@@ -46,6 +46,12 @@ class Tracers {
     // Overlay markers drawn with the wand outline: the wake-survey planes
     // (x < 0: none) and probe crosses (colour per probe).
     void set_overlay(int x_upstream, int x_survey, const std::vector<std::array<float, 3>>& probes);
+    // Rotor blades (actuator lines) as segments, redrawn every frame they turn
+    // without restarting the smoke.
+    void set_blades(const std::vector<std::array<std::array<float, 3>, 2>>& segments);
+    // The wand outline: drawn with the smoke it marks, not with the other
+    // markers alone.
+    void show_wand(bool on);
     static constexpr std::array<std::array<float, 4>, 4> kProbeColours = {
         {{1.0f, 0.75f, 0.25f, 1.0f},
          {1.0f, 0.40f, 0.80f, 1.0f},
@@ -84,6 +90,9 @@ class Tracers {
     std::int64_t clock_ = 0; // smoke steps since the last reset (timelines)
     int x_upstream_ = -1, x_survey_ = -1;
     std::vector<std::array<float, 3>> probes_;
+    std::vector<std::array<std::array<float, 3>, 2>> blades_;
+    bool show_wand_ = true;
+    bool redraw_ = false; // rebuild the markers without restarting the smoke
     std::uint32_t marker_count_ = 4;
     std::size_t max_arrows_ = 0;
 

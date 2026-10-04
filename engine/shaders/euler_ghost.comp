@@ -15,7 +15,7 @@ void main() {
     const uint c = linear_group() * 256u + gl_LocalInvocationID.x;
     if (c >= uint(N().x * N().y * N().z)) return;
     float ok = 0.0;
-    if (flags[c] != FLUID && P.bc.w == 1) {
+    if (flags[c] != FLUID && flags[c] < PORT0 && P.bc.w == 1) {  // ports hold their state
         const ivec3 p = coords(c);
         bool near = false;
         for (int ax = 0; ax < 3; ++ax) {

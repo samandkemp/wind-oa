@@ -152,6 +152,15 @@ class Solver {
     int live_index() const { return parity_; }
     const Buffer& flag_buffer() const { return flag_buf_; } // one uint per cell
 
+    // -- Per-cell body force -----------------------------------------------------
+    // On: a vec4 per cell (xyz = force per unit volume, added to the uniform
+    // body force) that the next steps read; whoever owns it writes it (the
+    // actuator lines, THEORY 3.12). Off: the plain step, bit for bit. Not
+    // while a submission is in flight.
+    void enable_force_field(bool on);
+    bool force_field_on() const { return force_field_on_; }
+    Buffer& force_field_buffer() { return *force_field_; }
+
     // -- Moving boundaries -------------------------------------------------------
     void clear_wall_velocity();
     // u_wall = omega x (cell_centre - axis_point) on OBSTACLE cells, limited
@@ -160,6 +169,11 @@ class Solver {
     // first, then once per spinning part); returns the cells set.
     int set_rotation(Vec3 axis_point, Vec3 omega, std::optional<float> radius = {},
                      std::optional<float> half_len = {});
+    // u_wall = u on OBSTACLE cells within a cylinder (radius about `axis`
+    // through `point`, half_len along it): an engine port's face, a velocity
+    // boundary (blowing along its normal, suction against it; THEORY 3.11).
+    // Overwrites those cells; returns the cells set.
+    int set_wall_velocity(Vec3 point, Vec3 axis, float radius, float half_len, Vec3 u);
 
   private:
     struct StatsSum {
@@ -191,12 +205,14 @@ class Solver {
     Buffer flag_buf_;
     Buffer link_q_;
     Buffer u_wall_;
+    std::unique_ptr<Buffer> force_field_; // 16 bytes until enabled
+    bool force_field_on_ = false;
     Buffer partials_;
     Buffer accum_;
     Buffer stats_partials_;
 
     // Kernels
-    ComputeKernel step_;
+    ComputeKernel step_, step_forced_; // without / with the per-cell force
     ComputeKernel reduce_;
     ComputeKernel init_;
     ComputeKernel stats_;

@@ -1,13 +1,7 @@
 // Headless LBM run: a sphere in the tunnel. Prints throughput (MLUPS),
 // health, the drag coefficient and a mass check as it goes. A development
 // tool, not a validation gate; the gates are under validation/
-// (docs/VALIDATION.md).
-//
-//   lbm_run [nx ny nz] [--steps N] [--bgk] [--rr] [--ibb] [--spin S]
-//           [--u U] [--tau T] [--no-sponge] [--stl PATH [--size CELLS]]
-//
-// Defaults follow the app's solver: regularised collision,
-// tau 0.504, Smagorinsky 0.1, u 0.05, outlet sponge 24 (full freestream).
+// (docs/VALIDATION.md). kUsage below is the reference for the command line.
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -23,6 +17,30 @@
 #include "windoa/voxeliser.hpp"
 
 using namespace windoa;
+
+namespace {
+
+const char* const kUsage =
+    R"(usage: lbm_run [NX NY NZ] [options]     a sphere in the tunnel, headless
+
+  NX NY NZ        grid (default 256 96 96)
+  --steps N       steps to run (default 4000)
+  --u U           inlet speed, lattice units (default 0.05)
+  --tau T         relaxation time (default 0.504)
+  --bgk           BGK collision (default regularised)
+  --rr            recursive regularisation
+  --ibb           interpolated bounce-back (link fractions at half-way)
+  --spin S        spin the sphere: surface speed / inlet speed
+  --no-sponge     no outlet sponge
+  --stl PATH      an STL file in place of the sphere
+  --size CELLS    with --stl: its longest axis, cells
+  -h, --help      this text
+
+Defaults follow the app's solver: regularised collision, tau 0.504,
+Smagorinsky 0.1, u 0.05, outlet sponge 24 (full freestream).
+)";
+
+} // namespace
 
 int main(int argc, char** argv) {
     lbm::Config cfg;
@@ -67,8 +85,11 @@ int main(int argc, char** argv) {
             stl_size = static_cast<float>(std::atof(argv[++a])); // longest axis, cells
         } else if (!s.empty() && s[0] != '-' && positional < 3) {
             *dims[positional++] = std::atoi(s.c_str());
+        } else if (s == "-h" || s == "--help") {
+            std::fputs(kUsage, stdout);
+            return 0;
         } else {
-            std::printf("unknown argument: %s\n", s.c_str());
+            std::fprintf(stderr, "unknown argument: %s\n\n%s", s.c_str(), kUsage);
             return 2;
         }
     }

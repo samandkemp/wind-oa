@@ -6,10 +6,9 @@
 //    solution for the shifted wall, H = (n_fluid_rows - 1) + 2q, u_max =
 //    g H^2 / (8 nu), within 1.5 % for q 0.25, 0.5, 0.75.
 // B. Informational: sphere Cd at low blockage (0.8 %), half-way vs IBB,
-//    Re 100, D 16 (ref 1.09). IBB is correct (A) but buys only ~0.6 points
-//    here, which matches the wall-placement term of the sphere error budget
-//    (blockage ~3.8 points, streamwise confinement ~1.2, wall placement
-//    ~0.6; THEORY 3.9).
+//    Re 100, D 16 (ref 1.09). The staircase's half-way wall costs about 4
+//    points of the error here; the interpolated wall removes them (THEORY
+//    3.9; V28 B measures the same on a voxelised mesh).
 #include "cases.hpp"
 
 using namespace windoa;
@@ -78,8 +77,12 @@ double sphere_cd(Context& ctx, bool ibb) {
     const double cx = NX * 0.3, cy = NY / 2.0, cz = NZ / 2.0; // double (shapes.hpp)
     shapes::add_sphere(flags, NX, NY, NZ, cx, cy, cz, D / 2.0);
     s.set_flags(flags);
+    // add_sphere tests the cell index, the fractions the cell centre (shapes.hpp):
+    // in centre coordinates the flagged sphere sits half a cell further along
+    // each axis, and the fractions must describe that sphere.
     if (ibb)
-        s.set_link_q(shapes::sphere_link_fractions(flags, NX, NY, NZ, cx, cy, cz, D / 2.0));
+        s.set_link_q(shapes::sphere_link_fractions(flags, NX, NY, NZ, cx + 0.5, cy + 0.5, cz + 0.5,
+                                                   D / 2.0));
     s.init_equilibrium(1.0f, {0.0f, 0.0f, 0.0f});
     for (int k = 0; k < RAMP; ++k) {
         s.set_inlet_velocity(U * float(k + 1) / RAMP);

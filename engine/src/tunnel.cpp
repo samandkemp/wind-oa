@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <sstream>
 
+#include "windoa/shapes.hpp"
+
 namespace windoa {
 
 namespace {
@@ -51,8 +53,80 @@ TunnelSettings tunnel_preset(const std::string& name) {
     } else if (name == "fine") {
         s.nx = 384;
         s.ny = s.nz = 160;
+    } else if (name == "ultra") { // 18.9 M cells: headless studies (~160 steps / s)
+        s.nx = 512;
+        s.ny = s.nz = 192;
     }
     return s;
+}
+
+namespace {
+
+// Model units -> cells: the placement's fit, rotation and ground drop, the
+// map placed_mesh() applies to the triangles (spinners and ports follow it).
+struct ModelFrame {
+    geometry::Bounds mb;
+    double scale = 1.0, drop = 0.0;
+    std::array<double, 3> centre{};
+    std::array<std::array<double, 3>, 3> R{};
+
+    std::array<double, 3> point(const std::array<double, 3>& c) const {
+        std::array<double, 3> rel, p{};
+        for (int k = 0; k < 3; ++k)
+            rel[k] = (c[k] - 0.5 * (mb.lo[k] + mb.hi[k])) * scale;
+        for (int i = 0; i < 3; ++i) {
+            for (int k = 0; k < 3; ++k)
+                p[i] += R[i][k] * rel[k];
+            p[i] += centre[i];
+        }
+        p[1] += drop;
+        return p;
+    }
+    std::array<double, 3> dir(const std::array<double, 3>& a) const {
+        std::array<double, 3> d{};
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 3; ++k)
+                d[i] += R[i][k] * a[k];
+        const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        for (double& v : d)
+            v /= std::max(n, 1e-12);
+        return d;
+    }
+};
+
+ModelFrame model_frame(const geometry::Mesh& mesh, const std::vector<catalogue::Rotor>& rotors,
+                       const Placement& pl, const TunnelSettings& s) {
+    ModelFrame f;
+    f.mb = model_bounds(mesh, rotors);
+    f.scale = pl.length_cells / std::max(f.mb.longest(), 1e-12f);
+    f.centre = {pl.pos_frac[0] * s.nx, pl.pos_frac[1] * s.ny, pl.pos_frac[2] * s.nz};
+    f.R = rotation(pl.yaw_deg, -pl.aoa_deg, pl.roll_deg);
+    if (pl.ground != catalogue::Ground::Air) { // the ground drop of placed_mesh()
+        const geometry::Vec3 c{float(f.centre[0]), float(f.centre[1]), float(f.centre[2])};
+        const geometry::Mesh fitted =
+            geometry::transform(geometry::fit_to_box(mesh, c, pl.length_cells, &f.mb), pl.yaw_deg,
+                                -pl.aoa_deg, pl.roll_deg, c);
+        f.drop = s.floor_height + pl.ride_height - geometry::bounds(fitted).lo[1];
+    }
+    return f;
+}
+
+} // namespace
+
+geometry::Bounds model_bounds(const geometry::Mesh& mesh,
+                              const std::vector<catalogue::Rotor>& rotors) {
+    geometry::Bounds b = geometry::bounds(mesh);
+    for (const catalogue::Rotor& r : rotors) {
+        const double n =
+            std::sqrt(r.axis[0] * r.axis[0] + r.axis[1] * r.axis[1] + r.axis[2] * r.axis[2]);
+        for (int k = 0; k < 3; ++k) { // the disc's box: r_tip sqrt(1 - a_k^2) either side
+            const double a = r.axis[std::size_t(k)] / std::max(n, 1e-12);
+            const double h = r.r_tip * std::sqrt(std::max(0.0, 1.0 - a * a));
+            b.lo[std::size_t(k)] = std::min(b.lo[std::size_t(k)], float(r.c[std::size_t(k)] - h));
+            b.hi[std::size_t(k)] = std::max(b.hi[std::size_t(k)], float(r.c[std::size_t(k)] + h));
+        }
+    }
+    return b;
 }
 
 Model model_from_catalogue(const catalogue::Entry& e) {
@@ -61,6 +135,8 @@ Model model_from_catalogue(const catalogue::Entry& e) {
     m.label = e.label;
     m.mesh = e.build();
     m.spinners = e.spinners;
+    m.ports = e.ports;
+    m.rotors = e.rotors;
     m.hash = content_hash(m.mesh.xyz.data(), m.mesh.xyz.size() * sizeof(float));
     return m;
 }
@@ -80,7 +156,7 @@ Placement default_placement(const catalogue::Entry& e, const TunnelSettings& s,
     p.length_cells = e.size_frac > 0.0 ? float(e.size_frac * s.nx) : 64.0f;
     p.ground = e.ground;
     if (!mesh.empty()) {
-        const geometry::Bounds b = geometry::bounds(mesh);
+        const geometry::Bounds b = model_bounds(mesh, e.rotors);
         const float k = p.length_cells / std::max(b.longest(), 1e-12f);
         const float ex = (b.hi[0] - b.lo[0]) * k, ey = (b.hi[1] - b.lo[1]) * k,
                     ez = (b.hi[2] - b.lo[2]) * k;
@@ -116,6 +192,7 @@ lbm::Config solver_config(const TunnelSettings& s) {
     c.regularised = s.regularised;
     c.recursive = s.recursive;
     c.moving_boundaries = true; // spinning wheels / rotors
+    c.use_ibb = s.sub_cell_walls;
     c.outlet_sponge = s.outlet_sponge;
     c.sponge_target = s.sponge_target;
     c.storage_f16 = s.storage_f16;
@@ -140,7 +217,8 @@ Tunnel::~Tunnel() = default;
 geometry::Mesh Tunnel::placed_mesh() const {
     const geometry::Vec3 centre{placement_.pos_frac[0] * s_.nx, placement_.pos_frac[1] * s_.ny,
                                 placement_.pos_frac[2] * s_.nz};
-    geometry::Mesh m = geometry::fit_to_box(model_.mesh, centre, placement_.length_cells);
+    const geometry::Bounds frame = model_bounds(model_.mesh, model_.rotors);
+    geometry::Mesh m = geometry::fit_to_box(model_.mesh, centre, placement_.length_cells, &frame);
     // Positive AoA = nose up for a +x-pointing model = clockwise about +z.
     m = geometry::transform(m, placement_.yaw_deg, -placement_.aoa_deg, placement_.roll_deg,
                             centre);
@@ -203,8 +281,11 @@ void Tunnel::revoxelise() {
     }
     const auto t0 = Clock::now();
     vox_stats_ = vox_->voxelise(tris, flags_);
-    vox_ms_ = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     solver_->set_flags(flags_);
+    if (s_.sub_cell_walls) // where each wall link crosses the true surface
+        solver_->set_link_q(shapes::link_fractions(flags_, vox_->signed_distance(flags_), s_.nx,
+                                                   s_.ny, s_.nz, &tris));
+    vox_ms_ = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
     // Reference areas: frontal (x-projection, car convention), planform
     // (y-projection, wing convention); extents; the upstream reference
@@ -243,7 +324,8 @@ void Tunnel::revoxelise() {
 
     if (new_body)
         reset_flow("new model"); // from rest, ramped (the cache may still win)
-    apply_spin();
+    apply_moving_walls();
+    build_rotors();
     if (dye_)
         build_dye_nozzles();
     begin_operating_point("model placed");
@@ -290,8 +372,43 @@ void Tunnel::load_euler() {
                 for (int z = 0; z < s_.nz; ++z)
                     ef[(std::size_t(x) * s_.ny + y) * s_.nz + z] = lbm::WALL;
     vox_->voxelise(placed_mesh(), ef);
+    const std::vector<float> phi = vox_->signed_distance(ef); // before the ports are marked
+    // Engine exhausts: each face (the port's disc, 2 cells inside the true
+    // face to 1 outside) emits the exit state -- Mach exit_mach along the
+    // normal at p_ratio x throttle and t_ratio times the freestream's static
+    // pressure and temperature. Euler units: rho_inf = 1, c_inf = 1, p_inf =
+    // 1/gamma, so rho_e = p_ratio / t_ratio and c_e = sqrt(t_ratio).
+    std::vector<std::array<float, 5>> states;
+    if (power_on_ && !model_.ports.empty()) {
+        const ModelFrame frame = model_frame(model_.mesh, model_.rotors, placement_, s_);
+        for (const catalogue::Port& po : model_.ports) {
+            if (po.kind != catalogue::Port::Kind::Exhaust || states.size() == euler::kMaxPorts)
+                continue;
+            const std::array<double, 3> c = frame.point(po.c), n = frame.dir(po.n);
+            const double r = std::max(po.r * frame.scale, 1.0);
+            const std::uint8_t mark = std::uint8_t(euler::kPortFlag + states.size());
+            for (std::size_t i = 0; i < ef.size(); ++i) {
+                if (ef[i] != lbm::OBSTACLE)
+                    continue;
+                const int x = int(i / (std::size_t(s_.ny) * s_.nz));
+                const int y = int((i / s_.nz) % s_.ny), z = int(i % s_.nz);
+                const double d[3] = {x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]};
+                const double along = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+                const double perp2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - along * along;
+                if (along >= -2.0 && along <= 1.0 && perp2 <= r * r)
+                    ef[i] = mark;
+            }
+            const double p_e = std::max(po.p_ratio * throttle_, 0.05) / euler::kGamma;
+            const double rho_e =
+                std::max(po.p_ratio * throttle_, 0.05) / std::max(po.t_ratio, 0.05);
+            const double u_e = po.exit_mach * std::sqrt(std::max(po.t_ratio, 0.05));
+            states.push_back({float(rho_e), float(u_e * n[0]), float(u_e * n[1]), float(u_e * n[2]),
+                              float(p_e)});
+        }
+    }
     euler_->set_flags(ef);
-    euler_->set_distance(vox_->signed_distance(ef));
+    euler_->set_ports(states);
+    euler_->set_distance(phi);
     euler_stale_ = false;
     restart_transonic("");
 }
@@ -300,6 +417,7 @@ void Tunnel::restart_transonic(const std::string& why) {
     euler_->set_mach(mach_applied_);
     euler_->init_freestream();
     euler_force_ema_ = {};
+    euler_moment_ema_ = {};
     euler_time0_ = euler_time_ = 0.0;
     peak_mach_ = 0.0f;
     ++flow_epoch_;
@@ -319,16 +437,24 @@ void Tunnel::advance_transonic(int steps) {
     }
     const double t0 = euler_time_;
     euler_->step(steps);
-    const std::array<double, 3> f = euler_->body_force();
+    // Moments about the placed centre, as in the subsonic regime (THEORY 8.11).
+    const euler::Solver::Loads loads = euler_->body_loads(placed_centre_);
+    const std::array<double, 3>& f = loads.force;
+    const std::array<double, 3>& m = loads.moment;
     euler_time_ = euler_->time();
     ++batch_;
-    if (!std::isfinite(f[0]) || !std::isfinite(f[1]) || !std::isfinite(f[2])) {
+    bool finite = true;
+    for (int k = 0; k < 3; ++k)
+        finite = finite && std::isfinite(f[k]) && std::isfinite(m[k]);
+    if (!finite) {
         restart_transonic("non-finite force");
         return;
     }
     const double a = 1.0 - std::exp(-std::max(euler_time_ - t0, 1e-9) / s_.force_ema_time);
-    for (int k = 0; k < 3; ++k)
+    for (int k = 0; k < 3; ++k) {
         euler_force_ema_[k] += a * (f[k] - euler_force_ema_[k]);
+        euler_moment_ema_[k] += a * (m[k] - euler_moment_ema_[k]);
+    }
     if (batch_ % std::max(s_.health_every, 1) == 0) {
         const euler::Solver::Health h = euler_->health();
         peak_mach_ = h.max_mach;
@@ -344,7 +470,8 @@ void Tunnel::advance_transonic(int steps) {
 
 void Tunnel::set_speed(float u) {
     u_command_ = std::clamp(u, 0.005f, s_.u_max);
-    apply_spin(); // omega follows the speed (spin ratio = rim / U)
+    apply_moving_walls(); // omega follows the speed (spin ratio = rim / U)
+    rotor_speeds();       // and the rotors' (tip-speed ratio)
 }
 
 void Tunnel::set_spin(bool on, float ratio) {
@@ -353,9 +480,82 @@ void Tunnel::set_spin(bool on, float ratio) {
     spin_ratio_ = ratio;
     if (!changed)
         return;
-    apply_spin();
+    apply_moving_walls();
     if (!model_.spinners.empty())
         begin_operating_point("spin change");
+}
+
+void Tunnel::set_rotors(bool turning, float tsr) {
+    const bool changed = turning != rotors_turning_ || std::abs(tsr - rotor_tsr_) > 0.005f;
+    rotors_turning_ = turning;
+    rotor_tsr_ = tsr;
+    if (!changed || !alm_)
+        return;
+    rotor_speeds();
+    begin_operating_point("rotor change");
+}
+
+// The model's rotors as actuator lines (THEORY 3.12), placed as the mesh is.
+// Present whenever the model has rotors: parked (omega 0) the blades still
+// take the wind.
+void Tunnel::build_rotors() {
+    alm_.reset(); // turns the force field off
+    rotor_thrust_ema_ = rotor_power_ema_ = rotor_fx_ = 0.0;
+    if (model_.rotors.empty() || model_.mesh.empty())
+        return;
+    const ModelFrame frame = model_frame(model_.mesh, model_.rotors, placement_, s_);
+    std::vector<RotorSpec> specs;
+    for (const catalogue::Rotor& r : model_.rotors) {
+        RotorSpec sp;
+        const std::array<double, 3> hub = frame.point(r.c), axis = frame.dir(r.axis);
+        for (int k = 0; k < 3; ++k) {
+            sp.hub[std::size_t(k)] = float(hub[std::size_t(k)]);
+            sp.axis[std::size_t(k)] = float(axis[std::size_t(k)]);
+        }
+        sp.r_tip = float(r.r_tip * frame.scale);
+        sp.r_hub = float(r.r_hub * frame.scale);
+        sp.blades = r.blades;
+        for (double c : r.chord)
+            sp.chord.push_back(float(c * frame.scale));
+        for (double t : r.twist_deg)
+            sp.twist_deg.push_back(float(t));
+        sp.cl_alpha = float(r.cl_alpha);
+        sp.alpha_stall_deg = float(r.alpha_stall_deg);
+        sp.cd0 = float(r.cd0);
+        specs.push_back(std::move(sp));
+    }
+    alm_ = std::make_unique<ActuatorLines>(ctx_, *solver_, std::move(specs), s_.alm_eps);
+    rotor_speeds();
+}
+
+// omega = sense x tsr x U / R (rad per step), or 0 parked.
+void Tunnel::rotor_speeds() {
+    if (!alm_)
+        return;
+    for (std::size_t k = 0; k < model_.rotors.size(); ++k) {
+        const catalogue::Rotor& r = model_.rotors[k];
+        const double tsr = rotor_tsr_ >= 0.0f ? double(rotor_tsr_) : r.tsr;
+        const double w = rotors_turning_ ? r.sense * tsr * std::max(double(u_command_), 1e-3) /
+                                               std::max(double(alm_->rotors()[k].r_tip), 1.0)
+                                         : 0.0;
+        alm_->set_omega(k, float(w));
+    }
+}
+
+void Tunnel::set_power(bool on, float throttle) {
+    throttle = std::clamp(throttle, 0.0f, 3.0f);
+    const bool changed = on != power_on_ || std::abs(throttle - throttle_) > 0.005f;
+    power_on_ = on;
+    throttle_ = throttle;
+    if (!changed)
+        return;
+    apply_moving_walls();
+    if (model_.ports.empty())
+        return;
+    begin_operating_point("power change");
+    euler_stale_ = true;
+    if (transonic_)
+        load_euler();
 }
 
 void Tunnel::set_turbulence(float pct) {
@@ -412,63 +612,68 @@ void Tunnel::build_dye_nozzles() {
     dye_->set_sources(src);
 }
 
-// Refill the wall velocities of the model's spinning parts (or clear them).
-// The request is scaled down by one factor for every spinner (rigid
-// rotation and relative speeds kept) so that no captured cell moves faster
-// than the cap: past ~0.10-0.12 the moving-wall term destabilises, and the
-// slider alone could ask for 3 x 0.11. |omega| x capture radius bounds the
-// speed of any captured cell. A spinner may carry a lower cap (blades).
+// Refill the wall velocities of the model's spinning parts and engine ports
+// (or clear them). Spinners: the request is scaled down by one factor for
+// every spinner (rigid rotation and relative speeds kept) so that no
+// captured cell moves faster than the cap: past ~0.10-0.12 the moving-wall
+// term destabilises, and the slider alone could ask for 3 x 0.11. |omega| x
+// capture radius bounds the speed of any captured cell. A spinner may carry
+// a lower cap (blades). Ports: each face moves along its normal at its speed
+// ratio x throttle x U, all scaled down together to max_jet_speed.
 //
 // In ground mode the model is dropped onto the belt, and the spinner
 // centres are dropped with it here: left at the undropped centre, the
 // capture cylinders would miss road-car wheels (~40 cells above them at
 // the fast preset).
-void Tunnel::apply_spin() {
+void Tunnel::apply_moving_walls() {
     solver_->clear_wall_velocity();
     spin_scale_ = 1.0f;
-    if (!spin_on_ || model_.spinners.empty() || model_.mesh.empty())
+    jet_scale_ = 1.0f;
+    const bool spinning = spin_on_ && !model_.spinners.empty();
+    const bool powered = power_on_ && !model_.ports.empty();
+    if ((!spinning && !powered) || model_.mesh.empty())
         return;
-    const geometry::Bounds mb = geometry::bounds(model_.mesh);
-    const double scale = placement_.length_cells / std::max(mb.longest(), 1e-12f);
-    const std::array<double, 3> centre{placement_.pos_frac[0] * s_.nx,
-                                       placement_.pos_frac[1] * s_.ny,
-                                       placement_.pos_frac[2] * s_.nz};
-    const auto R = rotation(placement_.yaw_deg, -placement_.aoa_deg, placement_.roll_deg);
-    // the ground drop (placed_mesh) applied to the spinners too
-    double drop = 0.0;
-    if (placement_.ground != catalogue::Ground::Air) {
-        const geometry::Mesh fitted = geometry::transform(
-            geometry::fit_to_box(model_.mesh,
-                                 {float(centre[0]), float(centre[1]), float(centre[2])},
-                                 placement_.length_cells),
-            placement_.yaw_deg, -placement_.aoa_deg, placement_.roll_deg,
-            geometry::Vec3{float(centre[0]), float(centre[1]), float(centre[2])});
-        drop = s_.floor_height + placement_.ride_height - geometry::bounds(fitted).lo[1];
+    const ModelFrame frame = model_frame(model_.mesh, model_.rotors, placement_, s_);
+    const double scale = frame.scale;
+    auto place_point = [&](const std::array<double, 3>& c) { return frame.point(c); };
+    auto place_dir = [&](const std::array<double, 3>& a) { return frame.dir(a); };
+    if (powered) {
+        struct Jet {
+            std::array<double, 3> point, dir;
+            double r, speed;
+        };
+        std::vector<Jet> jets;
+        for (const catalogue::Port& po : model_.ports) {
+            const double sign = po.kind == catalogue::Port::Kind::Exhaust ? 1.0 : -1.0;
+            const double speed = po.speed_ratio * throttle_ * std::max(double(u_command_), 1e-3);
+            if (speed > s_.max_jet_speed)
+                jet_scale_ = std::min(jet_scale_, float(s_.max_jet_speed / speed));
+            jets.push_back(
+                {place_point(po.c), place_dir(po.n), std::max(po.r * scale, 1.0), sign * speed});
+        }
+        for (const Jet& j : jets) {
+            // the face cells: the port's disc, from 2 cells inside the true face
+            // to 1 outside (the staircase straddles it)
+            const double v = j.speed * jet_scale_;
+            solver_->set_wall_velocity(
+                {float(j.point[0] - 0.5 * j.dir[0]), float(j.point[1] - 0.5 * j.dir[1]),
+                 float(j.point[2] - 0.5 * j.dir[2])},
+                {float(j.dir[0]), float(j.dir[1]), float(j.dir[2])}, float(j.r), 1.5f,
+                {float(v * j.dir[0]), float(v * j.dir[1]), float(v * j.dir[2])});
+        }
     }
+    if (!spinning)
+        return;
     struct Part {
         std::array<double, 3> point, omega;
         double capture_r, half_len;
     };
     std::vector<Part> parts;
     for (const catalogue::Spinner& sp : model_.spinners) {
-        std::array<double, 3> rel, p{}, ax{};
-        for (int k = 0; k < 3; ++k)
-            rel[k] = (sp.c[k] - 0.5 * (mb.lo[k] + mb.hi[k])) * scale;
-        for (int i = 0; i < 3; ++i) {
-            for (int k = 0; k < 3; ++k) {
-                p[i] += R[i][k] * rel[k];
-                ax[i] += R[i][k] * sp.axis[k];
-            }
-            p[i] += centre[i];
-        }
-        p[1] += drop;
-        const double an = std::sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+        const std::array<double, 3> p = place_point(sp.c), ax = place_dir(sp.axis);
         const double r_cells = std::max(sp.r * scale, 1.0);
         const double w = sp.sense * spin_ratio_ * std::max(double(u_command_), 1e-3) / r_cells;
-        Part part{p,
-                  {ax[0] / an * w, ax[1] / an * w, ax[2] / an * w},
-                  sp.r * scale * 1.2,
-                  sp.hl * scale * 1.4};
+        Part part{p, {ax[0] * w, ax[1] * w, ax[2] * w}, sp.r * scale * 1.2, sp.hl * scale * 1.4};
         const double fastest = std::abs(w) * part.capture_r;
         const double cap = std::min(double(s_.max_wall_speed),
                                     sp.max_wall > 0.0 ? sp.max_wall : double(s_.max_wall_speed));
@@ -500,11 +705,36 @@ std::string Tunnel::operating_point_key() const {
             k << "|sp=" << fmt(sp.c[0], 4) << "," << fmt(sp.c[1], 4) << "," << fmt(sp.c[2], 4)
               << "," << sp.axis[0] << sp.axis[1] << sp.axis[2] << "," << fmt(sp.r, 4) << ","
               << fmt(sp.hl, 4) << "," << sp.sense << "," << fmt(sp.max_wall, 4);
+    if (!model_.rotors.empty()) {
+        k << "|rotors=" << rotors_turning_ << "|tsr=" << fmt(rotor_tsr_, 4)
+          << "|eps=" << fmt(s_.alm_eps, 3);
+        for (const catalogue::Rotor& r : model_.rotors) {
+            k << "|ro=" << fmt(r.c[0], 4) << "," << fmt(r.c[1], 4) << "," << fmt(r.c[2], 4) << ","
+              << fmt(r.axis[0], 4) << "," << fmt(r.axis[1], 4) << "," << fmt(r.axis[2], 4) << ","
+              << fmt(r.r_tip, 4) << "," << fmt(r.r_hub, 4) << "," << r.blades << ","
+              << fmt(r.tsr, 4) << "," << r.sense << "," << fmt(r.cl_alpha, 4) << ","
+              << fmt(r.alpha_stall_deg, 4) << "," << fmt(r.cd0, 4);
+            for (double c : r.chord)
+                k << "," << fmt(c, 5);
+            for (double t : r.twist_deg)
+                k << "," << fmt(t, 4);
+        }
+    }
+    const bool powered = power_on_ && !model_.ports.empty();
+    k << "|power=" << powered << "|thr=" << fmt(powered ? throttle_ : 0.0f, 4)
+      << "|jetcap=" << fmt(s_.max_jet_speed, 4);
+    if (powered)
+        for (const catalogue::Port& po : model_.ports)
+            k << "|po=" << int(po.kind) << "," << fmt(po.c[0], 4) << "," << fmt(po.c[1], 4) << ","
+              << fmt(po.c[2], 4) << "," << fmt(po.n[0], 4) << "," << fmt(po.n[1], 4) << ","
+              << fmt(po.n[2], 4) << "," << fmt(po.r, 4) << "," << fmt(po.speed_ratio, 4) << ","
+              << fmt(po.exit_mach, 4) << "," << fmt(po.p_ratio, 4) << "," << fmt(po.t_ratio, 4);
     k << "|cap=" << fmt(s_.max_wall_speed, 4) << "|tu=" << fmt(turb_pct_, 1)
       << "|u=" << fmt(u_command_, 5) << "|grid=" << s_.nx << "x" << s_.ny << "x" << s_.nz
       << "|tau=" << fmt(s_.tau, 6) << "|cs=" << fmt(s_.smagorinsky_cs, 4)
-      << "|reg=" << s_.regularised << "|rr=" << s_.recursive << "|sponge=" << s_.outlet_sponge
-      << "," << s_.sponge_target << "|floor=" << s_.floor_height << "|f16=" << s_.storage_f16;
+      << "|reg=" << s_.regularised << "|rr=" << s_.recursive << "|walls=" << s_.sub_cell_walls
+      << "|sponge=" << s_.outlet_sponge << "," << s_.sponge_target << "|floor=" << s_.floor_height
+      << "|f16=" << s_.storage_f16;
     return cache_.key(k.str());
 }
 
@@ -595,7 +825,8 @@ void Tunnel::maybe_save_settled_flow() {
     const double dt = cache_.save(cache_key_, f, meta);
     cache_saved_for_ = cache_key_;
     cache_entries_ = cache_.entries();
-    cache_note_ = "saved to cache (" + fmt(dt, 1) + " s)";
+    cache_note_ = dt < 0.0 ? "not saved: one entry would exceed the cache budget"
+                           : "saved to cache (" + fmt(dt, 1) + " s)";
 }
 
 double Tunnel::q_dyn() const {
@@ -631,12 +862,30 @@ void Tunnel::advance(int steps) {
     if (turb_pct_ > 0.0f)
         solver_->set_turbulence_convection(std::max(u_applied_, 1e-3f));
 
-    if (dye_on_ && dye_)
-        dye_->step_with(*solver_, steps); // lock-step with the flow
+    const bool dye = dye_on_ && dye_;
+    if (dye || alm_) // lock-step with the flow: the dye, then the rotors' forces
+        solver_->step(steps, [&](VkCommandBuffer cmd, int macro_index) {
+            if (dye)
+                dye_->record_step(cmd, macro_index);
+            if (alm_)
+                alm_->record_step(cmd, macro_index);
+        });
     else
         solver_->step(steps);
     steps_done_ += steps;
     ++batch_;
+    if (alm_) { // the rotors' thrust and power (the last step of the batch)
+        double thrust = 0.0, power = 0.0, fx = 0.0;
+        for (const ActuatorLines::Loads& l : alm_->loads()) {
+            thrust += l.thrust;
+            power += l.power;
+            fx += l.force[0];
+        }
+        const double ar = 1.0 - std::exp(-steps / s_.force_ema_steps);
+        rotor_thrust_ema_ += ar * (thrust - rotor_thrust_ema_);
+        rotor_power_ema_ += ar * (power - rotor_power_ema_);
+        rotor_fx_ = fx;
+    }
 
     // Mean force over every step of the batch (a last-step sample aliases
     // against shedding); EMA time constant in solver steps.
@@ -746,7 +995,7 @@ void Tunnel::record_signals(const lbm::MeanForces& mf) {
             stats_ = std::make_unique<FlowStats>(ctx_, solver_->cells());
         stats_->add(solver_->macro_buffer(solver_->live_index()), double(mf.steps));
         for (int k = 0; k < 3; ++k)
-            force_sum_[k] += mf.force[k] * mf.steps;
+            force_sum_[k] += (mf.force[k] + (k == 0 ? rotor_fx_ : 0.0)) * mf.steps;
         force_w_ += mf.steps;
         avg_ft_ += double(mf.steps) * u_applied_ / s_.nx;
     }
@@ -891,6 +1140,25 @@ TunnelStatus Tunnel::status() const {
     t.ext_z_half = ext_z_half_;
     t.has_spinners = !model_.spinners.empty();
     t.spin_scale = spin_scale_;
+    t.has_ports = !model_.ports.empty();
+    t.power_on = power_on_;
+    t.jet_scale = jet_scale_;
+    t.has_rotors = alm_ != nullptr;
+    t.rotors_turning = rotors_turning_;
+    if (alm_) {
+        double area = 0.0, frontal = 0.0, tsr = 0.0;
+        for (const RotorSpec& r : alm_->rotors()) {
+            area += kPi * r.r_tip * r.r_tip;
+            frontal += kPi * r.r_tip * r.r_tip * std::abs(r.axis[0]); // projected on the stream
+            tsr = std::abs(r.omega) * r.r_tip / std::max(double(u_command_), 1e-3);
+        }
+        const double u = std::max(double(u_applied_), 1e-3);
+        t.rotor_ct = rotor_thrust_ema_ / (0.5 * u * u * area);
+        t.rotor_cp = rotor_power_ema_ / (0.5 * u * u * u * area);
+        t.rotor_tsr = float(tsr);
+        t.rotor_blockage = frontal / (double(s_.ny) * s_.nz);
+        t.rotor_segments = alm_->blade_outlines();
+    }
     t.cache_note = cache_note_;
     t.cache_entries = cache_entries_;
     t.inlet_turbulence_pct = turb_pct_;
@@ -925,7 +1193,7 @@ TunnelStatus Tunnel::status() const {
         t.cd = euler_force_ema_[0] / q;
         t.cl = euler_force_ema_[1] / q;
         t.cs = euler_force_ema_[2] / q;
-        t.cm = 0.0; // (the transonic pressure moment is not computed yet)
+        t.cm = euler_moment_ema_[2] / (q * std::max(placement_.length_cells, 1.0f));
         t.re_sim = 0.0;
     }
     return t;

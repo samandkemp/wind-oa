@@ -12,6 +12,7 @@ const float GAMMA = 1.4;
 const float PHI_FAR = 4.0;
 const uint FLUID = 0u;
 const uint OBSTACLE = 1u;
+const uint PORT0 = 8u;  // flags 8 + k: engine port k (an exhaust face; THEORY 8.12)
 
 struct S {
     vec4 v;

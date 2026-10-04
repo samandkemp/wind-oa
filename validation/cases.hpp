@@ -257,9 +257,17 @@ inline Result run(Context& ctx, float tau, bool regularised) {
 namespace app {
 
 struct Placed {
-    std::vector<std::uint8_t> flags; // OBSTACLE where the body is
-    double area = 0.0;               // frontal: OBSTACLE anywhere along x
+    std::vector<std::uint8_t> flags;  // OBSTACLE where the body is
+    std::vector<std::uint8_t> link_q; // the app's sub-cell walls (empty when off)
+    double area = 0.0;                // frontal: OBSTACLE anywhere along x
 };
+
+// The body into a solver built from solver_config(t), walls as the app sets them.
+inline void place(lbm::Solver& s, const Placed& p) {
+    s.set_flags(p.flags);
+    if (!p.link_q.empty())
+        s.set_link_q(p.link_q);
+}
 
 // fit_to_box(ahmed, (0.35 nx, 0.5 ny, 0.5 nz), 64), pitched by -aoa about
 // that centre.
@@ -271,6 +279,9 @@ inline Placed ahmed(Voxeliser& vox, const TunnelSettings& t, float aoa_deg = 0.0
     Placed p;
     p.flags.assign(std::size_t(t.nx) * t.ny * t.nz, lbm::FLUID);
     vox.voxelise(mesh, p.flags);
+    if (t.sub_cell_walls)
+        p.link_q =
+            shapes::link_fractions(p.flags, vox.signed_distance(p.flags), t.nx, t.ny, t.nz, &mesh);
     for (int y = 0; y < t.ny; ++y)
         for (int z = 0; z < t.nz; ++z)
             for (int x = 0; x < t.nx; ++x)

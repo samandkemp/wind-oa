@@ -1,5 +1,5 @@
-// The compressible Euler cases shared by V17 - V19: the exact Riemann
-// solution, the setups and the measurements.
+// The compressible Euler cases shared by V17 - V19 and V27: the exact
+// Riemann solution, the setups and the measurements.
 #pragma once
 
 #include <algorithm>
@@ -94,6 +94,85 @@ inline double theta_beta_m(double mach, double theta) {
             lo = mid;
     }
     return 0.5 * (lo + hi);
+}
+
+// -- NACA 0012 section (V19, V27) ---------------------------------------------------
+// A 2-D section on an nx x ny grid: chord ch cells at incidence al (radians,
+// nose up), rotated about the pivot (px, py), which sits at the quarter chord.
+// The foil mask and each cell's chordwise position x/c ([x * ny + y]), and the
+// exact signed distance to the contour within 6 cells of the foil (+-4 beyond;
+// negative inside), which the image-point walls need (THEORY 8.6).
+struct NacaSection {
+    std::vector<std::uint8_t> foil;
+    std::vector<double> xa;
+    std::vector<float> phi;
+};
+
+inline double naca0012_half(double xc) { // half-thickness / chord
+    xc = std::max(xc, 0.0);
+    return 0.6 * (0.2969 * std::sqrt(xc) - 0.1260 * xc - 0.3516 * xc * xc + 0.2843 * xc * xc * xc -
+                  0.1015 * xc * xc * xc * xc);
+}
+
+inline NacaSection naca0012_section(int nx, int ny, double ch, double al, double px, double py) {
+    NacaSection s;
+    s.foil.assign(std::size_t(nx) * ny, 0);
+    s.xa.assign(s.foil.size(), 0.0);
+    s.phi.assign(s.foil.size(), 0.0f);
+    for (int x = 0; x < nx; ++x)
+        for (int y = 0; y < ny; ++y) {
+            const double xg = x + 0.5 - px, yg = y + 0.5 - py;
+            const double xa = (xg * std::cos(al) - yg * std::sin(al)) / ch + 0.25;
+            const double ya = (xg * std::sin(al) + yg * std::cos(al)) / ch;
+            s.xa[std::size_t(x) * ny + y] = xa;
+            s.foil[std::size_t(x) * ny + y] =
+                (xa >= 0.0 && xa <= 1.0 && std::abs(ya) < naca0012_half(xa)) ? 1 : 0;
+        }
+    std::vector<double> cx, cy;
+    for (int i = 0; i < 2000; ++i) {
+        const double bt = gate::kPi * i / 1999.0, xs = 0.5 * (1 - std::cos(bt));
+        const double yt = naca0012_half(xs);
+        for (int sg : {1, -1}) {
+            const double qx = (xs - 0.25) * ch, qy = sg * yt * ch;
+            cx.push_back(qx * std::cos(al) + qy * std::sin(al) + px);
+            cy.push_back(-qx * std::sin(al) + qy * std::cos(al) + py);
+        }
+    }
+    for (int x = 0; x < nx; ++x)
+        for (int y = 0; y < ny; ++y) {
+            const std::size_t k = std::size_t(x) * ny + y;
+            bool near = false;
+            for (int dx = -6; dx <= 6 && !near; ++dx)
+                for (int dy = -6; dy <= 6; ++dy) {
+                    const int xx = x + dx, yy = y + dy;
+                    if (xx >= 0 && yy >= 0 && xx < nx && yy < ny &&
+                        s.foil[std::size_t(xx) * ny + yy]) {
+                        near = true;
+                        break;
+                    }
+                }
+            double d = 4.0;
+            if (near) {
+                d = 1e30;
+                for (std::size_t i = 0; i < cx.size(); ++i)
+                    d = std::min(d, std::hypot(x + 0.5 - cx[i], y + 0.5 - cy[i]));
+            }
+            s.phi[k] = float(s.foil[k] ? -d : d);
+        }
+    return s;
+}
+
+// The section extruded through nz cells (a 2-D case: slip z faces).
+inline void set_section(euler::Solver& s, const NacaSection& sec, int nz) {
+    std::vector<std::uint8_t> flags(s.cells());
+    std::vector<float> phi(s.cells());
+    for (std::size_t k = 0; k < sec.foil.size(); ++k)
+        for (int z = 0; z < nz; ++z) {
+            flags[k * std::size_t(nz) + std::size_t(z)] = sec.foil[k];
+            phi[k * std::size_t(nz) + std::size_t(z)] = sec.phi[k];
+        }
+    s.set_flags(flags);
+    s.set_distance(phi);
 }
 
 // least-squares slope of y(x)

@@ -12,7 +12,13 @@
 #include "windoa/device.hpp"
 
 int main(int argc, char** argv) {
-    const bool require = argc > 1 && std::strcmp(argv[1], "--require-compute") == 0;
+    const bool help =
+        argc > 1 && (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0);
+    if (argc > 2 || (argc > 1 && (help || std::strcmp(argv[1], "--require-compute") != 0))) {
+        std::fputs("usage: device_info [--require-compute]\n", help ? stdout : stderr);
+        return help ? 0 : 2;
+    }
+    const bool require = argc > 1;
     try {
         const auto gpus = windoa::enumerate_gpus();
         bool ok = false;

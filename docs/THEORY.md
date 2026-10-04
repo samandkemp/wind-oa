@@ -65,15 +65,16 @@ It is fast, local and naturally parallel, which is what makes an interactive tun
 ### 0.2 Boundary conditions - what the air meets
 
 A velocity inlet, a pressure outlet with an absorbing sponge, free-slip side walls, and bounce-back
-at every solid link (half-way or interpolated), with moving-wall terms for spinning parts and a
-rolling road (§3).
+at every solid link (interpolated to the true surface, or half-way), with moving-wall terms for
+spinning parts and a rolling road. Engines blow and draw through ports on the surface, and rotors
+act on the air as lines of blade-element forces (§3).
 
 ### 0.3 Compressible Euler - the transonic air
 
 The lattice Boltzmann method is trusted only to about Mach 0.3 and cannot form shocks. A
 finite-volume Euler solver on the same grid and flags carries the tunnel from Mach 0.3 to 1.6:
 MUSCL reconstruction, the HLLC flux and SSP-RK2 time stepping, with image-point ghost cells at the
-walls (§8).
+walls and engine exhausts that emit a prescribed exit state (§8).
 
 ### 0.4 Geometry - from triangles to cells
 
@@ -333,8 +334,32 @@ $$f_i = \begin{cases}
 
 The first branch needs the cell one step away from the wall to be fluid; where it is not (a gap
 of one cell), the link falls back to half-way bounce-back. Link fractions are stored as 8-bit
-values $q = n/255$; the default $n = 128$ stands for $q = 0.502$, effectively half-way. Only the
-analytic sphere fills them today (§5.5); the sandbox uses half-way bounce-back.
+values $q = n/255$, except that the default $n = 128$ is read as exactly $q = \tfrac12$: a link
+left at its default is half-way bounce-back to the bit.
+
+**Where the fractions come from.** The analytic sphere's are exact ray intersections (§5.5). Every
+other body, and so the sandbox's walls (`TunnelSettings::sub_cell_walls`, on by default), takes
+them from its mesh. Along each link from a fluid cell to an `OBSTACLE` cell, $q$ is the first
+crossing of the faceted surface: a ray-triangle intersection (Moller and Trumbore 1997) against
+the triangles binned on a coarse grid. Where the link crosses no triangle (a sheet thinner than a
+cell, kept solid by the shell of §5.3, need not be crossed by every link that ends in it), the
+exact signed distance of §5.4 is interpolated along the link,
+
+$$q = \frac{\phi_f}{\phi_f - \phi_s},$$
+
+which is exact for a plane at any orientation. The signed distance alone does not suffice on a
+curved surface: linear along a link that grazes the surface, it misplaces the wall by up to a fifth
+of a link, an RMS of 0.053 on a finely tessellated sphere against 0.003 from the crossings (V28).
+
+**Mass.** Interpolated bounce-back does not conserve mass: the populations a cell receives from its
+walls do not sum to those it sent. In the tunnel the defect showed as a mass flux that changed by
+5e-4 between planes either side of the body. The excess of every link over its half-way value is
+therefore taken back out of the cell's rest population,
+
+$$f_0 \leftarrow f_0 - \sum_{\text{wall links}} \left(f_i - f_i^{\mathrm{hw}}\right),$$
+
+which carries no momentum, so the momentum the interpolation encodes (the wall's position) is
+kept. The flux then agrees to 4e-5 across the body (V25), closer than with half-way walls (7e-5).
 
 ### 3.7 Moving walls
 
@@ -350,6 +375,13 @@ centre $\mathbf{x}_c$, about the axis point $\mathbf{p}$. The term implicitly as
 at the wall and runs out of stability margin near a wall speed of 0.10 - 0.12, which is the
 origin of the wall-speed cap (§9.3).
 
+On an interpolated wall the term takes the weight of the branch it joins (Bouzidi et al. 2001;
+Lallemand and Luo 2003): on the $q \geq \tfrac12$ branch the returning population is built from
+$f^*_{\bar\imath} / (2q)$, and the wall's momentum enters as $6\, w_i\, \mathbf{e}_i \cdot
+\mathbf{u}_w / (2q)$; on the $q < \tfrac12$ branch it enters whole. The mass correction of §3.6
+compares with the half-way value including the whole term, so a moving wall still passes exactly
+the mass of a half-way one, which the engine ports rely on (§3.11).
+
 ### 3.8 The closed-domain mass anchor
 
 An open tunnel holds its density level unaided, because the outlet pins it. A closed domain (the
@@ -361,14 +393,15 @@ level moves.
 
 ### 3.9 Deliberate limitations
 
-- **Staircase walls.** The sandbox's bodies are voxel staircases with half-way bounce-back.
-  Interpolated bounce-back is certified (V9) but buys only about 0.6 points of sphere drag, the
-  wall-placement term of the error budget (blockage contributes about 3.8 points and streamwise
-  confinement about 1.2).
+- **What sub-cell walls remove.** The staircase is a large error at sandbox resolution: on a sphere
+  16 cells across at Re 100, half-way walls read 6 % more drag than walls at the true surface
+  (V28), and V9's sphere's error against the published drag falls from 7.5 % to 3.2 % when its
+  walls are interpolated. What remains is the tunnel's blockage and confinement and, for real
+  shapes, the Reynolds number (§4.5). A gap of one cell still falls back to half-way bounce-back.
 - **Blockage and confinement.** The tunnel is a few body lengths long and wide; drag is inflated
   by blockage in the same way as in a small physical tunnel, and no correction is applied.
 
-### 3.10 Validation gates (V2, V8 - V10)
+### 3.10 Validation gates (V2, V8 - V10, V28)
 
 | Gate | Property | Checked against |
 |---|---|---|
@@ -376,6 +409,129 @@ level moves.
 | V8 | Moving walls give the Magnus force with the right sign and growth | Physical sign and monotonicity; 1.5 < abs(Cl) < 9 at spin ratio 2 |
 | V9 | Interpolated bounce-back places the wall at fraction q | Shifted-wall Poiseuille, u_max within 1.5 % |
 | V10 | The sponge absorbs sound without changing the answer | Reflection < 0.05; Ahmed Cd within 1 % |
+| V28 | A mesh's link fractions place its wall where the surface is, and the sandbox runs on them | Ray intersection with the true sphere: RMS within 0.01 of a link, worst within 0.05; the true sphere's drag within 0.5 %; 8,000 healthy steps at top speed for the thin-featured models |
+
+The gates of the two sections that follow are listed with them (§3.11, §3.12).
+
+### 3.11 Engine ports
+
+A port is a disc on a model's surface (centre, outward normal, radius) through which an engine
+blows (an exhaust, along the normal) or draws (an intake, against it). In this regime it is a
+velocity boundary built from the moving wall of §3.7: the solid cells of the port's face (those
+within its radius, from two cells inside the true face to one outside, which the staircase
+straddles) carry the wall velocity
+
+$$\mathbf{u}_w = \pm\, s\, k\, U\, \mathbf{n},$$
+
+with $s$ the port's speed ratio, $k$ the throttle, and the sign positive for an exhaust. Summed over
+the five links that leave a face cell through a plane face, the moving-wall term is
+$\sum_i 6\, w_i\, \mathbf{e}_i \cdot \mathbf{u}_w = u_w$: each face cell injects (or, drawing,
+removes) exactly $u_w$ of mass per step, a jet of speed $u_w$ at unit density. Its reaction is
+counted where every wall force is counted: the face cells are `OBSTACLE`, so momentum exchange
+(§4.1) includes the jet's momentum flux, and the body's force is the net of its drag and its
+thrust. V29 checks both the mass and the force, against a control-volume balance.
+
+The wall-speed limit of §3.7 applies to a face: a port blows at most
+`TunnelSettings::max_jet_speed` (0.12), and when any port would exceed it, every port is scaled
+by the same factor, which the sandbox reports. A turbofan's mixed exhaust, at 1.6 times the
+freestream, therefore runs at full strength up to $U = 0.075$.
+
+**Limits.** The lattice fluid is nearly incompressible and isothermal, so a port carries mass and
+momentum but no heat: an exhaust's temperature and exit Mach number act only in the compressible
+regime (§8.12). The face velocity is uniform (a top-hat jet), and the face's staircase sets its
+area, so a port a few cells across injects through its cells rather than through $\pi r^2$. An
+intake and an exhaust need not balance (a real engine adds fuel and heat); any surplus leaves
+through the outlet.
+
+| Gate | Property | Checked against |
+|---|---|---|
+| V29 | A port injects the mass it prescribes, and the body feels the jet's reaction | The injection $\rho U_j A$ within 1 %; the momentum balance between planes within 2 % for an exhaust, an intake and the control; in the app's tunnel, the wake survey within 2 % and the mass gained within 5 % |
+
+### 3.12 Actuator lines
+
+A rotor's blades move several times faster than the stream: a wind turbine's tip-speed ratio
+$\lambda = \Omega R / U$ is about 7, so at $U = 0.05$ its tips move at 0.35 lattice units, far past
+the moving-wall cap of §9.3 and the lattice's Mach limit. The blades are therefore represented not
+as moving geometry but by the forces they exert (Sorensen and Shen 2002): each blade is a line of
+elements, about one a cell, and each element's force follows from blade-element theory. The tip
+speed never enters the lattice as a velocity; only the velocities the forces induce do.
+
+**The element.** An element at radius $r$ samples the velocity $\mathbf{u}$ and density $\rho$ at
+its position (trilinear in the macroscopic field) and forms the relative wind in the blade's
+frame,
+
+$$\mathbf{W} = \mathbf{u} - \Omega r\, \mathbf{e}_\psi, \qquad \mathbf{e}_\psi = \mathbf{a} \times
+\mathbf{e}_r,$$
+
+with $\mathbf{a}$ the rotor's axis (the through-flow direction) and $\mathbf{e}_\psi$ the direction
+the blade moves. Its inflow angle from the rotor plane is $\phi = \operatorname{atan2}(W_a,
+-W_\psi)$ and its angle of attack $\alpha = \phi - \theta(r)$, with $\theta$ the local twist. A
+thin-aerofoil polar gives the coefficients: $C_l = 2\pi\alpha$ and $C_d = C_{d0}$ up to the stall
+angle $\alpha_s$ (12 degrees); past it a flat plate's $C_l \propto \sin 2\alpha$, continuous at
+stall, and $C_d = C_{d0} + 1.8(\sin^2\alpha - \sin^2\alpha_s)$. The force on the blade is
+
+$$\mathbf{F} = F_{\mathrm{tip}}\, \tfrac12 \rho |\mathbf{W}|^2 c\, \Delta r \left(C_l\, \mathbf{l} +
+C_d\, \mathbf{d}\right),$$
+
+with $c$ the local chord, $\Delta r$ the element's span, $\mathbf{d}$ along $\mathbf{W}$ and
+$\mathbf{l}$ normal to it in the plane of $\mathbf{a}$ and $\mathbf{e}_\psi$. Lift at positive
+$\alpha$ pushes the blade downstream and drives it (a turbine); at negative $\alpha$ it pushes the
+blade upstream (a propeller's thrust). $F_{\mathrm{tip}}$ is Prandtl's tip-loss factor in
+Glauert's form (Glauert 1935),
+
+$$F_{\mathrm{tip}} = \frac{2}{\pi} \arccos \exp\left(-\frac{B (R - r)}{2 r |\sin\phi|}\right),$$
+
+for $B$ blades of tip radius $R$. A line of elements carries its load out to the tip, where a real
+blade's load falls to zero as the air spills round it; without the factor the catalogue turbine's
+power coefficient passed the Betz limit.
+
+**The smearing.** The reaction of every element on the air, $-\mathbf{F}_e$, is spread over the
+grid with a Gaussian of width $\varepsilon$,
+
+$$\mathbf{f}(\mathbf{x}) = -\sum_e \mathbf{F}_e\, \frac{\exp(-|\mathbf{x} -
+\mathbf{x}_e|^2 / \varepsilon^2)}{\varepsilon^3 \pi^{3/2}},$$
+
+cut off at $3\varepsilon$, with $\varepsilon = 2$ cells (`TunnelSettings::alm_eps`); a kernel much
+narrower than two cells would put each element's force on a single cell. The kernel integrates to
+one, so the force the air receives is the force on the blades, which V31 checks against the
+momentum the air gains. Every rotor is spread in one pass over all their elements, into one box
+round everything they reach. The field enters the collision as Guo forcing (§2.2), a per-cell
+addition to the body force behind a specialisation constant: switched off, the step compiles
+without it and is bit-identical.
+
+**Stepping.** After each flow step the elements sample that step's velocity, and the field they
+produce acts on the next step: a lag of one step against a revolution of several hundred. The
+rotor turns by $\Omega$ each step, $\Omega = \lambda U / R$ at the commanded speed. A parked rotor
+($\Omega = 0$) keeps its blades as loaded, stalled sections.
+
+**Momentum theory and the tunnel.** For validation the same machinery carries a uniformly loaded
+actuator disc: elements on an equal-area polar grid, each with an equal axial force. Momentum
+theory (Burton et al. 2011) relates the disc's thrust coefficient $C_T = T / (\tfrac12 \rho U^2
+\pi R^2)$ to the axial induction $a$, the fraction by which the air slows at the disc, and bounds
+the power coefficient of any rotor by the Betz limit:
+
+$$C_T = 4a(1 - a), \qquad u_{\text{far wake}} = U(1 - 2a), \qquad C_P \leq \tfrac{16}{27}.$$
+
+Two effects of the tunnel show against it. **Blockage**: the walls stop the stream tube from
+expanding freely, so the disc slows the air less than in free air; at light loading the induction
+falls short of $C_T / 4$ by 2.0 % at a blockage (swept area over the section) of 1.2 %, 3.6 % at
+2.2 % and 4.9 % at 4.9 %. A turbine whose disc fills much of the section then reads power
+coefficients that would pass the Betz limit, a closed tunnel's familiar error rather than the
+model's: the catalogue turbine is sized to 5 % of the section, and the app warns above that.
+**Non-uniform loading**: at heavier loading ($C_T = 0.5$) the measured induction falls 8 % short of
+the one-dimensional value $(1 - \sqrt{1 - C_T})/2$. Both momentum relations hold for averages over
+the disc and the stream tube, while a disc in a viscous stream slows the air least at its centre
+and most at its rim, which the Gaussian smears; the comparison is reported but not gated.
+
+**Limits.** The polar is a thin aerofoil's rather than a measured section's, with no dynamic stall,
+no rotational delay of stall and no root loss. The blade is a force, not a body, so it has no
+thickness and no boundary layer of its own (the hub, nacelle and tower are bodies). At the fast
+preset a blade's chord is a few cells, smaller than the kernel, so the tip vortices form at the
+right radius and convect correctly but their cores are about $\varepsilon$ wide.
+
+| Gate | Property | Checked against |
+|---|---|---|
+| V31 | A uniformly loaded disc obeys momentum theory, and a turbine's blades load the air as the balance requires | Linear theory, $a = C_T / 4$ within 3 % at 1.2 % blockage; the applied thrust against the momentum deficit within 2 %; the catalogue turbine's wake survey against the force balance within 3 %, $0 < C_P < 16/27$, healthy at top speed |
 
 ## 4. Forces and coefficients
 
@@ -726,8 +882,10 @@ the wall pressure times the face's area vector; the staircase's projected areas 
 exactly. The wall pressure is the image ghost's value interpolated to the true wall,
 $p_w = p_I + \tfrac{\Delta n - d}{\Delta n} (p_g - p_I)$, where the face uses the image (the
 ghost's own pressure lies beyond the wall, and gave a NACA 0012 a thrust), and otherwise the star
-pressure of the Riemann problem between the cell and its mirror image. As in §4.1, a floor is
-`WALL` and is excluded.
+pressure of the Riemann problem between the cell and its mirror image, posed with the solid on its
+own side of the face (solid on the right of a face whose solid lies in $+x_i$, on the left
+otherwise; posed the other way round, an expansion reads as a compression, and a section and its
+mirror image carried lift differing by 7 %). As in §4.1, a floor is `WALL` and is excluded.
 
 ### 8.9 Deliberate limitations
 
@@ -735,8 +893,14 @@ pressure of the Riemann problem between the cell and its mirror image. As in §4
   only.
 - **Voxel walls cost lift.** At 128 cells a chord the NACA 0012 reads Cl 0.291 against about 0.35
   for the published Euler solutions; the far field must also sit at least about six chords away,
-  since a closer one inflates lift.
-- **No pitching moment** is computed in the transonic regime yet.
+  since a closer one inflates lift. The shortfall is in the flow, not in the force sum: the
+  circulation round the section gives the same lift (Kutta-Joukowski, V27). It depends erratically
+  on the resolution: at Mach 0.5 the lift slope reads 5.46, 7.05 and 5.41 per radian at 64, 96 and
+  128 cells a chord, against 7.26 for thin-aerofoil theory with Prandtl-Glauert.
+- **The moment inherits it.** The missing lift sits aft, so the aerodynamic centre reads 0.16 -
+  0.23 c instead of the quarter chord, and the transonic Cm is qualitative (§8.11).
+- **Subcritical drag is not zero.** An inviscid subcritical section has no drag (d'Alembert); the
+  voxel wall reads -0.002 to -0.007, a small thrust.
 
 ### 8.10 Validation gates (V17 - V19)
 
@@ -745,6 +909,68 @@ pressure of the Riemann problem between the cell and its mirror image. As in §4
 | V17 | Shock tube: all three wave families | The exact Riemann solution: L1(rho) < 2 %, shock within 2 cells, transverse symmetry |
 | V18 | Mach 2 over a 15 degree voxel wedge | theta-beta-M: shock angle within 1.5 degrees, wall pressure within 5 % |
 | V19 | NACA 0012 at Mach 0.8, alpha 1.25 degrees | AGARD-AR-211 bands for Cl, Cd and the upper shock; converged lift |
+
+The gates of the later sections, V27 and V30, are listed with them (§8.11, §8.12).
+
+### 8.11 Pitching moment
+
+The moment about a reference point $\mathbf{x}_r$ sums, over the same faces as §8.8, the arm to
+the face centre crossed with the face's pressure force:
+
+$$\mathbf{M} = \sum_f (\mathbf{x}_f - \mathbf{x}_r) \times (p_w - p_\infty)\, \mathbf{n}_f A_f$$
+
+A uniform pressure exerts no moment on a closed surface, $\oint \mathbf{x} \times \mathbf{n}\,
+dA = 0$, and the staircase is closed, so subtracting $p_\infty$ changes nothing but the size of
+the terms: in f32 they are then pressure differences rather than whole pressures. The sandbox takes
+the moment about the placed centre and reports $C_{m,z} = M_z / (q A L)$, the definition of the
+subsonic regime (§4.4), with $q = \tfrac12 M^2$ in Euler units.
+
+The sums are exact as bookkeeping: a section and its mirror image give opposite lift and moment to
+$10^{-6}$, the moment about the leading edge equals the moment about the quarter chord plus
+$\mathbf{r} \times \mathbf{F}$ to $10^{-8}$, and the surface lift agrees with the lift
+$\rho U \Gamma$ of the flow's circulation within 3 %. What they report is limited by the flow:
+the aerodynamic centre, at the quarter chord for a thin section (and left there by Prandtl-Glauert),
+reads 0.16 - 0.23 c, because the voxel wall's circulation falls short aft (§8.9).
+
+| Gate | Property | Checked against |
+|---|---|---|
+| V27 | NACA 0012 at Mach 0.5, alpha +-2 degrees: lift and moment consistent | Mirror antisymmetry; the moment transfer $\mathbf{M}_A = \mathbf{M}_B + (\mathbf{x}_B - \mathbf{x}_A) \times \mathbf{F}$; Kutta-Joukowski within 5 % |
+
+### 8.12 Engine exhausts
+
+In this regime an exhaust port (§3.11) emits a prescribed exit state. The solid cells of its face,
+chosen as in §3.11, carry the port's own flag ($8 + k$ for port $k$, up to eight); the ghost cells
+of §8.6 pass them by, and the flux through a face between a fluid cell and a port cell takes the
+port's state for its solid side, $\mathbf{F}^{\mathrm{HLLC}}(\mathbf{W}, \mathbf{W}_e)$ with the
+arguments in the grid's order. The exit state is set by the exit Mach number $M_e$ along the normal
+and by the ratios of the exit static pressure and temperature to the freestream's, $p_r$ (scaled by
+the throttle) and $t_r$. In the units of §8.1 ($\rho_\infty = 1$, $p_\infty = 1/\gamma$,
+$c_\infty = 1$),
+
+$$p_e = \frac{p_r}{\gamma}, \qquad \rho_e = \frac{p_r}{t_r}, \qquad c_e = \sqrt{t_r}, \qquad
+\mathbf{u}_e = M_e\, c_e\, \mathbf{n}.$$
+
+The pressure force of §8.8 takes the same flux on a port's faces, its normal momentum flux
+$\rho u_n^2 + p$, so the reported force includes the thrust. An exhaust with $p_r > 1$ is
+under-expanded: the jet expands beyond the nozzle and recompresses through a barrel shock and a
+normal shock, the Mach disc. The disc's distance is fixed by the inviscid expansion and is
+predicted; for a sonic jet it follows the correlation of Ashkenas and Sherman (1966), confirmed by
+Crist, Sherman and Glass (1966),
+
+$$\frac{x_M}{D} = 0.67 \sqrt{\frac{p_0}{p_a}},$$
+
+with $p_0$ the jet's stagnation pressure and $p_a$ the ambient pressure. Intakes are walls in this
+regime: an intake's face would need a condition that sets the mass it swallows, which the solver
+does not have.
+
+**Limits.** The jet is inviscid: its shear layer is held by numerical diffusion rather than
+turbulence, so the shock cells persist further downstream than in a real plume, and the plume's
+spreading is not predicted. Exhaust and air are one gas ($\gamma = 1.4$), and the exit state is
+uniform across the face.
+
+| Gate | Property | Checked against |
+|---|---|---|
+| V30 | An under-expanded sonic jet places its Mach disc | Ashkenas and Sherman, $x_M / D = 0.67 \sqrt{p_0 / p_a}$, within 10 % at $p_0 / p_a = 20$ and 40; the peak axial Mach number above 3 |
 
 ## 9. The sandbox loop
 
@@ -775,8 +1001,11 @@ A spinning part has a centre, an axis, a rim radius $r$ and a sense; its angular
 the spin ratio $\lambda$ (rim speed over wind speed), $\Omega = \pm \lambda U / r$. The cells it
 captures lie within $1.2\,r$ of the axis and $1.4$ times its half-length along it. Every part's
 $\Omega$ is then scaled by one common factor so that no captured cell moves faster than the cap
-of 0.08 (0.025 for thin rotor blades, where 0.04 diverged): rigid rotation and the relative speeds
-of the parts are preserved, and the panel reports when the cap is limiting.
+of 0.08 (a part may set a lower cap of its own: thin spinning blades diverged at 0.04 and ran at
+0.025): rigid rotation and the relative speeds of the parts are preserved, and the panel reports
+when the cap is limiting. The cap is why rotors are not spinning parts: a turbine's tips move at
+seven times the wind, and are represented by their forces instead (§3.12). Engine ports have a cap
+of their own, 0.12, applied the same way (§3.11).
 
 ### 9.4 The divergence guard
 
@@ -988,6 +1217,12 @@ grew by a factor of 2.2 in one measurement and about 5 in another. The same conf
 therefore needs at least five times as many samples, which the speed-up does not repay, and the
 option stays opt-in for that reason.
 
+The dye's populations (§6) were tried the same way, as binary16 of $g_i$, and rejected. It made a
+run with dye about 13 % faster, but it fails V20: at $\tau = 0.53$ a blob spreads 5.7 % too far
+along the stream, and a band between walls loses 2.3 % of its mass in 3,000 steps. The flow's
+scheme works because $f_i - w_i$ is small; the dye has no such rest value to subtract, since $C$
+ranges from 0 to 1 across the tunnel.
+
 ### 11.4 The fused Euler stage
 
 The six face fluxes and the Runge-Kutta stage are computed in one kernel, which reads about 60 bytes
@@ -1113,15 +1348,25 @@ per half cycle; one beside the centreline sees both at the shedding frequency.
 
 ## References
 
+- Anderson, J. D. (2017). *Fundamentals of Aerodynamics*, 6th edition. McGraw-Hill.
+- Ashkenas, H. and Sherman, F. S. (1966). The structure and utilization of supersonic free jets in
+  low density wind tunnels. In *Rarefied Gas Dynamics*, ed. J. H. de Leeuw, Vol. 2, 84. Academic
+  Press.
 - Bourke, P. (1994). Polygonising a scalar field. paulbourke.net/geometry/polygonise.
 - Bouzidi, M., Firdaouss, M. and Lallemand, P. (2001). Momentum transfer of a Boltzmann-lattice
   fluid with boundaries. *Physics of Fluids* 13, 3452.
+- Burton, T., Jenkins, N., Sharpe, D. and Bossanyi, E. (2011). *Wind Energy Handbook*, 2nd
+  edition. Wiley.
 - Cabral, B. and Leedom, L. C. (1993). Imaging vector fields using line integral convolution.
   *Proceedings of SIGGRAPH 93*, 263.
+- Crist, S., Sherman, P. M. and Glass, D. R. (1966). Study of the highly underexpanded sonic jet.
+  *AIAA Journal* 4(1), 68.
 - Dadone, A. and Grossman, B. (2004). Ghost-cell method for inviscid two-dimensional flows on
   Cartesian grids. *AIAA Journal* 42(12), 2499.
 - Ghia, U., Ghia, K. N. and Shin, C. T. (1982). High-Re solutions for incompressible flow using
   the Navier-Stokes equations and a multigrid method. *Journal of Computational Physics* 48, 387.
+- Glauert, H. (1935). Airplane propellers. In *Aerodynamic Theory*, ed. W. F. Durand, Vol. IV,
+  Division L. Springer.
 - Guo, Z., Zheng, C. and Shi, B. (2002). Discrete lattice effects on the forcing term in the
   lattice Boltzmann method. *Physical Review E* 65, 046308.
 - Hou, S., Sterling, J., Chen, S. and Doolen, G. D. (1996). A lattice Boltzmann subgrid model for
@@ -1131,12 +1376,18 @@ per half cycle; one beside the centreline sees both at the shedding frequency.
   *Journal of Turbulence* 19, 1051.
 - Ladd, A. J. C. (1994). Numerical simulations of particulate suspensions via a discretized
   Boltzmann equation. *Journal of Fluid Mechanics* 271, 285.
+- Lallemand, P. and Luo, L.-S. (2003). Lattice Boltzmann method for moving boundaries. *Journal of
+  Computational Physics* 184, 406.
 - Latt, J. and Chopard, B. (2006). Lattice Boltzmann method with regularized pre-collision
   distribution functions. *Mathematics and Computers in Simulation* 72, 165.
 - Lorensen, W. E. and Cline, H. E. (1987). Marching cubes: a high resolution 3D surface
   construction algorithm. *Computer Graphics* 21(4), 163.
 - Mei, R., Yu, D., Shyy, W. and Luo, L.-S. (2002). Force evaluation in the lattice Boltzmann
   method involving curved geometry. *Physical Review E* 65, 041203.
+- Moller, T. and Trumbore, B. (1997). Fast, minimum storage ray-triangle intersection. *Journal of
+  Graphics Tools* 2(1), 21.
+- Sorensen, J. N. and Shen, W. Z. (2002). Numerical modeling of wind turbine wakes. *Journal of
+  Fluids Engineering* 124(2), 393.
 - Toro, E. F. (2009). *Riemann Solvers and Numerical Methods for Fluid Dynamics*, 3rd edition.
   Springer.
 - Welford, B. P. (1962). Note on a method for calculating corrected sums of squares and

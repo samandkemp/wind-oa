@@ -33,9 +33,11 @@ static_assert(sizeof(ArrowParams) == 48);
 constexpr float kMarkerColour[4] = {0.25f, 0.85f, 1.0f, 1.0f};
 constexpr float kSurveyColour[4] = {1.0f, 0.55f, 0.20f, 0.9f};
 constexpr float kUpstreamColour[4] = {0.55f, 0.60f, 0.75f, 0.7f};
-constexpr std::uint32_t kMaxMarkers = 32; // segments: wand 4 + planes 8 + probes 12
-constexpr std::int32_t kPerPulse = 200;   // timeline particles per line
-constexpr float kArrowScale = 0.8f;       // freestream arrow / grid spacing
+// segments: wand 4 + planes 8 + probes 12 + rotor blades (4 per blade)
+constexpr std::uint32_t kMaxMarkers = 160;
+constexpr float kBladeColour[4] = {0.95f, 0.95f, 1.0f, 1.0f};
+constexpr std::int32_t kPerPulse = 200; // timeline particles per line
+constexpr float kArrowScale = 0.8f;     // freestream arrow / grid spacing
 
 } // namespace
 
@@ -92,12 +94,26 @@ void Tracers::set_overlay(int x_upstream, int x_survey,
     marker_dirty_ = true;
 }
 
+void Tracers::set_blades(const std::vector<std::array<std::array<float, 3>, 2>>& segments) {
+    if (segments == blades_)
+        return;
+    blades_ = segments;
+    redraw_ = true;
+}
+
+void Tracers::show_wand(bool on) {
+    if (on == show_wand_)
+        return;
+    show_wand_ = on;
+    redraw_ = true;
+}
+
 void Tracers::record(VkCommandBuffer cmd, int slot, int steps, float u_ref, bool smoke,
                      bool streamlines) {
     const std::uint32_t set = std::uint32_t(slot);
     ++frame_;
     Context::barrier_full(cmd); // the previous frame's splats read these buffers
-    if (marker_dirty_) {
+    if (marker_dirty_ || redraw_) {
         // The wand outline, the survey planes and the probe crosses as
         // segments (vkCmdUpdateBuffer keeps the host write ordered with the
         // frames in flight).
@@ -112,8 +128,9 @@ void Tracers::record(VkCommandBuffer cmd, int slot, int steps, float u_ref, bool
             seg({x, y1, z1}, {x, y0, z1}, col);
             seg({x, y0, z1}, {x, y0, z0}, col);
         };
-        rect_x(rake_x_, rake_cy_ - half_y_, rake_cz_ - half_z_, rake_cy_ + half_y_,
-               rake_cz_ + half_z_, kMarkerColour);
+        if (show_wand_)
+            rect_x(rake_x_, rake_cy_ - half_y_, rake_cz_ - half_z_, rake_cy_ + half_y_,
+                   rake_cz_ + half_z_, kMarkerColour);
         const float ny = float(n_[1]), nz = float(n_[2]);
         if (x_upstream_ >= 0)
             rect_x(float(x_upstream_) + 0.5f, 0.5f, 0.5f, ny - 0.5f, nz - 0.5f, kUpstreamColour);
@@ -127,11 +144,16 @@ void Tracers::record(VkCommandBuffer cmd, int slot, int steps, float u_ref, bool
             seg({q[0], q[1] - r, q[2]}, {q[0], q[1] + r, q[2]}, col);
             seg({q[0], q[1], q[2] - r}, {q[0], q[1], q[2] + r}, col);
         }
+        for (const auto& b : blades_)
+            seg(b[0], b[1], kBladeColour);
         marker_count_ = std::uint32_t(std::min<std::size_t>(c.size() / 4, kMaxMarkers));
-        vkCmdUpdateBuffer(cmd, marker_verts_.handle(), 0, marker_count_ * 32, v.data());
-        vkCmdUpdateBuffer(cmd, marker_col_.handle(), 0, marker_count_ * 16, c.data());
-        marker_dirty_ = false;
-        reset_pending_ = true; // the change shows at once, not as particles cycle out
+        if (marker_count_ > 0) { // a zero-byte update is invalid
+            vkCmdUpdateBuffer(cmd, marker_verts_.handle(), 0, marker_count_ * 32, v.data());
+            vkCmdUpdateBuffer(cmd, marker_col_.handle(), 0, marker_count_ * 16, c.data());
+        }
+        if (marker_dirty_)
+            reset_pending_ = true; // the change shows at once, not as particles cycle out
+        marker_dirty_ = redraw_ = false;
     }
     if (smoke && (steps > 0 || reset_pending_)) {
         if (reset_pending_)

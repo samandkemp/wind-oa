@@ -55,13 +55,16 @@ engine/      headless core (static lib windoa_engine); Vulkan::Vulkan only
   include/windoa/mesh.hpp      Mesh, STL I/O, fit_to_box, transform
   include/windoa/voxeliser.hpp Voxeliser (winding fill, thin shell, signed distance)
   include/windoa/isosurface.hpp marching_cubes (CPU; gated by V16)
-  include/windoa/catalogue.hpp the 30 procedural models
+  include/windoa/catalogue.hpp the 30 procedural models (+ spinners, engine
+                               ports, rotors)
+  include/windoa/rotor.hpp     ActuatorLines: rotors as actuator lines (blade
+                               elements -> Gaussian -> the LBM force field)
   include/windoa/tunnel.hpp    Tunnel: the sandbox (everything the app does
                                that is not UI) + TunnelSettings (tunables)
   include/windoa/convergence.hpp, flow_cache.hpp  settling detector, cache
   include/windoa/flow_stats.hpp FlowStats (GPU time averages), wake survey
   include/windoa/spectrum.hpp   spectrum (uneven samples -> Hann -> FFT)
-  shaders/                     lbm_*, vox_*, euler_*, dye_*, turb_* + includes
+  shaders/                     lbm_*, vox_*, euler_*, dye_*, turb_*, alm_* + includes
 render/      VolumeRenderer (march, Q cores, dye, surface paints incl. oil-flow
              LIC, slice LIC, mean reversed-flow shells, splats) + Tracers
              (smoke / timelines, streamlines, slice arrows, markers), reading
@@ -71,12 +74,13 @@ app/         Win32 + Dear ImGui app: App (panels incl. Analysis), SimWorker (Tun
 third_party/ imgui (v1.92.9b-docking, vendored unmodified; VERSION.md)
 tools/       device_info, compute_selftest, lbm_run, tunnel_run, euler_run,
              bench, lbm_equiv
-validation/  gates V1-V26 (one exe each, CTest label "gate", "long" for
+validation/  gates V1-V31 (one exe each, CTest label "gate", "long" for
              the > 1 min ones); gate.hpp = ledger + numerics, cases.hpp +
              euler_cases.hpp = setups shared by several gates
 docs/        public, in three tiers under README.md (tier 1): GUIDE.md (use it),
              MODEL.md (understand it), REFERENCE.md (lookup) = tier 2;
              THEORY.md (the spec, sections N.M), VALIDATION.md (gates) = tier 3.
+             images/ = the README gallery (GUIDE 3.7 regenerates it).
              Local, gitignored: PLAN.md, PROGRESS.md, TRANSITION.md
 ```
 
@@ -118,12 +122,14 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
 - Configure + build: `cmake --preset dev` then `cmake --build --preset dev`
   (RelWithDebInfo; `--build --preset debug` / `release` for the others).
   Any prompt: the VS generator finds MSVC itself.
-- Gates: `ctest --preset dev` (everything, ~13 min), `ctest --preset quick`
-  (skips label `long`, ~80 s), `ctest --preset dev -R V17` (one gate).
+- Gates: `ctest --preset dev` (everything, ~19 min), `ctest --preset quick`
+  (skips label `long`, ~105 s), `ctest --preset dev -R V17` (one gate).
 - GPU report: `build\tools\RelWithDebInfo\device_info`
 - App: `build\app\RelWithDebInfo\windoa_app [fast|balanced|fine] [transonic]`
   (finds the repo root itself); scripted: `--show / --field / --warmup /
-  --frames / --shot` (app/src/main.cpp). Dev tools: `tunnel_run`,
+  --frames / --shot / --zoom / --view / --mach` (app/src/main.cpp; the
+  README gallery commands are in GUIDE 3.7). Every exe prints its usage
+  with `--help`; `tunnel_run --list` gives the model IDs. Dev tools: `tunnel_run`,
   `euler_run`, `bench`. clang-format: the VS Code C++ extension's
   (`%USERPROFILE%\.vscode\extensions\ms-vscode.cpptools-*\LLVM\bin`).
 - Validation layers: `cmake --preset validation-layers` then
@@ -139,16 +145,21 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
 - Closed domains leak mass: `enforce_mass()` (uniform rescale) is needed for
   the cavity to pass.
 - Moving walls: spin cap 0.08 lattice; thin rotor blades 0.025 (0.04
-  diverged). Stability tests need a 3-D body -- a periodic slab is 2-D
+  diverged) -- why rotors are now actuator lines (a turbine's tip runs at
+  7 U). Stability tests need a 3-D body -- a periodic slab is 2-D
   turbulence and goes NaN at U 0.11 regardless.
 - A new body / big placement change restarts from rest with the inlet ramp
   (an impulsive start reaches |u| 0.31).
 - Ahmed Cd plateaus ~1.14 vs 0.285 experimental: Re + blockage, NOT a
   solver defect. (That is V15's setup -- 256x128x128, L 100, regularised,
-  Re 7,500; the app's fast preset, L 64 + sponge, reads ~0.72: a different
-  configuration.) The sphere error budget: blockage ~3.8 pts, streamwise
-  confinement ~1.2, wall placement ~0.6. Boundary-layer resolution is NOT
-  the cause -- do not cite it to motivate grid refinement.
+  Re 7,500; the app's fast preset, L 64 + sponge, reads ~0.68 with sub-cell
+  walls, ~0.72 half-way: a different configuration.) The sphere error
+  budget: blockage ~3.8 pts, streamwise confinement ~1.2, and the half-way
+  staircase ~4 - 6 (V9 B 7.5 % -> 3.2 % with IBB; V28 B half-way 6 % above
+  exact walls at D 16). The old "wall placement ~0.6" came from V9 B's
+  fractions sitting half a cell off its flags (add_sphere tests indices,
+  the fractions centres) -- fixed 2026-10-04. Boundary-layer resolution is
+  NOT the cause -- do not cite it to motivate grid refinement.
 - Voxeliser: nonzero WINDING rule (not parity), 2-of-3 axis vote, plus a
   thin-feature supercover shell kept only where the far side of the sheet is
   within 1.5 cells or no solid is near. Four simpler thin rules were REFUTED.
@@ -171,6 +182,37 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
 - Perfectly reflecting side walls ring: transverse acoustic modes at
   n c_s / (2 n_y) (333 steps on the fast grid) show in every spectrum.
   The shedding St is the strongest peak below 0.8 of the first mode.
+- Euler force fallback (no usable image point): the mirror Riemann
+  problem keeps the grid's orientation -- solid on the RIGHT of a +e face,
+  the LEFT of a -e face. Posed the other way an expansion reads as a
+  compression; a section and its mirror carried lift 7 % apart. V27 (a).
+- The Euler voxel wall develops too little circulation, erratically with
+  resolution (Mach 0.5 lift slope 5.46 / 7.05 / 5.41 per rad at 64 / 96 /
+  128 cells a chord, vs 7.26). The deficit is in the FLOW (Kutta-Joukowski
+  matches the surface lift) and sits aft: x_ac reads 0.16 - 0.23 c, so the
+  transonic Cm is qualitative. Open: the trailing-edge / Kutta behaviour.
+- f16 dye storage (binary16 of g) was measured (+13 % with dye) and
+  REJECTED: it fails V20 (5.7 % extra streamwise spread at tau 0.53, 2.3 %
+  mass drift); unlike f - w, the dye has no rest value to subtract.
+- Interpolated bounce-back is not mass-conserving: the body became a mass
+  source (V25 B flux 5.3e-4). Each link's excess over its half-way value
+  comes out of the rest population (no momentum): 3.8e-5. Moving-wall
+  terms are compared WHOLE, so a port face still passes exactly u_w per
+  face cell. Link byte 128 = exactly q 0.5 (a sentinel: default = half-way
+  to the bit).
+- Link fractions: first mesh crossing along the link (exact); the signed
+  distance only where no triangle is crossed (sub-cell sheets). The SDF
+  alone, linear along a link that grazes a curved surface, read RMS 0.053
+  of a link on a fine sphere vs 0.003 (V28 A).
+- Rotors (actuator lines): without Prandtl tip loss the turbine's C_P
+  passed Betz. A closed tunnel inflates C_P past Betz above ~5 % swept
+  area, and the disc's induction falls short of C_T / 4 with blockage
+  (2.0 % at 1.2 %, 4.9 % at 4.9 %); the loaded disc's induction is not
+  uniform, so 1-D momentum theory at C_T 0.5 is reported, not gated.
+- The wake survey in a fixed-ground run includes the floor's friction
+  (V31 B read 40 % off): survey-vs-balance checks belong in free air.
+- Bluff catalogue shapes blocking > ~15 % of the section diverged at
+  U 0.11 (with half-way walls too): sphere 0.15, cube 0.12, capsule 0.15.
 
 ## Engineering rules (add as they are learned)
 
@@ -215,6 +257,18 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
   bias: the slice registers its hit a little in front of the plane.
 - FlowStats stores rho - 1, and plane sums add the 1 in double: f32 rho
   rounds away the 1e-4 deviations a momentum balance needs.
+- An uncapped window (--no-vsync, ~900 fps) starves the solver's queue
+  (3,040 -> 1,280 MLUPS): the app caps it at kMaxFps 240. Windows Sleep(1)
+  lasts a whole 15.6 ms tick, so the cap waits on a high-resolution
+  waitable timer.
+- Debug + validation layers: P2_catalogue crashed twice at exit
+  (0xC0000005, no output) right after a rebuild, then passed 30 runs.
+  Unexplained; tunnel_run now prints unbuffered, so a repeat shows where.
+- Actuator-line forces are spread into ONE box round every rotor, summing
+  all elements: per-rotor boxes, each written in turn, overwrote a
+  neighbour's force where the boxes overlapped (the quadcopter), in an
+  undefined order. Sync validation did not flag it -- it was found by
+  reading. Validation layers see API misuse, not every data race.
 - Shell: Bash heredocs collapse doubled backslashes (a `\\n` inside a
   Python string arrives as a newline), so edits touching backslashes go
   through the editor tools or a Python script written with the Write tool.
@@ -273,3 +327,24 @@ handover; read it first in a new session) and `docs/PROGRESS.md` (the log).
   survey exposed the free-slip mass defect (owner: fix it); results
   re-measured, build\p4_orig regenerated. Gates V24 - V26: 26 gates.
   Open: gating f16.
+- 2026-10-03, polish + transonic moment + performance (owner chose these;
+  f16 stays opt-in and ungated; MIT licence): panels kept on screen (a
+  layout that does not fit resets; View > reset layout), label column;
+  --help and argument checks on every exe, tunnel_run --list, app --view /
+  --mach and clean-shot tokens; PNG deflate (5.8 MB -> 0.2 - 0.5 MB);
+  README gallery (docs/images); validation layers + sync validation clean
+  on every new kernel; transonic Cm (euler::Solver::body_loads, THEORY
+  8.11) and V27 (antisymmetry, transfer, Kutta-Joukowski), which found the
+  force fallback's orientation bug; the circulation deficit documented;
+  no-vsync frame cap; f16 dye rejected. 27 gates.
+- 2026-10-04, model fidelity + powered models (owner chose: jets and
+  intakes, rotors as actuator lines, sharper walls + finer grid, a full
+  geometry pass on all 30): sub-cell walls on by default (mesh-crossing
+  link fractions, mass-conserving IBB, moving term over 2q); ultra preset
+  512 x 192 x 192; engine ports (LBM: moving-wall velocity boundary,
+  jet-speed cap 0.12; Euler: prescribed exit state, thrust in the force);
+  rotors as actuator lines (rotor.hpp, alm_*.comp, Guo force field behind
+  a spec constant); every catalogue model detailed, blades replaced by
+  actuator lines. Gates V28 (walls), V29 (LBM jets), V30 (Mach disc),
+  V31 (actuator disc + turbine): 31 gates. NOT committed (nor is the
+  2026-10-03 polish session).

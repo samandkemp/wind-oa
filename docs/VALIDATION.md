@@ -1,7 +1,7 @@
 # Validation
 
 Every model in wind-oa ships with a **gate**: an executable that checks it against an external
-reference and exits non-zero if it misses. There are 26 of them, V1 - V26, and they are the backbone
+reference and exits non-zero if it misses. There are 31 of them, V1 - V31, and they are the backbone
 of the project: they are the evidence that the solvers compute the right physics, not merely
 plausible pictures.
 
@@ -42,8 +42,8 @@ away.
 ## Running them
 
 ```
-ctest --preset dev                 # every gate and the smoke checks (about 13 minutes)
-ctest --preset quick               # skip the gates labelled long (about 80 s)
+ctest --preset dev                 # every gate and the smoke checks (about 19 minutes)
+ctest --preset quick               # skip the gates labelled long (about 105 s)
 ctest --preset dev -L gate         # the gates only
 ctest --preset dev -R V17          # one gate
 ```
@@ -71,8 +71,11 @@ last printed it.
 |---|---|---|---|
 | V2 | The open tunnel holds its density and conserves mass locally; the anchor pins it and leaves u exact | Drift < 1e-8 per step; the mass flux through every x-face equal to 1e-4; u bit-identical | Drift +2.7e-10 per step; face mass flux spread 4.2e-5; u unchanged |
 | V8 | Moving walls produce the Magnus force | Sign, monotonic growth, 1.5 < abs(Cl) < 9 at spin ratio 2 | Cl -2.78 / -5.59 at ratios 1 / 2 |
-| V9 | Interpolated bounce-back places the wall at fraction q | Shifted-wall Poiseuille, u_max within 1.5 % | 0.16 - 0.70 %; sphere Cd 1.171 -> 1.165 with IBB |
-| V10 | The sponge absorbs sound without changing the answer | Reflection < 0.05; Ahmed Cd within 1 % | R 0.687 -> 0.010; Cd +0.20 %, force noise down 8x |
+| V9 | Interpolated bounce-back places the wall at fraction q | Shifted-wall Poiseuille, u_max within 1.5 % | 0.15 - 0.70 %; informational: sphere Cd 1.171 half-way -> 1.125 interpolated (error 7.5 % -> 3.2 %) |
+| V10 | The sponge absorbs sound without changing the answer | Reflection < 0.05; Ahmed Cd within 1 % | R 0.687 -> 0.010; Cd +0.03 %, force noise down 4x |
+| V28 | A mesh's link fractions place its wall at the surface (§3.6), and the sandbox runs on them | Ray intersection with the true sphere, RMS within 0.01 of a link and worst within 0.05; the true sphere's drag within 0.5 %; 8,000 healthy steps at U 0.11 for six thin-featured models | RMS 0.0030, worst 0.016 (the signed distance alone: 0.036, 0.176); Cd within 0.23 %, half-way 6.0 % higher; all six healthy, max abs(u) 0.20 - 0.28 |
+| V29 | An engine port injects the mass it prescribes, and the body feels the jet (§3.11) | The injection within 1 %; the momentum balance within 2 % for an exhaust, an intake and the control; in the app's tunnel, the survey within 2 % and the mass gained within 5 % | Mass 0.11 % (exhaust), 0.22 % (intake); force 0.04 % in all three; app survey 0.14 %, mass 1.4 % |
+| V31 | Rotors as actuator lines obey momentum theory and load the air as the balance requires (§3.12) | Linear theory, a = C_T / 4 within 3 %; the thrust against the momentum deficit within 2 %; the app's turbine: survey within 3 %, 0 < C_P < 16/27, healthy at U 0.11 | a 2.0 % below C_T / 4; deficit 1.07 % below the thrust; survey 0.98 %, C_T 0.824, C_P 0.565; healthy. Measured, not gated: at C_T 0.5 the induction 8.0 % below 1-D theory |
 
 ### §4 Forces and coefficients
 
@@ -94,7 +97,7 @@ last printed it.
 
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
-| V20 | Dye advects at U, spreads with D = (tau - 1/2)/4, never leaks, stays bounded | The analytic Gaussian blob; exact zero beyond a wall; 0 <= C <= 1.1 | Variance within 0.9 %, mass 0.04 %; leak exactly 0; C <= 1.060 |
+| V20 | Dye advects at U, spreads with D = (tau - 1/2)/4, never leaks, stays bounded | The analytic Gaussian blob; exact zero beyond a wall; 0 <= C <= 1.1 | Variance within 0.9 %, mass 0.04 %; leak exactly 0; C <= 1.070 |
 | V21 | Inlet turbulence is solenoidal, at the requested intensity, and quiet | Closed form; the request within 25 %; non-solenoidal noise | Divergence 4e-8; Tu 1.75 % for 2 %; one fifth of the noise's sound |
 
 ### §8 The compressible Euler solver
@@ -104,13 +107,15 @@ last printed it.
 | V17 | Shock tube: all three wave families | The exact Riemann solution | L1 0.28 %, shock on the exact cell, symmetric |
 | V18 | Mach 2 over a 15 degree voxel wedge | theta-beta-M | Shock 45.50 against 45.34 degrees; wall pressure exact |
 | V19 | NACA 0012 at Mach 0.8, alpha 1.25 degrees | AGARD-AR-211 bands | Cl 0.291, Cd 0.0147, upper shock 0.64c |
+| V27 | Lift and pitching moment of a NACA 0012 at Mach 0.5, alpha +-2 degrees (§8.11) | Mirror antisymmetry; the moment transfer to the leading edge; Kutta-Joukowski within 5 % | Sums 1.5e-6 / 7e-7; transfer exact to 8e-9; circulation lift 2.9 % below the surface lift. Measured, not gated: the aerodynamic centre at 0.225 c (§8.9) |
+| V30 | An under-expanded sonic jet places its Mach disc (§8.12) | Ashkenas and Sherman, x_M / D = 0.67 sqrt(p0 / p_a), within 10 % at p0 / p_a = 20 and 40; peak axial Mach above 3 | 2.92 D vs 3.00 (2.4 %); 4.12 D vs 4.24 (2.7 %); peak Mach 4.7 and 5.7 |
 
 ### §9 The sandbox loop
 
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
 | V11 | The guard sees a blow-up; spin at the cap is stable; long windows are exact | Poisoned fields; 8,000 healthy steps; a double-precision sum | All detected; healthy at U 0.05 and 0.11; window exact to 5e-7 |
-| V22 | The settling detector is right on synthetic and real signals | Five synthetic invariants; the long-run mean within 2 % | All five; cold start settles within 1.4 %, warm restart within 0.2 % |
+| V22 | The settling detector is right on synthetic and real signals | Five synthetic invariants; the long-run mean within 2 % | All five; cold start settles within 0.4 %, warm restart within 0.3 % |
 | V23 | A restored flow is the settled flow | A never-restored control | Means identical to 0.00 %, frames within 0.1 % |
 
 ### §10 What the renderer derives
@@ -124,14 +129,13 @@ last printed it.
 | Gate | Property | Checked against | Result |
 |---|---|---|---|
 | V24 | Time averages are exact, and the mean vortex street has its published structure | A double-precision host accumulation; a steady flow's identity; the symmetric mean wake, v_rms peaking on the centreline and u_rms off it | Accumulator within 2.7e-8; mean = instantaneous to the f32 floor; mean wake symmetric to 1e-4 U (instantaneous 1.9 U); u_rms peaks 0.82 D off the centreline |
-| V25 | The wake survey recovers the drag | The force balance over the same window: steady sphere within 1 %, the app's tunnel within 2 % | 0.34 % and 0.56 % at two planes; 0.52 % on the app's Ahmed body; mass flux equal to 7e-5 |
+| V25 | The wake survey recovers the drag | The force balance over the same window: steady sphere within 1 %, the app's tunnel within 2 % | 0.34 % and 0.56 % at two planes; 0.60 % on the app's Ahmed body; mass flux equal to 4e-5 |
 | V26 | Spectra find frequencies, the shedding Strouhal number and the acoustic modes | Tones at uneven sampling; St 0.196 at Re 200; v at f and u at 2f on the centreline; c_s / (2 n_y) for a standing sound wave | Tones within 0.08 %; St 0.212 (zero crossings 0.212); probes exact to 0.03 %; sound wave within 0.01 % |
 
 ## Where they live, and why there
 
 Each gate is one executable under `validation/`, registered with CTest by `windoa_gate(...)` in
-`validation/CMakeLists.txt`, with the label `gate` (and `long` for the twelve that take over a
-minute). Gates use only the engine's public headers: they exercise exactly the API the app uses,
+`validation/CMakeLists.txt`, with the label `gate` (and `long` for the sixteen slow ones). Gates use only the engine's public headers: they exercise exactly the API the app uses,
 including `solver_config(TunnelSettings)` where a gate claims to test what the app runs.
 
 - `validation/gate.hpp` is the shared harness: the pass / fail ledger and the small numerics the
@@ -164,13 +168,23 @@ diagnosable.
   is protected is that the performance work does not change the physics: `P4_equiv` and the
   Euler baseline check it bit for bit (§11.5).
 - **The interactive UI.** Its numbers come from the same `Tunnel` the gates drive.
+- **A heavily loaded rotor against one-dimensional momentum theory.** At $C_T = 0.5$ the actuator
+  disc's induction reads 8 % below $(1 - \sqrt{1 - C_T})/2$. The theory's relations hold for
+  averages over the disc and the stream tube; a disc in a viscous stream slows the air least at its
+  centre, and the comparison depends on how the average is taken, so it is reported rather than
+  gated (§3.12). The thrust itself is gated against the momentum the air gains.
+- **An exhaust plume beyond its Mach disc.** The inviscid solver holds the plume's shear layer by
+  numerical diffusion, so its spreading and the decay of its shock cells are not predicted (§8.12).
+- **The catalogue's geometric detail.** The models are stylised; `P2_catalogue` checks that every
+  one voxelises inside the tunnel, and V28 that the thin-featured ones run at top speed.
 
 ### The two worth singling out
 
 - **Half-precision storage.** It is an approximation, not an identity, and every gate runs f32. Its
-  effect on the Ahmed body is measured ([`docs/GUIDE.md`](GUIDE.md#10-a-worked-study-end-to-end)),
-  but it is not gated, which is the main reason it stays opt-in. Gating it would mean running the
-  ladder a second time with f16 storage.
+  effect on the Ahmed body is measured ([`docs/GUIDE.md`](GUIDE.md#10-a-worked-study-end-to-end)):
+  a third faster per step, but slower to a given confidence in a mean, with a spurious lift peak.
+  It therefore stays opt-in and ungated, a tool for pictures rather than numbers. Gating it would
+  mean running the ladder a second time with f16 storage.
 - **Three-dimensional transonic bodies.** The compressible solver is gated on a shock tube, a
   two-dimensional wedge and a two-dimensional aerofoil. A 3-D body at Mach 0.8 runs (a sphere
   briefly reaches a local Mach of about 2.2 early in its impulsive start), but no external reference

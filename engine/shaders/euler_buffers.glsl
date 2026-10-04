@@ -12,6 +12,7 @@ layout(std430, binding = 8) buffer BDt { vec4 dtbuf; };      // dt, time, -, -
 layout(std430, binding = 9) buffer BPart { vec4 partials[]; };  // per-workgroup reductions
 layout(std430, binding = 10) buffer BMacro { vec4 macro[]; };   // renderer: u.xyz, p
 layout(std430, binding = 11) buffer BRho { float rho_out[]; };  // renderer: rho
+layout(std430, binding = 12) readonly buffer BPorts { float port_w[]; };  // 5 per port: rho, u, v, w, p
 
 S load_u(uint c) { return S(vec4(U[5 * c], U[5 * c + 1], U[5 * c + 2], U[5 * c + 3]), U[5 * c + 4]); }
 S load_u0(uint c) { return S(vec4(U0[5 * c], U0[5 * c + 1], U0[5 * c + 2], U0[5 * c + 3]), U0[5 * c + 4]); }

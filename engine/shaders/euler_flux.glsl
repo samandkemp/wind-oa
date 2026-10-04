@@ -2,7 +2,13 @@
 // Include after euler_common.glsl and euler_buffers.glsl.
 
 bool solid(ivec3 c) { return in_grid(c) && flags[cidx(c)] != FLUID; }
-bool model_cell(ivec3 c) { return in_grid(c) && flags[cidx(c)] == OBSTACLE; }
+bool is_port(ivec3 c) { return in_grid(c) && flags[cidx(c)] >= PORT0; }
+// the model: its walls and its engine ports (whose momentum flux it feels)
+bool model_cell(ivec3 c) { return in_grid(c) && (flags[cidx(c)] == OBSTACLE || is_port(c)); }
+S port_state(ivec3 c) {
+    const uint k = 5u * (flags[cidx(c)] - PORT0);
+    return S(vec4(port_w[k], port_w[k + 1u], port_w[k + 2u], port_w[k + 3u]), port_w[k + 4u]);
+}
 
 // Primitive state at cell c, which may lie outside the grid: the domain
 // boundary conditions live here, as ghost states.
@@ -129,7 +135,9 @@ bool image_used(ivec3 cf, ivec3 cs) {
 
 // The state in solid cell cs for a face whose fluid side is cf (state wf):
 // the image ghost if usable, else the impermeable grid-axis mirror.
+// An engine port's face emits the port's exit state.
 S wall_state(S wf, ivec3 cf, ivec3 cs, int ax) {
+    if (is_port(cs)) return port_state(cs);
     return image_used(cf, cs) ? load_gs(cidx(cs)) : mirror(wf, ax);
 }
 

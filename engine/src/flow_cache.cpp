@@ -90,6 +90,8 @@ FlowCache::load(const std::string& key) {
 
 double FlowCache::save(const std::string& key, std::span<const float> f, const Meta& meta) {
     const auto t0 = std::chrono::steady_clock::now();
+    if (8 + sizeof(std::uint64_t) + sizeof(Meta) + 2 * f.size() > budget_bytes_)
+        return -1.0;
     const std::size_t cells = f.size() / kQ;
     std::vector<std::uint16_t> h(f.size());
     for (int i = 0; i < kQ; ++i)

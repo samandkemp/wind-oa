@@ -41,8 +41,13 @@ struct Options {
     std::string show;       // e.g. "q,dye,lines,nosmoke,slice" (tests / screenshots)
     std::string field;      // speed|pressure|vorticity|vortx|mach|schlieren|mean|turb
     float spin = -1.0f;     // >= 0: spin on at this ratio
+    float power = -1.0f;    // >= 0: engines on at this throttle
+    float rotors = -1.0f;   // >= 0: rotors turning at this tip-speed ratio
     float aoa = 0.0f;
-    float zoom = 0.0f; // > 0: camera distance x zoom, aimed at the model
+    float size = 0.0f;                        // > 0: the model's longest axis, cells
+    float mach = 0.0f;                        // > 0: transonic Mach number at start
+    float zoom = 0.0f;                        // > 0: camera distance x zoom, aimed at the model
+    std::optional<std::array<float, 2>> view; // camera azimuth, elevation (degrees)
 };
 
 // One model the menu can load: a catalogue entry or an STL in ./models.
@@ -68,6 +73,9 @@ class App {
     void panel_view(const TunnelStatus& st);
     void panel_compare(const TunnelStatus& st);
     void panel_analysis(const TunnelStatus& st);
+    bool begin_panel(const char* name, float x, float y, float w, float h);
+    void end_panel();
+    float plot_strip_height() const;
     void post_probes();
     void legends(const TunnelStatus& st);
     void plot_strip(const TunnelStatus& st);
@@ -104,6 +112,10 @@ class App {
     float turb_pct_ = 0.0f;
     bool spin_on_ = false;
     float spin_ratio_ = 1.0f;
+    bool power_on_ = false;
+    float throttle_ = 1.0f;
+    bool rotors_on_ = false;
+    float rotor_tsr_ = 6.0f;
     int area_mode_ = 0;
     float a_manual_ = 100.0f;
     float sim_rate_cap_ = 0.0f; // steps / s, 0 = flat out
@@ -120,6 +132,8 @@ class App {
     bool show_smoke_ = true, show_streamlines_ = false, show_plots_ = true, show_ui_ = true;
     bool show_dye_ = false;
     bool show_help_ = false;
+    bool reset_layout_ = false;      // one frame: every panel back to its initial place
+    bool want_reset_layout_ = false; // reset next frame (the button, or a misfit)
     std::string title_;
     float smoke_radius_ = 0.16f;
     bool rake_track_ = true, rake_autofit_ = false;
@@ -158,6 +172,7 @@ class App {
 
     // timing
     VkQueryPool queries_ = VK_NULL_HANDLE;
+    HANDLE frame_timer_ = nullptr; // --no-vsync frame cap
     double tick_ms_ = 1e-6;
     bool slot_written_[kFramesInFlight] = {};
     double render_gpu_ms_ = 0.0, frame_ms_ = 0.0;

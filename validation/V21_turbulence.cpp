@@ -100,7 +100,7 @@ double rms_div(const std::vector<float>& f, int S, int NY, int NZ) {
 
 double ahmed_cd(Context& ctx, const TunnelSettings& t, const cases::app::Placed& p, float tu) {
     lbm::Solver s(ctx, solver_config(t));
-    s.set_flags(p.flags);
+    cases::app::place(s, p);
     if (tu > 0)
         s.set_inlet_turbulence(tu, 8.0f);
     s.init_equilibrium(1.0f, {0.0f, 0.0f, 0.0f});

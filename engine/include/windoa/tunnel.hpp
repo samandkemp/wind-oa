@@ -33,6 +33,7 @@
 #include "windoa/flow_stats.hpp"
 #include "windoa/lbm.hpp"
 #include "windoa/mesh.hpp"
+#include "windoa/rotor.hpp"
 #include "windoa/spectrum.hpp"
 #include "windoa/voxeliser.hpp"
 
@@ -45,8 +46,11 @@ struct TunnelSettings {
     float smagorinsky_cs = 0.1f;
     bool regularised = true;
     bool recursive = false; // RR: validated (V5), opt-in
-    float u_inlet = 0.05f;  // startup command
-    float u_max = 0.11f;    // Ma = u sqrt(3) stays under ~0.19
+    // Sub-cell walls: interpolated bounce-back with link fractions from the
+    // body's exact signed distance (THEORY 3.6; V28). Off = half-way.
+    bool sub_cell_walls = true;
+    float u_inlet = 0.05f; // startup command
+    float u_max = 0.11f;   // Ma = u sqrt(3) stays under ~0.19
     // Inlet slew limit, per step because the worker steps in batches of
     // varying size: 1e-4 (0.0015 per 15 steps).
     float u_slew_per_step = 1.0e-4f;
@@ -55,6 +59,11 @@ struct TunnelSettings {
     // Fastest a spinning surface may move: the moving-wall term destabilises
     // near 0.10-0.12 (impulsive 0.13+ went NaN within 1,000 steps).
     float max_wall_speed = 0.08f;
+    // Fastest an engine port's face may blow or draw (THEORY 3.11; V29).
+    float max_jet_speed = 0.12f;
+    // Actuator lines: the width of the Gaussian that smears a blade's force
+    // onto the grid, cells (THEORY 3.12; V31).
+    float alm_eps = 2.0f;
     // Guard: blown up above this |u| (sound speed 0.577; stable 3-D < ~0.3).
     float diverge_speed = 0.5f;
     int outlet_sponge = 24; // reflection 0.68 -> 0.01, Cd +0.2 % (V10)
@@ -84,7 +93,8 @@ struct TunnelSettings {
 // solver. u_inlet 0 (ramped).
 lbm::Config solver_config(const TunnelSettings& s);
 
-// Grid presets: fast 256x96x96, balanced 320x128x128, fine 384x160x160.
+// Grid presets: fast 256x96x96, balanced 320x128x128, fine 384x160x160,
+// ultra 512x192x192 (headless studies).
 // Unknown names give fast.
 TunnelSettings tunnel_preset(const std::string& name);
 
@@ -94,9 +104,14 @@ struct Model {
     std::string label;
     geometry::Mesh mesh;
     std::vector<catalogue::Spinner> spinners;
+    std::vector<catalogue::Port> ports;
+    std::vector<catalogue::Rotor> rotors;
     std::string hash; // content hash of the mesh (flow-cache key)
 };
 Model model_from_catalogue(const catalogue::Entry& e);
+// The box a model is fitted by: its mesh and its rotors' swept discs.
+geometry::Bounds model_bounds(const geometry::Mesh& mesh,
+                              const std::vector<catalogue::Rotor>& rotors);
 Model model_from_stl(const std::filesystem::path& path);
 
 struct Placement {
@@ -179,6 +194,16 @@ struct TunnelStatus {
     float ext_y_half = 8.0f, ext_z_half = 8.0f;
     bool has_spinners = false;
     float spin_scale = 1.0f;
+    bool has_ports = false, power_on = false;
+    float jet_scale = 1.0f; // < 1: the ports are limited by max_jet_speed
+    // Rotors (actuator lines): turning or parked, the tip-speed ratio, and
+    // their thrust and power coefficients over the swept area (EMA; power > 0:
+    // the flow drives them), the blade outlines now (drawing).
+    bool has_rotors = false, rotors_turning = false;
+    float rotor_tsr = 0.0f;
+    double rotor_ct = 0.0, rotor_cp = 0.0;
+    double rotor_blockage = 0.0; // swept area projected on the stream, over the section
+    std::vector<std::array<std::array<float, 3>, 2>> rotor_segments;
     std::string cache_note;
     int cache_entries = 0;
     float inlet_turbulence_pct = 0.0f;
@@ -222,6 +247,10 @@ class Tunnel {
     // -- operating point -----------------------------------------------------
     void set_speed(float u_command);
     void set_spin(bool on, float ratio);
+    // Engines on / off; throttle scales every port's speed ratio (0 - 3).
+    void set_power(bool on, float throttle);
+    // Rotors turning at tip-speed ratio tsr (omega R / U), or parked.
+    void set_rotors(bool turning, float tsr);
     void set_turbulence(float percent);
     void set_area_mode(AreaMode m, double manual = -1.0);
     void set_dye(bool on);
@@ -279,7 +308,9 @@ class Tunnel {
     void advance_transonic(int steps);
     void restart_transonic(const std::string& why);
     void begin_operating_point(const std::string& reason);
-    void apply_spin();
+    void apply_moving_walls();
+    void build_rotors();
+    void rotor_speeds();
     void diverged(float umax, int n_bad);
     void maybe_save_settled_flow();
     void build_dye_nozzles();
@@ -294,6 +325,10 @@ class Tunnel {
     std::unique_ptr<lbm::Solver> solver_;
     std::unique_ptr<Voxeliser> vox_;
     std::unique_ptr<Dye> dye_;
+    std::unique_ptr<ActuatorLines> alm_; // the model's rotors (after the solver: goes first)
+    bool rotors_turning_ = false;
+    float rotor_tsr_ = -1.0f; // < 0: each rotor's design ratio
+    double rotor_thrust_ema_ = 0.0, rotor_power_ema_ = 0.0, rotor_fx_ = 0.0;
     FlowCache cache_;
     ConvergenceMonitor develop_;
 
@@ -324,6 +359,8 @@ class Tunnel {
     // spin
     bool spin_on_ = false;
     float spin_ratio_ = 1.0f, spin_scale_ = 1.0f;
+    bool power_on_ = false;
+    float throttle_ = 1.0f, jet_scale_ = 1.0f;
 
     // turbulence, dye
     float turb_pct_ = 0.0f;
@@ -367,7 +404,7 @@ class Tunnel {
     bool transonic_ = false;
     bool euler_stale_ = true; // the model changed since the Euler grid was built
     float mach_command_ = 0.8f, mach_applied_ = 0.8f, peak_mach_ = 0.0f;
-    std::array<double, 3> euler_force_ema_{};
+    std::array<double, 3> euler_force_ema_{}, euler_moment_ema_{};
     double euler_time0_ = 0.0, euler_time_ = 0.0;
 };
 

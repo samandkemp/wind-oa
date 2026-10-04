@@ -46,7 +46,9 @@ class FlowCache {
 
     // f32 distributions [Q][cells] + metadata, or nothing.
     std::optional<std::pair<std::vector<float>, Meta>> load(const std::string& key);
-    double save(const std::string& key, std::span<const float> f, const Meta& meta); // seconds
+    // Seconds taken; -1 (nothing written) for an entry larger than the whole
+    // budget, which would otherwise evict every entry, itself included.
+    double save(const std::string& key, std::span<const float> f, const Meta& meta);
 
     int entries() const;
     double usage_mb() const;

@@ -92,6 +92,9 @@ CdStats ahmed(Context& ctx, const TunnelSettings& ts, int sponge) {
     std::vector<std::uint8_t> flags(s.cells(), lbm::FLUID);
     vox.voxelise(mesh, flags);
     s.set_flags(flags);
+    if (t.sub_cell_walls) // the app's walls
+        s.set_link_q(
+            shapes::link_fractions(flags, vox.signed_distance(flags), t.nx, t.ny, t.nz, &mesh));
     int area = 0; // frontal: OBSTACLE anywhere along x
     for (int y = 0; y < t.ny; ++y)
         for (int z = 0; z < t.nz; ++z)

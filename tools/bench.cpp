@@ -1,8 +1,7 @@
 // Throughput benchmark (a measurement, not a gate): the LBM at each grid
 // preset -- plain, with the app's moving boundaries, with dye -- and the
-// Euler solver. The baseline for performance work.
-//
-//   bench [fast|balanced|fine|all] [--steps N]
+// Euler solver. The baseline for performance work. kUsage below is the
+// reference for the command line.
 //
 // Timing: steps submitted in 128-step batches after a warm-up, wall clock
 // around blocking submits (so it includes submit overhead, like the app).
@@ -84,6 +83,15 @@ double euler_mcells(Context& ctx, const TunnelSettings& t, int steps) {
 
 } // namespace
 
+const char* const kUsage =
+    R"(usage: bench [fast|balanced|fine|ultra|all] [--steps N]
+
+  fast|balanced|fine|ultra|all
+                           the preset to measure (default all: every one but ultra)
+  --steps N                LBM steps per measurement (default 1000; Euler a quarter)
+  -h, --help               this text
+)";
+
 int main(int argc, char** argv) {
     std::string which = "all";
     int steps = 1000;
@@ -91,8 +99,15 @@ int main(int argc, char** argv) {
         const std::string s = argv[a];
         if (s == "--steps" && a + 1 < argc)
             steps = std::atoi(argv[++a]);
-        else
+        else if (s == "fast" || s == "balanced" || s == "fine" || s == "ultra" || s == "all")
             which = s;
+        else if (s == "-h" || s == "--help") {
+            std::fputs(kUsage, stdout);
+            return 0;
+        } else {
+            std::fprintf(stderr, "unknown argument: %s\n\n%s", s.c_str(), kUsage);
+            return 2;
+        }
     }
     try {
         Context ctx;
@@ -101,8 +116,8 @@ int main(int argc, char** argv) {
                     "+dye", "f16", "Euler");
         std::printf("%-9s %8s  %9s %9s %9s %9s  %11s\n", "", "", "MLUPS", "MLUPS", "MLUPS", "MLUPS",
                     "Mcell-st/s");
-        for (const char* p : {"fast", "balanced", "fine"}) {
-            if (which != "all" && which != p)
+        for (const char* p : {"fast", "balanced", "fine", "ultra"}) {
+            if (which != p && (which != "all" || std::string(p) == "ultra"))
                 continue;
             const TunnelSettings t = tunnel_preset(p);
             const double cells = double(t.nx) * t.ny * t.nz / 1e6;

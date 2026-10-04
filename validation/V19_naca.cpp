@@ -21,54 +21,9 @@ int main() {
         const double MC = 0.8, AL = 1.25 * kDeg, CH = 128.0;
         constexpr int NX = 1536, NY = 1152, NZ = 2;
         const double PX = 0.35 * NX, PY = 0.5 * NY; // pivot = quarter chord
-        auto half = [](double xc) {
-            xc = std::max(xc, 0.0);
-            return 0.6 * (0.2969 * std::sqrt(xc) - 0.1260 * xc - 0.3516 * xc * xc +
-                          0.2843 * xc * xc * xc - 0.1015 * xc * xc * xc * xc);
-        };
-        std::vector<std::uint8_t> foil(std::size_t(NX) * NY, 0);
-        std::vector<double> xa_of(foil.size());
-        for (int x = 0; x < NX; ++x)
-            for (int y = 0; y < NY; ++y) {
-                const double xg = x + 0.5 - PX, yg = y + 0.5 - PY;
-                const double xa = (xg * std::cos(AL) - yg * std::sin(AL)) / CH + 0.25;
-                const double ya = (xg * std::sin(AL) + yg * std::cos(AL)) / CH;
-                xa_of[std::size_t(x) * NY + y] = xa;
-                foil[std::size_t(x) * NY + y] =
-                    (xa >= 0.0 && xa <= 1.0 && std::abs(ya) < half(xa)) ? 1 : 0;
-            }
-        // exact signed distance to the contour within 6 cells of the foil, +-4 beyond
-        std::vector<double> cx, cy;
-        for (int i = 0; i < 2000; ++i) {
-            const double bt = gate::kPi * i / 1999.0, xs = 0.5 * (1 - std::cos(bt)), yt = half(xs);
-            for (int sg : {1, -1}) {
-                const double px = (xs - 0.25) * CH, py = sg * yt * CH;
-                cx.push_back(px * std::cos(AL) + py * std::sin(AL) + PX);
-                cy.push_back(-px * std::sin(AL) + py * std::cos(AL) + PY);
-            }
-        }
-        std::vector<float> phi2(foil.size());
-        for (int x = 0; x < NX; ++x)
-            for (int y = 0; y < NY; ++y) {
-                const std::size_t k = std::size_t(x) * NY + y;
-                bool near = false;
-                for (int dx = -6; dx <= 6 && !near; ++dx)
-                    for (int dy = -6; dy <= 6; ++dy) {
-                        const int xx = x + dx, yy = y + dy;
-                        if (xx >= 0 && yy >= 0 && xx < NX && yy < NY &&
-                            foil[std::size_t(xx) * NY + yy]) {
-                            near = true;
-                            break;
-                        }
-                    }
-                double d = 4.0;
-                if (near) {
-                    d = 1e30;
-                    for (std::size_t i = 0; i < cx.size(); ++i)
-                        d = std::min(d, std::hypot(x + 0.5 - cx[i], y + 0.5 - cy[i]));
-                }
-                phi2[k] = float(foil[k] ? -d : d);
-            }
+        const NacaSection sec = naca0012_section(NX, NY, CH, AL, PX, PY);
+        const std::vector<std::uint8_t>& foil = sec.foil;
+        const std::vector<double>& xa_of = sec.xa;
 
         Context ctx;
         euler::Config c;
@@ -79,15 +34,7 @@ int main() {
         c.side_bc = euler::SideBC::Farfield;
         c.z_bc = int(euler::SideBC::Slip);
         euler::Solver s(ctx, c);
-        std::vector<std::uint8_t> flags(s.cells());
-        std::vector<float> phi(s.cells());
-        for (std::size_t k = 0; k < foil.size(); ++k)
-            for (int z = 0; z < NZ; ++z) {
-                flags[k * NZ + z] = foil[k];
-                phi[k * NZ + z] = phi2[k];
-            }
-        s.set_flags(flags);
-        s.set_distance(phi);
+        set_section(s, sec, NZ);
         s.init_freestream();
         const double qc = 0.5 * MC * MC * CH * 2.0; // q * chord * span
         std::vector<std::pair<double, double>> hist;

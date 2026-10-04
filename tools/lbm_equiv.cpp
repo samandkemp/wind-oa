@@ -111,6 +111,14 @@ std::vector<std::uint8_t> sphere(float cx, float r) {
 
 } // namespace
 
+const char* const kUsage =
+    R"(usage: lbm_equiv               the identity checks (exit 1 on any bit difference)
+       lbm_equiv --f16         also report the f16-storage deviations
+       lbm_equiv --save DIR    save the reference path's results
+       lbm_equiv --check DIR   compare them bit for bit against a saved baseline
+       lbm_equiv -h | --help   this text
+)";
+
 int main(int argc, char** argv) {
     bool f16 = false;
     std::string save_dir, check_dir;
@@ -122,6 +130,13 @@ int main(int argc, char** argv) {
             save_dir = argv[++a];
         else if (s == "--check" && a + 1 < argc)
             check_dir = argv[++a];
+        else if (s == "-h" || s == "--help") {
+            std::fputs(kUsage, stdout);
+            return 0;
+        } else {
+            std::fprintf(stderr, "unknown argument: %s\n\n%s", s.c_str(), kUsage);
+            return 2;
+        }
     }
     int case_no = 0;
     if (!save_dir.empty())

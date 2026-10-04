@@ -48,6 +48,10 @@ layout(constant_id = 10) const bool SPARSE_FORCES = false;
 // physics is (the flow cache's scheme). Arithmetic stays f32. Halves the
 // distribution traffic; an approximation, not an identity.
 layout(constant_id = 11) const bool F16 = false;
+// A per-cell body force, added to the uniform one (actuator lines, THEORY
+// 3.12). The solver builds this pipeline beside the plain one and uses it
+// only while a force field is on, so without one nothing changes.
+layout(constant_id = 12) const bool FORCE_FIELD = false;
 
 #include "lattice.glsl"
 #include "lbm_params.glsl"
@@ -63,6 +67,7 @@ layout(std430, binding = 4) writeonly buffer MacroOut { vec4 macro_out[]; };
 layout(std430, binding = 5) readonly buffer LinkQ { uint link_q[]; };  // packed u8, [Q][cell]
 layout(std430, binding = 6) readonly buffer UWall { vec4 u_wall[]; };
 layout(std430, binding = 7) writeonly buffer Partials { vec4 partials[]; };  // per group: F, T
+layout(std430, binding = 8) readonly buffer ForceField { vec4 force_field[]; };  // per cell
 
 shared vec4 s_force[256];
 shared vec4 s_torque[256];
@@ -76,9 +81,10 @@ void st(int i, uint idx, float v) {
     else f_dst[idx] = v;
 }
 
+// u8 / 255; 128, the value of a link nothing has set, is exactly half-way.
 float link_fraction(uint idx) {
-    uint word = link_q[idx >> 2u];
-    return float((word >> ((idx & 3u) * 8u)) & 0xFFu) / 255.0;
+    const uint b = (link_q[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+    return b == 128u ? 0.5 : float(b) / 255.0;
 }
 
 void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
@@ -89,7 +95,8 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
     const vec3 u_in = vec3(P.flow.x, 0.0, 0.0);
     const float tau0 = P.flow.y;
     const float smag_pref = P.flow.z;
-    const vec3 g = P.g.xyz;
+    vec3 g = P.g.xyz;
+    if (FORCE_FIELD) g += force_field[c].xyz;
 
     // Hard Dirichlet inlet plane, THEORY 3.1 (a soft equilibrium-pull inlet alone lets
     // the tunnel settle ~15 % below the commanded speed).
@@ -102,6 +109,7 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
 
     // ---- 1. Pull with boundary handling ----------------------------------
     float fl[19];
+    float ibb_dm = 0.0; // IBB: mass the interpolation added at this cell's wall links
     for (int i = 0; i < Q; ++i) {
         int ii = i;
         int sx = x - E[i].x;
@@ -163,6 +171,7 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
                 if (sflag == LID) {
                     value += 6.0 * W[ii] * dot(vec3(E[ii]), P.u_lid.xyz);
                 } else if (sflag == OBSTACLE) {
+                    float wall_q = 0.0; // > 0: the q >= 1/2 branch (its wall term is over 2q)
                     if (USE_IBB) {
                         // Bouzidi linear interpolated bounce-back (THEORY 3.6)
                         const float qv = link_fraction(uint(io) * N + c);
@@ -182,12 +191,19 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
                         } else if (qv >= 0.5) {
                             value = f_towards / (2.0 * qv) +
                                     (2.0 * qv - 1.0) / (2.0 * qv) * ld(ii, uint(ii) * N + c);
+                            wall_q = qv;
                         }
                         // else: thin-gap fallback = half-way
                     }
+                    float half_way = f_towards; // mass-conserving reference
                     if (MOVING) {
-                        value += 6.0 * W[ii] * dot(vec3(E[ii]), u_wall[sc].xyz);
+                        // Moving wall (Ladd); with IBB, over 2q on the q >= 1/2 branch
+                        // (Bouzidi et al. 2001; Lallemand & Luo 2003). THEORY 3.7.
+                        const float mt = 6.0 * W[ii] * dot(vec3(E[ii]), u_wall[sc].xyz);
+                        value += wall_q > 0.0 ? mt / (2.0 * wall_q) : mt;
+                        half_way += mt;
                     }
+                    if (USE_IBB) ibb_dm += value - half_way;
                     // Momentum exchange relative to ambient (Mei et al.; THEORY 4.1):
                     // e_io (f_out + f_in - 2 w_io) per link.
                     const vec3 link_f = (f_towards + value - 2.0 * W[io]) * vec3(E[io]);
@@ -202,6 +218,10 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
         }
         fl[i] = value;
     }
+    // Interpolated bounce-back is not mass-conserving: the mass it adds over the
+    // half-way value comes back out of the rest population, which carries no
+    // momentum, so the wall position the interpolation encodes is kept. THEORY 3.6.
+    if (USE_IBB) fl[0] -= ibb_dm;
 
     // ---- 2. Moments (THEORY 2.1) -------------------------------------------
     float rho = 0.0;

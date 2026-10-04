@@ -71,7 +71,7 @@ int main() {
 
         // 1. develop and save through the real cache
         lbm::Solver a(ctx, solver_config(t));
-        a.set_flags(placed.flags);
+        cases::app::place(a, placed);
         a.init_equilibrium(1.0f, {0.0f, 0.0f, 0.0f});
         for (int done = 0; done < 20000; done += 500) {
             a.set_inlet_velocity(t.u_inlet * std::min(1.0f, float(done + 500) / t.ramp_steps));
@@ -90,7 +90,7 @@ int main() {
 
         // 2. restore into a solver at rest (the app's startup state)
         lbm::Solver b(ctx, solver_config(t));
-        b.set_flags(placed.flags);
+        cases::app::place(b, placed);
         b.init_equilibrium(1.0f, {0.0f, 0.0f, 0.0f});
         b.set_inlet_velocity(t.u_inlet);
         const auto entry = cache.load(key);

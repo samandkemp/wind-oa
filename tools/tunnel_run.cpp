@@ -1,16 +1,5 @@
 // Headless sandbox run: the app's Tunnel without a window. A development
-// tool (not a gate).
-//
-//   tunnel_run [--preset fast|balanced|fine] [--model ID] [--batches N]
-//              [--steps S] [--spin R] [--dye] [--tu PCT] [--aoa DEG] [--f16]
-//              [--average] [--probe X,Y,Z ...] [--no-cache]
-//   --average   time averaging once settled; reports the wake survey
-//   --probe     a probe at (X, Y, Z) cells (up to 4); reports its spectrum
-//   --no-cache  never restore or save a settled flow (a fresh development)
-// The summary gives the second-half means and the lift spectrum's peak as
-// a Strouhal number on the body's height (THEORY 12.3).
-//   tunnel_run --catalogue    voxelise every catalogue model at its default
-//                           placement: triangles, cells, areas, bounds
+// tool (not a gate). kUsage below is the reference for the command line.
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -27,11 +16,48 @@
 
 using namespace windoa;
 
+namespace {
+
+const char* const kUsage =
+    R"(usage: tunnel_run [options]     the app's sandbox, headless
+       tunnel_run --list          the catalogue's model IDs
+       tunnel_run --catalogue     voxelise every catalogue model at its default
+                                  placement: triangles, cells, areas, bounds
+
+  --preset fast|balanced|fine|ultra
+                                grid preset (default fast)
+  --model ID                    catalogue model (default ahmed_25deg)
+  --batches N                   batches to run (default 40)
+  --steps S                     steps per batch (default 50)
+  --spin R                      spin ratio, rim speed / U (models with spinners)
+  --dye                         dye smoke on
+  --tu PCT                      inlet turbulence intensity, percent
+  --aoa DEG                     pitch, degrees
+  --size CELLS                  the model's longest axis, cells (default: its own)
+  --speed U                     the freestream, lattice units (default 0.05; at most 0.11)
+  --f16                         f16 distribution storage (an ungated approximation)
+  --average                     time averaging once settled; reports the wake survey
+  --probe X,Y,Z                 a probe at (X, Y, Z) cells (up to 4); reports its spectrum
+  --no-cache                    never restore or save a settled flow
+  --walls sub|half              sub-cell walls (default) or half-way bounce-back
+  --rotors L                    rotors turning at tip-speed ratio L (models with rotors)
+  --power T                     engines on at throttle T (models with jets / intakes)
+  -h, --help                    this text
+
+The summary gives the second-half means and the lift spectrum's peak as a
+Strouhal number on the body's height (THEORY 12.3).
+)";
+
+} // namespace
+
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0); // progress survives a crash
     std::string preset = "fast", model_id = "ahmed_25deg";
     int batches = 40, steps = 50;
-    float spin = -1.0f, tu = 0.0f, aoa = 0.0f;
-    bool dye = false, catalogue_check = false, f16 = false, average = false, no_cache = false;
+    float spin = -1.0f, tu = 0.0f, aoa = 0.0f, rotors = -1.0f, power = -1.0f, size = 0.0f,
+          speed = 0.0f;
+    bool dye = false, catalogue_check = false, f16 = false, average = false, no_cache = false,
+         half_walls = false;
     std::vector<std::array<float, 3>> probes;
     for (int a = 1; a < argc; ++a) {
         const std::string s = argv[a];
@@ -56,16 +82,41 @@ int main(int argc, char** argv) {
             f16 = true;
         else if (s == "--catalogue")
             catalogue_check = true;
-        else if (s == "--average")
+        else if (s == "--list") {
+            for (const catalogue::Entry& e : catalogue::entries())
+                std::printf("%-20s %-24s %s\n", e.id.c_str(), e.group.c_str(), e.label.c_str());
+            return 0;
+        } else if (s == "--average")
             average = true;
         else if (s == "--no-cache")
             no_cache = true;
-        else if (s == "--probe") {
+        else if (s == "--speed")
+            speed = float(std::atof(next()));
+        else if (s == "--size")
+            size = float(std::atof(next()));
+        else if (s == "--rotors")
+            rotors = float(std::atof(next()));
+        else if (s == "--power")
+            power = float(std::atof(next()));
+        else if (s == "--walls") {
+            const std::string w = next();
+            if (w != "sub" && w != "half") {
+                std::fprintf(stderr, "--walls takes sub or half\n");
+                return 2;
+            }
+            half_walls = w == "half";
+        } else if (s == "--probe") {
             std::array<float, 3> q{};
-            if (sscanf_s(next(), "%f,%f,%f", &q[0], &q[1], &q[2]) == 3)
-                probes.push_back(q);
+            if (sscanf_s(next(), "%f,%f,%f", &q[0], &q[1], &q[2]) != 3) {
+                std::fprintf(stderr, "--probe needs X,Y,Z (cells)\n");
+                return 2;
+            }
+            probes.push_back(q);
+        } else if (s == "-h" || s == "--help") {
+            std::fputs(kUsage, stdout);
+            return 0;
         } else {
-            std::printf("unknown argument: %s\n", s.c_str());
+            std::fprintf(stderr, "unknown argument: %s\n\n%s", s.c_str(), kUsage);
             return 2;
         }
     }
@@ -73,6 +124,7 @@ int main(int argc, char** argv) {
         Context ctx;
         TunnelSettings ts = tunnel_preset(preset);
         ts.storage_f16 = f16;
+        ts.sub_cell_walls = !half_walls;
         const std::filesystem::path cache_dir =
             no_cache ? std::filesystem::temp_directory_path() / "windoa_tunnel_run_nocache"
                      : std::filesystem::path("cache/flow");
@@ -105,15 +157,23 @@ int main(int argc, char** argv) {
 
         const catalogue::Entry* e = catalogue::find(model_id);
         if (!e) {
-            std::printf("no catalogue model '%s'\n", model_id.c_str());
+            std::printf("no catalogue model '%s' (tunnel_run --list)\n", model_id.c_str());
             return 2;
         }
         Model m = model_from_catalogue(*e);
         Placement p = default_placement(*e, ts, m.mesh);
+        if (size > 0.0f)
+            p.length_cells = size;
         p.aoa_deg = aoa;
         tunnel.set_model(std::move(m), p);
         if (spin >= 0.0f)
             tunnel.set_spin(true, spin);
+        if (speed > 0.0f)
+            tunnel.set_speed(speed);
+        if (rotors >= 0.0f)
+            tunnel.set_rotors(true, rotors);
+        if (power >= 0.0f)
+            tunnel.set_power(true, power);
         if (tu > 0.0f)
             tunnel.set_turbulence(tu);
         if (average)
@@ -219,6 +279,13 @@ int main(int argc, char** argv) {
                         a.cd_wake, a.cd_balance,
                         a.wake_valid ? (a.cd_wake / a.cd_balance - 1.0) * 100.0 : 0.0,
                         a.mass_imbalance);
+        if (st.has_rotors)
+            std::printf("rotors %s, tip-speed ratio %.2f: C_T %+.4f  C_P %+.4f (swept area %.1f %% "
+                        "of the section)\n",
+                        st.rotors_turning ? "turning" : "parked", st.rotor_tsr, st.rotor_ct,
+                        st.rotor_cp, 100.0 * st.rotor_blockage);
+        if (st.has_ports)
+            std::printf("engines %s, jet scale %.3f\n", st.power_on ? "on" : "off", st.jet_scale);
         std::printf("spin scale %.3f, cache: %s (%d entries)\n", st.spin_scale,
                     st.cache_note.c_str(), st.cache_entries);
         if (no_cache)

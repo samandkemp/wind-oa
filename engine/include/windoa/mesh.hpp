@@ -39,7 +39,9 @@ Bounds bounds(const Mesh& mesh);
 
 // Uniformly scale + translate (THEORY 5.1) so the longest axis equals `length` and the
 // bounding-box centre sits at `centre` (lattice-unit placement).
-Mesh fit_to_box(const Mesh& mesh, const Vec3& centre, float length);
+// frame: the box to fit (default: the mesh's own bounds); a model whose
+// rotors are actuator lines is fitted by its mesh and their swept discs.
+Mesh fit_to_box(const Mesh& mesh, const Vec3& centre, float length, const Bounds* frame = nullptr);
 
 // Rotate about `about` (default: bounding-box centre). Yaw about +y, pitch
 // about +z (nose-up positive for a +x-pointing model), roll about +x;

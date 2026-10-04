@@ -47,6 +47,9 @@ struct Config {
     Wall wall = Wall::Image;
 };
 
+inline constexpr std::uint8_t kPortFlag = 8; // euler_common.glsl PORT0
+inline constexpr std::size_t kMaxPorts = 8;
+
 class Solver {
   public:
     Solver(Context& ctx, const Config& cfg);
@@ -58,7 +61,11 @@ class Solver {
 
     // Flags [x][y][z] (lbm::Flag values). Clears an exact distance: set it
     // again, or the indicator-based estimate is used.
+    // FLUID, OBSTACLE (the model), WALL (a floor), or kPortFlag + k: the face
+    // of engine port k, which emits that port's state (THEORY 8.12).
     void set_flags(std::span<const std::uint8_t> flags);
+    // The ports' exit states, primitive (rho, u, v, w, p), at most kMaxPorts.
+    void set_ports(std::span<const std::array<float, 5>> states);
     // Exact signed distance to the surface (cells, negative in the solid).
     void set_distance(std::span<const float> phi);
 
@@ -78,6 +85,12 @@ class Solver {
     double time(); // simulated time (reads back)
 
     std::array<double, 3> body_force(); // pressure force on OBSTACLE cells
+    // The pressure force and its moment about `ref` (cells; a cell's centre
+    // is at its index + 0.5). THEORY 8.8, 8.11.
+    struct Loads {
+        std::array<double, 3> force{}, moment{};
+    };
+    Loads body_loads(const std::array<float, 3>& ref);
     struct Health {
         float max_mach = 0.0f;
         int bad_cells = 0;
@@ -111,7 +124,7 @@ class Solver {
     bool phi_exact_ = false, phi_ready_ = false;
     std::vector<std::uint8_t> host_flags_;
 
-    Buffer u_, u1_, flags_, phi_, gs_, gn_, gpw_, dt_, partials_, macro_, rho_;
+    Buffer u_, u1_, flags_, phi_, gs_, gn_, gpw_, dt_, partials_, macro_, rho_, ports_;
     ComputeKernel ghost_, update_, stage_, dt_kernel_, force_, diag_;
 };
 

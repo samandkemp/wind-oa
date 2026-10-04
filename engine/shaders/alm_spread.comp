@@ -1,0 +1,38 @@
+#version 450
+// Actuator lines, step 2 (THEORY 3.12): one thread per cell of the rotors' box.
+// The reaction of every element of every rotor on the air, -F_e, smeared with
+// a Gaussian of width eps,
+//   f(x) = - sum_e F_e exp(-|x - x_e|^2 / eps^2) / (eps^3 pi^(3/2)),
+// written (not added) as the cell's body force: the box covers everything the
+// rotors reach, so rewriting it each step leaves nothing stale.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "lattice.glsl"
+
+layout(push_constant) uniform Params {
+    ivec4 lo;   // box origin xyz, first element
+    ivec4 size; // box extent xyz, elements
+    ivec4 grid; // nx, ny, nz
+    vec4 kern;  // eps, 1 / (eps^3 pi^1.5), cut-off radius^2
+} P;
+
+layout(std430, binding = 0) readonly buffer Elements { vec4 elem[]; };
+layout(std430, binding = 1) writeonly buffer ForceField { vec4 force_field[]; };
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x;
+    const ivec3 s = P.size.xyz;
+    if (id >= uint(s.x * s.y * s.z)) return;
+    const ivec3 c = P.lo.xyz + ivec3(int(id) / (s.y * s.z), (int(id) / s.z) % s.y, int(id) % s.z);
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, P.grid.xyz))) return;
+    const vec3 x = vec3(c) + 0.5;
+    const float inv_e2 = 1.0 / (P.kern.x * P.kern.x);
+    vec3 f = vec3(0.0);
+    for (int k = 0; k < P.size.w; ++k) {
+        const uint o = 2u * uint(P.lo.w + k);
+        const vec3 d = x - elem[o].xyz;
+        const float d2 = dot(d, d);
+        if (d2 < P.kern.z) f -= elem[o + 1u].xyz * (exp(-d2 * inv_e2) * P.kern.y);
+    }
+    force_field[cell_index(c.x, c.y, c.z, P.grid.xyz)] = vec4(f, 0.0);
+}

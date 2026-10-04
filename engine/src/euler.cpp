@@ -35,13 +35,14 @@ Solver::Solver(Context& ctx, const Config& cfg)
       groups_(groups_for(ctx, n_, kLocal)), host_flags_(n_, kFluid), u_(ctx, n_ * 20),
       u1_(ctx, n_ * 20), flags_(ctx, n_ * 4), phi_(ctx, n_ * 4), gs_(ctx, n_ * 20),
       gn_(ctx, n_ * 16), gpw_(ctx, n_ * 4), dt_(ctx, 16),
-      partials_(ctx, std::size_t{groups_.total} * 16), macro_(ctx, n_ * 16), rho_(ctx, n_ * 4),
-      ghost_(ctx, spv::euler_ghost, 12, sizeof(Params), 2),
-      update_(ctx, spv::euler_update, 12, sizeof(Params), 2),
-      stage_(ctx, spv::euler_stage, 12, sizeof(Params)),
-      dt_kernel_(ctx, spv::euler_dt, 12, sizeof(Params)),
-      force_(ctx, spv::euler_force, 12, sizeof(Params)),
-      diag_(ctx, spv::euler_diag, 12, sizeof(Params)) {
+      partials_(ctx, std::size_t{groups_.total} * 32), macro_(ctx, n_ * 16), rho_(ctx, n_ * 4),
+      ports_(ctx, kMaxPorts * 5 * sizeof(float)),
+      ghost_(ctx, spv::euler_ghost, 13, sizeof(Params), 2),
+      update_(ctx, spv::euler_update, 13, sizeof(Params), 2),
+      stage_(ctx, spv::euler_stage, 13, sizeof(Params)),
+      dt_kernel_(ctx, spv::euler_dt, 13, sizeof(Params)),
+      force_(ctx, spv::euler_force, 13, sizeof(Params)),
+      diag_(ctx, spv::euler_diag, 13, sizeof(Params)) {
     static_assert(sizeof(Params) == 96, "Params must match euler_common.glsl");
     if (cfg.nx < 1 || cfg.ny < 1 || cfg.nz < 1)
         throw std::runtime_error("euler::Solver: empty grid");
@@ -50,14 +51,25 @@ Solver::Solver(Context& ctx, const Config& cfg)
     // and the output -- stage 2 (see euler_update.comp).
     for (ComputeKernel* k : {&ghost_, &update_, &stage_, &dt_kernel_, &force_, &diag_})
         k->bind(0, {&u_, &u_, &u1_, &flags_, &phi_, &gs_, &gn_, &gpw_, &dt_, &partials_, &macro_,
-                    &rho_});
+                    &rho_, &ports_});
     for (ComputeKernel* k : {&ghost_, &update_})
         k->bind(1, {&u1_, &u_, &u_, &flags_, &phi_, &gs_, &gn_, &gpw_, &dt_, &partials_, &macro_,
-                    &rho_});
+                    &rho_, &ports_});
     ctx_.fill_zero(flags_);
     ctx_.fill_zero(gn_);
     ctx_.fill_zero(dt_);
     ctx_.fill_zero(u1_);
+    ctx_.fill_zero(ports_);
+}
+
+void Solver::set_ports(std::span<const std::array<float, 5>> states) {
+    if (states.size() > kMaxPorts)
+        throw std::runtime_error("euler::Solver::set_ports: too many ports");
+    std::vector<float> w(kMaxPorts * 5, 0.0f);
+    for (std::size_t k = 0; k < states.size(); ++k)
+        for (std::size_t i = 0; i < 5; ++i)
+            w[5 * k + i] = states[k][i];
+    ctx_.upload(ports_, w.data(), w.size() * sizeof(float));
 }
 
 Solver::Params Solver::params(int axis, int first, int mode, float aux0, float aux1) const {
@@ -278,20 +290,29 @@ double Solver::time() {
 }
 
 std::array<double, 3> Solver::body_force() {
+    return body_loads({0.0f, 0.0f, 0.0f}).force;
+}
+
+Solver::Loads Solver::body_loads(const std::array<float, 3>& ref) {
     ensure_geometry();
     const Params p = params();
+    Params pf = p;
+    for (int a = 0; a < 3; ++a)
+        pf.aux2[a] = ref[std::size_t(a)];
     ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
         ghost_.record(cmd, &p, groups_.x, groups_.y);
         Context::barrier_compute_to_compute(cmd);
-        force_.record(cmd, &p, groups_.x, groups_.y);
+        force_.record(cmd, &pf, groups_.x, groups_.y);
     });
-    std::vector<float> v(std::size_t{groups_.total} * 4);
+    std::vector<float> v(std::size_t{groups_.total} * 8);
     ctx_.download(partials_, v.data(), v.size() * 4);
-    std::array<double, 3> f{};
+    Loads l;
     for (std::size_t k = 0; k < groups_.total; ++k)
-        for (int a = 0; a < 3; ++a)
-            f[a] += v[4 * k + a];
-    return f;
+        for (std::size_t a = 0; a < 3; ++a) {
+            l.force[a] += v[8 * k + a];
+            l.moment[a] += v[8 * k + 4 + a];
+        }
+    return l;
 }
 
 void Solver::refresh() {

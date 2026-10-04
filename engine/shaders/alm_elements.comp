@@ -1,0 +1,103 @@
+#version 450
+// Actuator lines, step 1 (THEORY 3.12): one thread per blade element.
+// Lines: the element samples the flow (trilinear in the macro field), forms
+// the relative wind W = u - omega r (a x e_r) in the blade's frame, its inflow
+// angle phi from the rotor plane and angle of attack alpha = phi - twist,
+// takes lift and drag from the section polar and writes the force the air
+// exerts on the blade,
+//   F = F_tip 1/2 rho |W|^2 c dr (Cl l + Cd d),  l = cos(phi) a + sin(phi) e_t,
+//   d = W / |W| (in the plane of a and e_t, the direction the blade moves),
+// so positive alpha pushes the blade downstream and drives it (a turbine)
+// and negative alpha pushes it upstream (a propeller's thrust).
+// Disc (validation): a uniformly loaded actuator disc -- the elements sit on
+// an equal-area polar grid (rings x spokes) and carry equal axial forces.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "lattice.glsl"
+
+layout(push_constant) uniform Params {
+    vec4 hub;     // xyz (cells), rotor angle (rad)
+    vec4 axis;    // xyz: the through-flow direction (unit); w: omega (rad / step, signed)
+    vec4 e1;      // xyz: unit, normal to the axis (angle 0); w: r_hub
+    ivec4 counts; // blades (disc: spokes), elements per blade (disc: rings), mode, element offset
+    vec4 polar;   // cl_alpha (per rad), alpha_stall (rad), cd0, r_tip
+    vec4 grid;    // nx, ny, nz, disc: axial force per element
+    ivec4 extra;  // section offset (this rotor's first section), -, -, -
+} P;
+
+layout(std430, binding = 0) readonly buffer Macro { vec4 macro[]; };    // u.xyz, rho
+layout(std430, binding = 1) writeonly buffer Elements { vec4 elem[]; }; // 2 per element: x, F
+layout(std430, binding = 2) readonly buffer Sections { vec2 section[]; }; // chord (cells), twist (rad)
+
+vec4 sample_macro(vec3 x) {
+    const ivec3 n = ivec3(P.grid.xyz);
+    const vec3 g = x - 0.5;
+    const ivec3 b = ivec3(floor(g));
+    const vec3 t = g - vec3(b);
+    vec4 acc = vec4(0.0);
+    for (int dx = 0; dx < 2; ++dx)
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dz = 0; dz < 2; ++dz) {
+                const ivec3 c = clamp(b + ivec3(dx, dy, dz), ivec3(0), n - 1);
+                const float w = (dx == 1 ? t.x : 1.0 - t.x) * (dy == 1 ? t.y : 1.0 - t.y) *
+                                (dz == 1 ? t.z : 1.0 - t.z);
+                acc += w * macro[cell_index(c.x, c.y, c.z, n)];
+            }
+    return acc;
+}
+
+void main() {
+    const int blades = P.counts.x, n_el = P.counts.y, mode = P.counts.z;
+    const uint e = gl_GlobalInvocationID.x;
+    if (e >= uint(blades * n_el)) return;
+    const int b = int(e) / n_el, i = int(e) % n_el;
+    const vec3 a = P.axis.xyz, e1 = P.e1.xyz, e2 = cross(a, e1);
+    const float r_hub = P.e1.w, r_tip = P.polar.w;
+    float r, psi;
+    if (mode == 1) { // disc: equal-area rings, staggered spokes
+        r = r_tip * sqrt((float(i) + 0.5) / float(n_el));
+        psi = P.hub.w + 6.2831853 * (float(b) + 0.5 * float(i % 2)) / float(blades);
+    } else {
+        r = r_hub + (float(i) + 0.5) * (r_tip - r_hub) / float(n_el);
+        psi = P.hub.w + 6.2831853 * float(b) / float(blades);
+    }
+    const vec3 er = cos(psi) * e1 + sin(psi) * e2;
+    const vec3 x = P.hub.xyz + r * er;
+    vec3 f;
+    if (mode == 1) {
+        f = P.grid.w * a;
+    } else {
+        const vec4 m = sample_macro(x);
+        const float rho = m.w > 0.1 ? m.w : 1.0;
+        const float om = P.axis.w;
+        const vec3 et = (om >= 0.0 ? 1.0 : -1.0) * cross(a, er);
+        const vec3 w = m.xyz - om * r * cross(a, er);
+        const float wa = dot(w, a), wt = dot(w, et);
+        const float phi = atan(wa, -wt);
+        const vec2 sec = section[uint(P.extra.x + i)];
+        const float alpha = phi - sec.y;
+        const float k = P.polar.x, as = P.polar.y, cd0 = P.polar.z;
+        const float aa = min(abs(alpha), 3.1415927);
+        float cl, cd;
+        if (aa <= as) {
+            cl = k * alpha;
+            cd = cd0;
+        } else { // past stall: a flat plate's sin 2 alpha, meeting the linear range at stall
+            cl = sign(alpha) * k * as * sin(2.0 * aa) / sin(2.0 * as);
+            const float sa = sin(aa), ss = sin(as);
+            cd = cd0 + 1.8 * (sa * sa - ss * ss);
+        }
+        const float w2 = wa * wa + wt * wt;
+        const vec3 l = cos(phi) * a + sin(phi) * et;
+        const vec3 d = (wa * a + wt * et) / max(sqrt(w2), 1e-9);
+        const float dr = (r_tip - r_hub) / float(n_el);
+        // Prandtl's tip loss for a finite number of blades (Glauert's form):
+        // F = 2/pi acos(exp(-B (R - r) / (2 r |sin phi|))).
+        const float ft = float(blades) * (r_tip - r) / (2.0 * r * max(abs(sin(phi)), 0.02));
+        const float tip = 0.63661977 * acos(clamp(exp(-ft), 0.0, 1.0));
+        f = tip * 0.5 * rho * w2 * sec.x * dr * (cl * l + cd * d);
+    }
+    const uint o = 2u * (uint(P.counts.w) + e);
+    elem[o] = vec4(x, r);
+    elem[o + 1u] = vec4(f, 0.0);
+}

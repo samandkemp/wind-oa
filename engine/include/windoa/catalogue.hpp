@@ -33,6 +33,39 @@ struct Spinner {
     double max_wall = 0.0; // 0: the global cap
 };
 
+// An engine port in model units: an exhaust that blows or an intake that
+// draws, a disc of radius r on the model's surface at c with outward normal
+// n (an exhaust's jet runs along n, an intake's flow against it).
+// Subsonic: the face moves at speed_ratio x U along the normal, a velocity
+// boundary (THEORY 3.11). Transonic exhaust: the face emits the exit state,
+// Mach exit_mach along n at p_ratio and t_ratio times the freestream's
+// static pressure and temperature (THEORY 8.12); a transonic intake is a
+// wall.
+struct Port {
+    enum class Kind { Exhaust, Intake };
+    Kind kind = Kind::Exhaust;
+    std::array<double, 3> c{}, n{};
+    double r = 0.0;
+    double speed_ratio = 2.0;
+    double exit_mach = 1.0, p_ratio = 1.0, t_ratio = 1.0;
+};
+
+// A rotor as an actuator line (THEORY 3.12), in model units: hub c; axis,
+// the through-flow direction (a turbine slows the air along it, a propeller
+// drives it along it); tip and hub radii; blades; chord and twist (degrees,
+// from the rotor plane) evenly spaced root to tip; the design tip-speed
+// ratio omega R / U; the sense of rotation about the axis; a thin-aerofoil
+// section polar.
+struct Rotor {
+    std::array<double, 3> c{}, axis{1.0, 0.0, 0.0};
+    double r_tip = 1.0, r_hub = 0.1;
+    int blades = 3;
+    std::vector<double> chord, twist_deg;
+    double tsr = 6.0;
+    int sense = 1;
+    double cl_alpha = 6.2832, alpha_stall_deg = 12.0, cd0 = 0.012;
+};
+
 struct Entry {
     std::string id;    // stable key (--model ID, cache keys)
     std::string label; // menu text
@@ -41,6 +74,8 @@ struct Entry {
     double size_frac = 0.0; // suggested length / nx (0: 64 cells)
     Ground ground = Ground::Air;
     std::vector<Spinner> spinners;
+    std::vector<Port> ports;
+    std::vector<Rotor> rotors;
 };
 
 // In menu order (groups contiguous).

@@ -77,12 +77,12 @@ ctest --preset quick
 
 `device_info` lists the GPUs the engine can see and the capabilities it relies on (an asynchronous
 compute queue, f16 storage, linear filtering of 32-bit float images). `ctest --preset quick` runs the
-smoke checks and the 14 short validation gates in about 80 s; every line should read `Passed`.
+smoke checks and the 15 short validation gates in about 105 s; every line should read `Passed`.
 
 ## 2. Running the app
 
 ```
-build\app\RelWithDebInfo\windoa_app [fast|balanced|fine] [transonic] [--model ID]
+build\app\RelWithDebInfo\windoa_app [fast|balanced|fine|ultra] [transonic] [--model ID]
 ```
 
 | Preset | Grid | Cells | Typical speed while rendering |
@@ -90,11 +90,14 @@ build\app\RelWithDebInfo\windoa_app [fast|balanced|fine] [transonic] [--model ID
 | fast (default) | 256 x 96 x 96 | 2.4 M | about 3,150 MLUPS |
 | balanced | 320 x 128 x 128 | 5.2 M | |
 | fine | 384 x 160 x 160 | 9.8 M | about 2,400 MLUPS with vortex cores on |
+| ultra | 512 x 192 x 192 | 18.9 M | about 160 steps a second: for patient studies, mostly headless |
 
 MLUPS is millions of lattice cell updates per second. The app finds the repository root itself:
 the flow cache (`cache/`), screenshots (`screenshots/`), imported STL files (`models/`) and the
 panel layout (`windoa_imgui.ini`) live there, and all are gitignored. It starts with the saloon on a
-rolling road; `--model ID` starts with any catalogue model (the IDs are listed in REFERENCE).
+rolling road; `--model ID` starts with any catalogue model (`tunnel_run --list` prints the IDs, and
+REFERENCE describes them). `windoa_app --help` lists every option; an unknown option or model ID
+is refused with the list rather than ignored.
 
 The solver runs flat out on the GPU's asynchronous compute queue and the window draws on the
 graphics queue, so the window stays smooth however hard the solver works.
@@ -117,7 +120,10 @@ graphics queue, so the window stays smooth however hard the solver works.
 | Esc | Quit |
 | Ctrl + click a slider | Type an exact value |
 
-Panels can be dragged, docked and resized, and the layout is remembered.
+Panels can be dragged, docked and resized, and the layout is remembered. A layout that does not
+fit the window (one saved on a larger screen, or after the window shrinks) is put back to the
+starting arrangement for the current size; *reset layout* in the View panel does the same on
+demand.
 
 ### 3.2 The Tunnel panel
 
@@ -151,9 +157,21 @@ the flow controls.
   stops moving. A new body, or a turn of more than 20 degrees, restarts the flow from rest.
 - *ref area*: frontal (the car convention), planform (the wing convention) or manual. A wing's Cl
   only looks right against its planform area.
-- *spin wheels / rotors* appears on models with spinning parts. The spin ratio is rim speed over
-  wind speed; surfaces are capped at 0.08 lattice units (thin blades at 0.025) for stability, and
-  the panel says when the cap is limiting.
+- *spinning parts* appears on models with wheels or other spinning bodies. The spin ratio is rim
+  speed over wind speed; surfaces are capped at 0.08 lattice units for stability, and the panel
+  says when the cap is limiting.
+- *rotors turning* appears on models with rotors (the turbine, the propellers, the quadcopter).
+  The blades are not solid: they are lines of lift and drag forces computed from the local flow,
+  drawn as turning outlines (section 4.6). The *tip-speed ratio* is tip speed over wind speed,
+  starting at 6 (the turbine is designed for 7, the propellers for 4.5); parked, the blades still
+  take the wind. The panel shows the rotor's thrust and power coefficients and warns when the
+  rotor sweeps more than 5 % of the tunnel's section, where blockage moves them from their
+  free-air values.
+- *engines (jets / intakes)* appears on models with engine ports (the jets, the race cars, the
+  rockets and missiles). Exhausts blow and intakes draw at their speed ratio times the *throttle*
+  times the wind speed, capped at 0.12 lattice units (the panel says when); in transonic mode the
+  exhausts emit a hot, under-expanded jet instead (section 4.7). The force balance then reads the
+  net force, thrust included.
 
 ### 3.4 The View panel
 
@@ -200,17 +218,33 @@ history (which happens by itself once settled).
 
 ### 3.7 Screenshots and scripted runs
 
-P saves a PNG of the window, panels included, to `screenshots/`. For a reproducible picture, the
-app can be scripted from the command line:
+P saves a PNG of the window, panels included, to `screenshots/` (compressed: about 0.2 - 0.5 MB at
+1600 x 900). For a reproducible picture, the app can be scripted from the command line:
 
 ```
 windoa_app --model airliner --aoa 6 --show "q,lines,nosmoke" --warmup 8000 --frames 120 --shot out.png
 ```
 
-`--warmup` develops the flow before the first frame, `--frames` exits after that many, `--shot`
-saves the last one and `--zoom` moves the camera nearer the model. The view flags, including the
-new views and the analysis (`avg`, `recirc`, `lic`, `arrows`, `timelines`, `oil`, `probes`), are
-listed in REFERENCE.
+`--warmup` develops the flow before the first frame, `--frames` exits after that many and `--shot`
+saves the last one. `--zoom` moves the camera nearer the model and `--view AZ,EL` sets its azimuth
+and elevation in degrees; `--size` sets the model's length in cells, `--mach` the transonic Mach
+number, and `--rotors` and `--power` start the rotors and the engines. The view flags (`--show`) cover
+every overlay, the slices (`slice`, `hslice`, `xslice`) and the clean-picture switches (`noui`,
+`noplots`, `nobox`, `nosurface`); REFERENCE lists them all.
+
+The README's images come from these runs (each restores a settled flow from the cache when it
+has one, so a second run is quicker; the transonic runs take their frames after the warm-up because
+the Mach number slews once per batch, and the warm-up runs as a few long batches):
+
+```
+windoa_app --model car_saloon --zoom 0.6 --view 40,22 --warmup 30000 --frames 240 --shot app.png
+windoa_app --model cylinder --field mean --show "avg,hslice,lic,recirc,nohaze,nosmoke,noui,noplots,nobox" --zoom 0.55 --view 90,75 --warmup 40000 --frames 120 --shot cylinder_mean_wake.png
+windoa_app fine --model wind_turbine --rotors 7 --show "q,nohaze,nosmoke,noui,noplots,nobox" --zoom 0.3 --view 70,22 --warmup 25000 --frames 120 --shot turbine_tip_vortices.png
+windoa_app --model ahmed_25deg --show "timelines,nohaze,noui,noplots" --zoom 0.5 --view 60,30 --warmup 25000 --frames 240 --shot ahmed_timelines.png
+windoa_app --model car_saloon --show "oil,nohaze,nosmoke,noui,noplots" --zoom 0.3 --view 150,30 --warmup 30000 --frames 60 --shot saloon_oil_flow.png
+windoa_app transonic --mach 0.8 --model wing_naca0012 --aoa 2 --field mach --show "slice,noui,noplots,nobox" --zoom 0.3 --view 90,0 --warmup 8000 --frames 120 --shot transonic_wing.png
+windoa_app transonic --mach 1.5 --model aim120 --size 90 --power 1 --field schlieren --show "slice,noui,noplots,nobox,nosurface" --zoom 0.55 --view 90,0 --warmup 20000 --frames 1000 --shot missile_plume.png
+```
 
 # Part 2 - Building situations
 
@@ -222,7 +256,8 @@ Thirty stylised procedural models in eight groups: basic shapes, aerodynamic ref
 0012 wing and the Ahmed body), road vehicles, aircraft, space, munitions, wind engineering and
 rotating parts. Each is built in memory from boxes, cylinders, lofts, aerofoil sections and bodies
 of revolution, so nothing is downloaded or shipped. They have the right proportions; they are not
-replicas. The full list, with sizes, ground modes and spinning parts, is in REFERENCE.
+replicas. The full list, with sizes, ground modes, spinning parts, rotors and engine ports, is
+in REFERENCE.
 
 ### 4.2 Placement and attitude
 
@@ -240,11 +275,10 @@ planform for wings) and keep it fixed across any comparison.
 
 ### 4.4 Spinning parts
 
-Road cars' wheels, the open-wheel car's wheels, the quadcopter's rotors, the UAV's propeller, the
-turbine, the propeller, the frisbee and the Magnus ball can spin. Wheels roll so the contact patch
-moves downstream; the quadcopter's rotors counter-rotate in diagonal pairs; the ball has backspin
-(Magnus lift upwards). All parts are scaled by one common factor if any would exceed the wall-speed
-cap, so their relative speeds are preserved.
+Road cars' wheels, the open-wheel car's wheels, the frisbee and the Magnus ball can spin. Wheels
+roll so the contact patch moves downstream; the ball has backspin (Magnus lift upwards). All parts
+are scaled by one common factor if any would exceed the wall-speed cap, so their relative speeds
+are preserved. Rotors are not spinning walls (section 4.6).
 
 ### 4.5 Imported models
 
@@ -254,6 +288,36 @@ size slider, so its units do not matter. Imperfect meshes are tolerated (a windi
 two-of-three axis vote), as are overlapping parts and zero-thickness sheets; parts thinner than a
 cell are kept one cell thick. Imported STL files are gitignored and never committed.
 
+### 4.6 Rotors
+
+A real rotor's tips move several times faster than the wind, faster than any wall the lattice can
+move. The turbine, the propeller, the UAV's pusher propeller and the quadcopter's four rotors are
+therefore actuator lines (THEORY §3.12): each blade is a line of points that read the local flow,
+take lift and drag from an aerofoil section's polar at the local angle of attack, and push back on
+the air. The blades are drawn as turning outlines, and their wake (the helical tip vortices behind
+a turbine, the downwash under a quadcopter) is real flow. The turbine's blades follow a
+blade-element design for a tip-speed ratio of 7; the propellers and the quadcopter's rotors are
+pitched to drive the air.
+
+The thrust and power coefficients are over the swept area, $C_T = T / (\tfrac12 \rho U^2 A)$ and
+$C_P = P / (\tfrac12 \rho U^3 A)$, positive power meaning the wind drives the rotor. The
+dashboard's Cd, Cl and Cm remain the body's (the tower, nacelle or fuselage); the wake survey's
+force balance adds the rotor's streamwise force, since the air feels both. A closed
+tunnel holds the flow round a large rotor, so these depart from free-air values as the swept area
+grows: past about 5 % of the section a turbine's power coefficient can even pass the Betz limit
+(16/27). The catalogue turbine is sized below that; enlarge it for pictures, not for numbers.
+
+### 4.7 Engines
+
+Engine ports are discs on the surface: intakes at the jets' fan faces and the race cars' airboxes
+and radiators, exhausts at the nozzles, the motors of the rockets and missiles, and the base-bleed
+unit of the 105 mm shell. In the subsonic regime each face blows (or draws) at its speed ratio
+times the throttle times the wind speed, a velocity boundary (THEORY §3.11); the lattice is
+isothermal, so a subsonic jet carries mass and momentum but no heat. In transonic mode an exhaust
+emits its exit state, a Mach number, pressure and temperature (THEORY §8.12): an under-expanded jet
+then shows its barrel shock, Mach disc and shock diamonds in the *schlieren* field. Intakes are
+walls in transonic mode.
+
 ## 5. Transonic mode
 
 The lattice Boltzmann solver is trusted to about Mach 0.3 and cannot form shocks. *regime:
@@ -262,19 +326,20 @@ HLLC, SSP-RK2, with image-point walls from the exact distance to the surface).
 
 - A *Mach* slider (0.3 - 1.6) replaces the speed. *schlieren* shows the shocks and *Mach* the
   supersonic pockets; the panel shows the peak local Mach number.
-- Cd and Cl are pressure forces only: the solver is inviscid, so there is wave drag but no skin
-  friction.
+- Cd, Cl and Cm_z are pressure forces and their moment only: the solver is inviscid, so there is
+  wave drag but no skin friction.
 - After a switch or a new model the flow develops for two flow-throughs.
-- Smoke, dye, streamlines, vortex cores and spin are subsonic-only; switching back resumes the
-  paused lattice flow.
+- Smoke, dye, streamlines, vortex cores, spin and rotors are subsonic-only (engines work in both
+  regimes); switching back resumes the paused lattice flow.
 - At the default model sizes, read it for shock patterns and trends. The NACA 0012 at 128 cells a
-  chord reads its lift about 17 % low, because the walls lie on a voxel grid.
+  chord reads its lift about 17 % low, because the walls lie on a voxel grid, and the shortfall
+  sits aft, so the pitching moment's centre reads ahead of the quarter chord (THEORY §8.9).
 
 ## 6. The flow cache
 
 Once a configuration has settled, its flow is saved (about 86 MB at the fast preset; a 512 MB budget,
 oldest dropped first). Returning to exactly that configuration (the same model, placement, speed,
-spin and turbulence) restores it in well under a second. A change to the solver or voxeliser source
+spin, rotors, engines, walls and turbulence) restores it in well under a second. A change to the solver or voxeliser source
 invalidates every entry automatically. *reset flow* always starts from rest, and `cache/` is safe
 to delete.
 
@@ -309,12 +374,13 @@ The tools drive the engine without a window, so a study can run unattended and r
 
 | Tool | For |
 |---|---|
-| `tunnel_run` | The app's sandbox headless: any catalogue model, speed, spin, angle, turbulence, dye or f16, reporting settled means, the lift spectrum and, with `--average`, the wake survey |
+| `tunnel_run` | The app's sandbox headless: any catalogue model, size, speed, spin, rotors, engines, angle, turbulence, dye, f16 or half-way walls, reporting settled means, the lift spectrum, the rotors' coefficients and, with `--average`, the wake survey |
 | `lbm_run` | A sphere or any STL in a bare solver, with the collision and boundary options exposed |
 | `euler_run sphere M` | A sphere in the compressible solver at Mach M |
 | `bench` | Throughput at each preset |
 
-The flags of each are in REFERENCE. A typical `tunnel_run`:
+Each prints its options with `--help` and refuses an unknown one; the flags are also in REFERENCE.
+A typical `tunnel_run`:
 
 ```
 build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 300 --steps 100
@@ -325,10 +391,10 @@ build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 300 --steps 
 `tunnel_run` prints ten progress lines and a summary:
 
 ```
-step   30000  u 0.0500  Cd +0.7146  Cl +0.0598  Cm +0.0090  max|u| 0.065  SETTLED after 2.5 flow-throughs  (3272 MLUPS)
-second-half mean: Cd 0.7135 (sd 0.0021)  Cl 0.0627 (sd 0.0048)  over 150 batches
-lift spectrum over 16000 steps: peak St 0.116 (period 2938 steps, amplitude 0.00474); next peaks at St 1.026 0.978  (h 17 cells; acoustic modes every St 1.022)
-shedding (strongest peak below the first acoustic mode): St 0.116
+step   30000  u 0.0500  Cd +0.6798  Cl +0.0981  Cm +0.0172  max|u| 0.066  SETTLED after 2.5 flow-throughs  (3240 MLUPS)
+second-half mean: Cd 0.6779 (sd 0.0013)  Cl 0.0960 (sd 0.0102)  over 150 batches
+lift spectrum over 16000 steps: peak St 0.135 (period 2523 steps, amplitude 0.013); next peaks at St 0.265 0.393  (h 17 cells; acoustic modes every St 1.022)
+shedding (strongest peak below the first acoustic mode): St 0.135
 spin scale 1.000, cache: saved to cache (0.5 s) (1 entries)
 ```
 
@@ -343,6 +409,8 @@ spin scale 1.000, cache: saved to cache (0.5 s) (1 entries)
 | lift spectrum | The strongest peaks of the lift's spectrum over the developed flow, as Strouhal numbers on the body's height, and the spacing of the tunnel's acoustic modes |
 | shedding | The strongest lift peak below the first acoustic mode: the shedding frequency |
 | spin scale | Below 1 when the wall-speed cap limited the requested spin |
+| rotors | Models with rotors: turning (`--rotors L`) or parked, the tip-speed ratio, the smoothed $C_T$ and $C_P$ at the end of the run, and the swept area as a fraction of the section |
+| engines | Models with engine ports: on (`--power T`) or off, and the jet scale, below 1 when the jet-speed cap limited the throttle |
 
 The standard deviation is of smoothed, correlated values, so it understates the uncertainty of the
 mean; use it to compare the scatter of two runs, not as an error bar on its own. A repeated run
@@ -360,16 +428,21 @@ build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 300 --steps 
 
 | Storage | Throughput | Settled after | Second-half mean Cd | sd |
 |---|---|---|---|---|
-| f32 | 3,272 MLUPS | 2.5 flow-throughs | 0.7135 | 0.0021 |
-| f16 | 4,369 MLUPS | 3.1 flow-throughs | 0.7190 | 0.0053 |
+| f32 | 3,240 MLUPS | 2.5 flow-throughs | 0.6779 | 0.0013 |
+| f16 | 4,022 MLUPS | 2.5 flow-throughs | 0.6768 | 0.0052 |
 
-Half precision is 34 % faster per step, and its mean is 0.8 % higher. However, its scatter is 2.5
-times larger, so matching f32's confidence in the mean needs $(0.0053 / 0.0021)^2 \approx 6.4$
-times as many samples, and the noisier signal also took 1.2 times as long to settle. At 1.34
-times the speed, the same confidence costs about 4.8 times the wall-clock time; and its lift
-spectrum carries a spurious peak at St 0.61. The faster storage is
-therefore slower for this kind of question, which is why it stays opt-in; it remains useful where
-a picture, not a mean, is the goal.
+Half precision is 24 % faster per step, and its mean is 0.2 % lower. However, its scatter is 4
+times larger, so matching f32's confidence in the mean needs $(0.0052 / 0.0013)^2 = 16$ times as
+many samples: at 1.24 times the speed, the same confidence costs about 13 times the wall-clock
+time. Its lift spectrum also misses the shedding: f32 finds a clean peak at St 0.135 with its
+harmonics at 0.265 and 0.393, while f16 reports St 0.119 and a spurious peak at 0.64. The faster
+storage is therefore slower for this kind of question, which is why it stays opt-in and ungated
+(every gate runs f32); it remains useful where a picture, not a mean, is the goal.
+
+The same study answers a second question with one flag: `--walls half` runs the half-way staircase
+instead of the sub-cell walls. It reads Cd 0.7135 (sd 0.0021), 5.3 % more drag, with two thirds of the
+lift and a weaker shedding peak (St 0.116): on a body with sharp edges and a slant, where the
+wall sits matters at this resolution (THEORY §3.9).
 
 ## 11. Averages, the wake survey and spectra
 
@@ -410,8 +483,8 @@ build\tools\RelWithDebInfo\tunnel_run --model ahmed_25deg --batches 1500 --steps
 
 | Command | Runs | Time |
 |---|---|---|
-| `ctest --preset quick` | The smoke checks and the 14 short gates | about 80 s |
-| `ctest --preset dev` | Everything, all 26 gates included | about 13 minutes |
+| `ctest --preset quick` | The smoke checks and the 15 short gates | about 105 s |
+| `ctest --preset dev` | Everything, all 31 gates included | about 19 minutes |
 | `ctest --preset dev -R V17` | One test by name | - |
 
 ### The validation layers
@@ -479,6 +552,8 @@ Write the GLSL under the module's `shaders/` directory and add it with
   up at 6 flow-throughs and says NOT SETTLED. Average over a long window instead (Part 3).
 - **The model is clipped by the tunnel.** The Model panel warns when it extends outside; reduce the
   size or the turn.
+- **A panel has gone missing.** It may be folded or docked somewhere unexpected: *reset layout* in
+  the View panel puts every panel back (H toggles them all).
 
 ### Studies
 

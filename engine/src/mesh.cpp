@@ -114,8 +114,8 @@ Bounds bounds(const Mesh& mesh) {
     return b;
 }
 
-Mesh fit_to_box(const Mesh& mesh, const Vec3& centre, float length) {
-    const Bounds b = bounds(mesh);
+Mesh fit_to_box(const Mesh& mesh, const Vec3& centre, float length, const Bounds* frame) {
+    const Bounds b = frame ? *frame : bounds(mesh);
     const float scale = length / std::max(b.longest(), 1e-20f);
     const Vec3 mid = b.centre();
     Mesh out = mesh;

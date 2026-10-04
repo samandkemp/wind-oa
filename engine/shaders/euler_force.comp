@@ -5,9 +5,16 @@
 // staircase's projected areas sum to the body's exactly). Wall pressure =
 // the image ghost's value interpolated to the true wall where the face uses
 // it (the ghost's own pressure lies beyond the wall and gave a NACA 0012 a
-// thrust), else the star pressure of the mirror Riemann problem. Per-
-// workgroup partial sums in a fixed order; summed on the host in double.
-// THEORY 8.8.
+// thrust), else the star pressure of the mirror Riemann problem, posed with
+// the solid on its own side of the face. THEORY 8.8.
+//
+// The moment about P.aux2.xyz (cells) sums (p_w - p_inf) times the area
+// vector at each face centre: a uniform pressure exerts no moment on a
+// closed surface, so the subtraction changes nothing but keeps the f32 terms
+// the size of the pressure differences. THEORY 8.11.
+//
+// Per-workgroup partial sums in a fixed order, the force at partials[2 g]
+// and the moment at partials[2 g + 1]; summed on the host in double.
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 256) in;
 #include "euler_common.glsl"
@@ -15,30 +22,50 @@ layout(local_size_x = 256) in;
 #include "euler_flux.glsl"
 
 shared vec3 s_f[256];
+shared vec3 s_m[256];
 
 void main() {
     const uint lid = gl_LocalInvocationID.x;
     const uint c = linear_group() * 256u + lid;
     vec3 f = vec3(0.0);
+    vec3 m = vec3(0.0);
     if (c < uint(N().x * N().y * N().z) && flags[c] == FLUID) {
         const ivec3 p = coords(c);
         const S w = w_at(p);
+        const vec3 centre = vec3(p) + 0.5 - P.aux2.xyz;
         for (int ax = 0; ax < 3; ++ax) {
             const ivec3 e = e3(ax);
             for (int sgn = 0; sgn < 2; ++sgn) {
                 const ivec3 cs = sgn == 0 ? p + e : p - e;
                 if (!model_cell(cs)) continue;
-                const float pw =
-                    image_used(p, cs) ? gpw[cidx(cs)] : hllc(w, mirror(w, ax), ax).v[1 + ax];
+                // The face's normal momentum flux. Walls: the image's pressure
+                // at the true wall, else the mirror Riemann problem's; ports: the
+                // Riemann flux with the exit state (rho u_n^2 + p). Either keeps
+                // the grid's orientation: the solid on the right of a +e face, on
+                // the left of a -e one (the other way round reads an expansion
+                // as a compression).
+                const S ws = is_port(cs) ? port_state(cs) : mirror(w, ax);
+                const float pw = !is_port(cs) && image_used(p, cs) ? gpw[cidx(cs)]
+                                 : sgn == 0 ? hllc(w, ws, ax).v[1 + ax]
+                                            : hllc(ws, w, ax).v[1 + ax];
                 f += (sgn == 0 ? pw : -pw) * vec3(e);
+                const vec3 n = (sgn == 0 ? 1.0 : -1.0) * vec3(e);
+                m += cross(centre + 0.5 * n, (pw - 1.0 / GAMMA) * n);
             }
         }
     }
     s_f[lid] = f;
+    s_m[lid] = m;
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1) {
-        if (lid < s) s_f[lid] += s_f[lid + s];
+        if (lid < s) {
+            s_f[lid] += s_f[lid + s];
+            s_m[lid] += s_m[lid + s];
+        }
         barrier();
     }
-    if (lid == 0u) partials[linear_group()] = vec4(s_f[0], 0.0);
+    if (lid == 0u) {
+        partials[2u * linear_group()] = vec4(s_f[0], 0.0);
+        partials[2u * linear_group() + 1u] = vec4(s_m[0], 0.0);
+    }
 }
