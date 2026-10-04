@@ -71,7 +71,7 @@ that solver.
 | `flow_cache_mb` | double | 512 | Disk budget of the settled-flow cache, MiB (§9.6) |
 | `storage_f16` | bool | false | Half-precision distribution storage: an ungated approximation (§11.3) |
 | `mach_min`, `mach_max` | float | 0.3, 1.6 | Range of the transonic Mach slider |
-| `mach_slew` | float | 0.004 | Largest Mach change per batch (§9.1) |
+| `mach_slew` | float | 0.4 | Largest Mach change per flow-through of solver time, whatever the batch size (§9.1) |
 | `develop_flow_throughs` | double | 2.0 | Transonic development time, flow-throughs |
 | `force_ema_time` | double | 60 | Transonic dashboard smoothing, in cell sound-crossings |
 | `analysis_every` | int | 25 | Batches between refreshes of the wake survey and the spectra (§12) |
@@ -259,7 +259,8 @@ tunnel_run --catalogue
 | `--list` | - | Print the catalogue's model IDs, groups and names |
 | `--catalogue` | - | Voxelise every catalogue model at its default placement and report cells, areas and bounds (CTest `P2_catalogue`) |
 
-It prints progress ten times, then the mean and standard deviation of Cd and Cl over the second half
+It prints progress ten times, each line ending with the settling status and the wind as a speed in
+sea-level air (§1.2), then the mean and standard deviation of Cd and Cl over the second half
 of the run; the lift spectrum's strongest peaks as Strouhal numbers on the body's height, with the
 acoustic-mode spacing and the shedding peak below the first mode (§12.3); each probe's peak per
 component; the wake survey with `--average`; the rotors' tip-speed ratio, smoothed $C_T$ and
@@ -342,11 +343,11 @@ what it compared against and the measured value. See [`docs/VALIDATION.md`](VALI
 | Panel | Control | Range | Meaning |
 |---|---|---|---|
 | Tunnel | regime | subsonic / transonic | The solver (§8) |
-| Tunnel | flow speed | 0.005 - `u_max` | Freestream command; a change over 10 % re-develops (§9.2) |
+| Tunnel | flow speed | 0.005 - `u_max` (7 - 145 mph) | Freestream command, shown with its Mach-matched speed in sea-level air (§1.2); a change over 10 % re-develops (§9.2) |
 | Tunnel | inlet turbulence % | 0 - 2 | Synthetic inlet turbulence (§7) |
 | Tunnel | sim rate cap | flat out - 5,000 steps/s | Slow the solver to watch the flow evolve |
 | Tunnel | skip developing, pause, reset flow | - | Leave the detector early; pause; restart from rest (never from the cache) |
-| Tunnel (transonic) | Mach | 0.3 - 1.6 | Freestream Mach number; restart flow |
+| Tunnel (transonic) | Mach | 0.3 - 1.6 (228 - 1,218 mph) | Freestream Mach number, shown as a speed in sea-level air; restart flow |
 | Model | model | the catalogue | Applies the model's natural size and placement |
 | Model | placement | aviation / rolling road / fixed ground | Free air, a floor moving at the wind speed, or a stationary floor |
 | Model | size [cells] | 12 - 0.8 $n_x$ | Length of the longest axis |
@@ -354,7 +355,7 @@ what it compared against and the measured value. See [`docs/VALIDATION.md`](VALI
 | Model | pos x; pos y (air) or ride height (ground) | 0.1 - 0.8; 0.15 - 0.85 or 0 - 0.25 $n_y$ | Position |
 | Model | ref area | frontal / planform / manual (10 - 5,000) | The coefficients' reference area (§4.4) |
 | Model | spinning parts; spin ratio | 0 - 3 | Rim speed over wind speed (§9.3) |
-| Model | rotors turning; tip-speed ratio | 0 - 12 (starts at 6) | Tip speed over wind speed; shows $C_T$, $C_P$ and a warning past 5 % of the section swept (§3.12) |
+| Model | rotors turning; tip-speed ratio | 0 - 12 (starts at the rotor's design ratio) | Tip speed over wind speed; shows $C_T$, $C_P$ and a warning past 5 % of the section swept (§3.12) |
 | Model | engines (jets / intakes); throttle | 0 - 3 | Each port's speed ratio (subsonic) or exit pressure (transonic) times the throttle (§3.11, §8.12) |
 | Compare | save as A, save as B | - | Snapshot the coefficients and show B - A |
 | View | surface | hidden / voxel / smooth | How the body is drawn |

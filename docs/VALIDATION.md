@@ -169,10 +169,9 @@ diagnosable.
   Euler baseline check it bit for bit (§11.5).
 - **The interactive UI.** Its numbers come from the same `Tunnel` the gates drive.
 - **A heavily loaded rotor against one-dimensional momentum theory.** At $C_T = 0.5$ the actuator
-  disc's induction reads 8 % below $(1 - \sqrt{1 - C_T})/2$. The theory's relations hold for
-  averages over the disc and the stream tube; a disc in a viscous stream slows the air least at its
-  centre, and the comparison depends on how the average is taken, so it is reported rather than
-  gated (§3.12). The thrust itself is gated against the momentum the air gains.
+  disc's induction reads 8 % below $(1 - \sqrt{1 - C_T})/2$. Blockage, the kernel's width and the
+  viscosity were each varied and none accounts for it, so its cause is open and it is reported
+  rather than gated (§3.12). The thrust itself is gated against the momentum the air gains.
 - **An exhaust plume beyond its Mach disc.** The inviscid solver holds the plume's shear layer by
   numerical diffusion, so its spreading and the decay of its shock cells are not predicted (§8.12).
 - **The catalogue's geometric detail.** The models are stylised; `P2_catalogue` checks that every

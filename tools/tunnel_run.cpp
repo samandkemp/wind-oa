@@ -279,11 +279,16 @@ int main(int argc, char** argv) {
                         a.cd_wake, a.cd_balance,
                         a.wake_valid ? (a.cd_wake / a.cd_balance - 1.0) * 100.0 : 0.0,
                         a.mass_imbalance);
-        if (st.has_rotors)
+        if (st.has_rotors && st.rotor_coeffs_ready)
             std::printf("rotors %s, tip-speed ratio %.2f: C_T %+.4f  C_P %+.4f (swept area %.1f %% "
                         "of the section)\n",
                         st.rotors_turning ? "turning" : "parked", st.rotor_tsr, st.rotor_ct,
                         st.rotor_cp, 100.0 * st.rotor_blockage);
+        else if (st.has_rotors)
+            std::printf("rotors %s, tip-speed ratio %.2f: the wind is not yet at speed (swept "
+                        "area %.1f %% of the section)\n",
+                        st.rotors_turning ? "turning" : "parked", st.rotor_tsr,
+                        100.0 * st.rotor_blockage);
         if (st.has_ports)
             std::printf("engines %s, jet scale %.3f\n", st.power_on ? "on" : "off", st.jet_scale);
         std::printf("spin scale %.3f, cache: %s (%d entries)\n", st.spin_scale,

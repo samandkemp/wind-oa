@@ -15,6 +15,7 @@
 #include <vulkan/vulkan_win32.h>
 
 #include "png.hpp"
+#include "windoa/airspeed.hpp"
 
 namespace windoa::app {
 
@@ -395,10 +396,18 @@ void App::choose_model(std::size_t index) {
         placement_ = Placement{};
     }
     has_spinners_ = !m.spinners.empty();
+    const bool has_rotors = !m.rotors.empty();
+    if (has_rotors) // each rotor model starts at its own design point
+        rotor_tsr_ = float(m.rotors.front().tsr);
     placement_dirty_ = false;
     const Placement p = placement_;
     auto shared = std::make_shared<Model>(std::move(m));
     sim_->post([shared, p](Tunnel& t) { t.set_model(std::move(*shared), p); });
+    if (has_rotors) {
+        const bool on = rotors_on_;
+        const float tsr = rotor_tsr_;
+        sim_->post([on, tsr](Tunnel& t) { t.set_rotors(on, tsr); });
+    }
     cd_.clear();
     cl_.clear();
     cm_.clear();
@@ -839,14 +848,22 @@ void App::panel_tunnel(const TunnelStatus& st) {
                 st.developing ? "   (settling)" : "");
     ImGui::Text("Cm_z %+.4f   max|u| %.3f", st.cm, st.max_speed);
     ImGui::Separator();
-    if (ImGui::SliderFloat("flow speed", &u_command_, 0.005f, ts_.u_max, "%.3f")) {
+    // The slider reads in lattice units and, beside them, the Mach-matched
+    // speed in sea-level air (airspeed.hpp; ImGui takes the label as a format).
+    char speed_fmt[48];
+    std::snprintf(speed_fmt, sizeof(speed_fmt), "%%.3f  = %.0f mph",
+                  airspeed::mph(airspeed::metres_per_second(
+                      airspeed::mach_from_lattice(double(u_command_)))));
+    if (ImGui::SliderFloat("flow speed", &u_command_, 0.005f, ts_.u_max, speed_fmt)) {
         const float u = u_command_;
         sim_->post([u](Tunnel& t) { t.set_speed(u); });
     }
     ImGui::SetItemTooltip(
         "Freestream speed in lattice units (Mach = u sqrt 3, kept under ~0.19).\n"
+        "mph and m/s are the speed in sea-level air at that Mach number; the\n"
+        "Reynolds number stays near 10^3 whatever the speed (see Re_sim).\n"
         "Slew-limited so the lattice never shocks; a change over 10 %% re-develops.");
-    ImGui::Text("  u %.3f -> %.3f   Ma %.2f", st.u_applied, st.u_command, st.u_applied * 1.732f);
+    ImGui::Text("  u %.3f -> %.3f   Ma %.3f", st.u_applied, st.u_command, st.airspeed_mach);
     if (ImGui::SliderFloat("inlet turbulence %", &turb_pct_, 0.0f, 2.0f, "%.1f")) {
         const float t = turb_pct_;
         sim_->post([t](Tunnel& tn) { tn.set_turbulence(t); });
@@ -889,7 +906,10 @@ void App::panel_transonic(const TunnelStatus& st) {
     ImGui::TextDisabled("  inviscid: pressure + wave drag only");
     if (!st.health_note.empty() && st.health_note_age < 15.0)
         ImGui::TextColored({1.0f, 0.45f, 0.4f, 1.0f}, "%s", st.health_note.c_str());
-    if (ImGui::SliderFloat("Mach", &mach_command_, ts_.mach_min, ts_.mach_max, "%.3f")) {
+    char mach_fmt[48];
+    std::snprintf(mach_fmt, sizeof(mach_fmt), "%%.3f  = %.0f mph",
+                  airspeed::mph(airspeed::metres_per_second(double(mach_command_))));
+    if (ImGui::SliderFloat("Mach", &mach_command_, ts_.mach_min, ts_.mach_max, mach_fmt)) {
         const float m = mach_command_;
         sim_->post([m](Tunnel& t) { t.set_mach(m); });
     }
@@ -901,7 +921,7 @@ void App::panel_transonic(const TunnelStatus& st) {
     if (ImGui::Button("restart flow"))
         sim_->post([](Tunnel& t) { t.restart_flow(); });
     ImGui::TextDisabled("LBM paused (kept for switching back). Smoke, dye,");
-    ImGui::TextDisabled("vortex cores and spin are subsonic-only.");
+    ImGui::TextDisabled("vortex cores, spin and rotors are subsonic-only.");
     ImGui::TextDisabled("Try field: schlieren for the shocks.");
 }
 
@@ -1002,8 +1022,11 @@ void App::panel_model(const TunnelStatus& st) {
             const float t = rotor_tsr_;
             sim_->post([on, t](Tunnel& tn) { tn.set_rotors(on, t); });
         }
-        ImGui::TextDisabled("  rotor C_T %+.3f  C_P %+.3f%s", st.rotor_ct, st.rotor_cp,
-                            st.rotor_cp > 0.0 ? " (driven)" : "");
+        if (st.rotor_coeffs_ready)
+            ImGui::TextDisabled("  rotor C_T %+.3f  C_P %+.3f%s", st.rotor_ct, st.rotor_cp,
+                                st.rotor_cp > 0.0 ? " (driven)" : "");
+        else
+            ImGui::TextDisabled("  rotor C_T, C_P: once the wind is at speed");
         if (st.rotor_blockage > 0.05)
             ImGui::TextColored({1.0f, 0.75f, 0.35f, 1.0f},
                                "  swept area %.0f %% of the section: blocked, not free air",

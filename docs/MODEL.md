@@ -109,6 +109,11 @@ which is the "Re_sim" on the Tunnel panel. A real car at motorway speed is near 
 the tunnel works three orders of magnitude lower, so absolute drag coefficients are qualitative and
 *comparisons* are what it is for (§4.5).
 
+The panel also reads the speed in familiar units. The lattice's only absolute speed is its sound
+speed, so $U = 0.05$, Mach 0.087, is reported as the speed of sea-level air at that Mach number:
+$0.087 \times 340.3 = 29.5$ m/s, or 66 mph (§1.2). The figure matches the compressibility, not the
+Reynolds number, which is why a faster setting changes the picture less than a faster real wind.
+
 Time is easiest to read in **flow-throughs**: one flow-through is the time for the freestream to
 cross the tunnel, $n_x / U = 256 / 0.05 = 5{,}120$ steps on the fast grid. At the 3,240 million
 lattice updates per second measured in the sandbox, the fast grid advances 1,373 steps a second,

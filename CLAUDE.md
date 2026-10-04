@@ -64,6 +64,7 @@ engine/      headless core (static lib windoa_engine); Vulkan::Vulkan only
   include/windoa/convergence.hpp, flow_cache.hpp  settling detector, cache
   include/windoa/flow_stats.hpp FlowStats (GPU time averages), wake survey
   include/windoa/spectrum.hpp   spectrum (uneven samples -> Hann -> FFT)
+  include/windoa/airspeed.hpp   lattice speed / Mach -> m/s, mph (sea-level air)
   shaders/                     lbm_*, vox_*, euler_*, dye_*, turb_*, alm_* + includes
 render/      VolumeRenderer (march, Q cores, dye, surface paints incl. oil-flow
              LIC, slice LIC, mean reversed-flow shells, splats) + Tracers
@@ -127,7 +128,8 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
 - GPU report: `build\tools\RelWithDebInfo\device_info`
 - App: `build\app\RelWithDebInfo\windoa_app [fast|balanced|fine] [transonic]`
   (finds the repo root itself); scripted: `--show / --field / --warmup /
-  --frames / --shot / --zoom / --view / --mach` (app/src/main.cpp; the
+  --frames / --shot / --zoom / --view / --mach / --size / --power /
+  --rotors` (app/src/main.cpp; the
   README gallery commands are in GUIDE 3.7). Every exe prints its usage
   with `--help`; `tunnel_run --list` gives the model IDs. Dev tools: `tunnel_run`,
   `euler_run`, `bench`. clang-format: the VS Code C++ extension's
@@ -207,8 +209,11 @@ Dependency arrows point one way: app -> render -> engine; tools/validation
 - Rotors (actuator lines): without Prandtl tip loss the turbine's C_P
   passed Betz. A closed tunnel inflates C_P past Betz above ~5 % swept
   area, and the disc's induction falls short of C_T / 4 with blockage
-  (2.0 % at 1.2 %, 4.9 % at 4.9 %); the loaded disc's induction is not
-  uniform, so 1-D momentum theory at C_T 0.5 is reported, not gated.
+  (2.0 % at 1.2 %, 4.9 % at 4.9 %). At C_T 0.5 the induction reads 8 %
+  below 1-D theory, nearly uniform over 0.8 R; probed 2026-10-04: a 2.25x
+  section -0.2 pts, eps 1.25 changes only the rim, 3x nu +1.2 pts -- NOT
+  blockage, smearing or (mostly) viscosity; cause open, reported not gated.
+  (The earlier "lowest at the centre" explanation was wrong.)
 - The wake survey in a fixed-ground run includes the floor's friction
   (V31 B read 40 % off): survey-vs-balance checks belong in free air.
 - Bluff catalogue shapes blocking > ~15 % of the section diverged at

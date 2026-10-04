@@ -142,6 +142,19 @@ simulated at $\mathrm{Re} = 2{,}400$: about three orders of magnitude below a ro
 motorway speed. This is the single most important fact for reading the tunnel's numbers, and the
 reason absolute coefficients are qualitative (§4.5).
 
+**The equivalent airspeed.** The sound speed is the lattice's one absolute speed scale, so the
+sandbox reports the freestream as the speed in sea-level air with the same Mach number (ISA at
+15 °C, $a_0 = 340.3$ m/s):
+
+$$V = \mathrm{Ma}\, a_0 = \sqrt{3}\, U a_0.$$
+
+The default $U = 0.05$ is 29.5 m/s (66 mph) and the top of the slider, 0.11, is 64.8 m/s
+(145 mph); the compressible regime's Mach 0.3 - 1.6 is 102 - 545 m/s (228 - 1,218 mph). The
+settling line and the speed sliders carry it (`airspeed.hpp`). It matches the compressibility the
+lattice represents, and only that: the Reynolds number does not follow it. A car 4.5 m long at
+29.5 m/s runs at $\mathrm{Re} \approx 9 \times 10^6$, against the 2,400 simulated, so the speed is
+a guide to the regime, not a claim of similarity.
+
 ### 1.3 Grid conventions
 
 The grid presets are $256 \times 96 \times 96$ (fast), $320 \times 128 \times 128$ (balanced) and
@@ -518,10 +531,14 @@ falls short of $C_T / 4$ by 2.0 % at a blockage (swept area over the section) of
 2.2 % and 4.9 % at 4.9 %. A turbine whose disc fills much of the section then reads power
 coefficients that would pass the Betz limit, a closed tunnel's familiar error rather than the
 model's: the catalogue turbine is sized to 5 % of the section, and the app warns above that.
-**Non-uniform loading**: at heavier loading ($C_T = 0.5$) the measured induction falls 8 % short of
-the one-dimensional value $(1 - \sqrt{1 - C_T})/2$. Both momentum relations hold for averages over
-the disc and the stream tube, while a disc in a viscous stream slows the air least at its centre
-and most at its rim, which the Gaussian smears; the comparison is reported but not gated.
+**Heavier loading**: at $C_T = 0.5$ the induction over the inner 0.8 R falls 8 % short of the
+one-dimensional value $(1 - \sqrt{1 - C_T})/2$, and is nearly uniform there (7.4 % short over the
+inner half); over the whole disc it reads lower still, because the Gaussian spreads the rim's load
+beyond R. The shortfall is not the walls' or the kernel's doing: a section 2.25 times larger moves
+it by 0.2 points, and a kernel of $\varepsilon = 1.25$ changes the rim but not the core. It grows a
+little with the viscosity (9.2 % at three times $\nu$), yet most of it would remain without any,
+whilst the thrust still equals the momentum the air gains to 1 %. Its cause is open, and the
+comparison is reported, not gated.
 
 **Limits.** The polar is a thin aerofoil's rather than a measured section's, with no dynamic stall,
 no rotational delay of stall and no root loss. The blade is a force, not a body, so it has no
@@ -985,7 +1002,9 @@ $$u_{\mathrm{desired}} = u_{\mathrm{command}} \min\left(1, \frac{n}{n_{\mathrm{r
 
 An impulsive start can reach a local speed of 0.31, which is why a new body always
 restarts from rest. In ground mode the rolling road moves at the applied speed. The Mach number of
-the transonic regime is slewed similarly, by 0.004 per batch.
+the transonic regime is slewed similarly, by at most 0.4 per flow-through of solver time, measured
+over each batch, so the rate is the same whatever a batch holds: a fine grid's short batches, a
+fast one's long batches and a scripted warm-up all slew alike.
 
 ### 9.2 Operating points and restarts
 

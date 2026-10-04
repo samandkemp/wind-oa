@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <sstream>
 
+#include "windoa/airspeed.hpp"
 #include "windoa/shapes.hpp"
 
 namespace windoa {
@@ -418,7 +419,7 @@ void Tunnel::restart_transonic(const std::string& why) {
     euler_->init_freestream();
     euler_force_ema_ = {};
     euler_moment_ema_ = {};
-    euler_time0_ = euler_time_ = 0.0;
+    euler_batch_time_ = euler_time_ = 0.0;
     peak_mach_ = 0.0f;
     ++flow_epoch_;
     if (!why.empty()) {
@@ -429,8 +430,13 @@ void Tunnel::restart_transonic(const std::string& why) {
 }
 
 void Tunnel::advance_transonic(int steps) {
-    // Slew the Mach number: a slider jump must not shock the whole tunnel.
-    const float d = std::clamp(mach_command_ - mach_applied_, -s_.mach_slew, s_.mach_slew);
+    // Slew the Mach number: a slider jump must not shock the whole tunnel. The
+    // rate is per flow-through of solver time (over the previous batch), so it
+    // does not depend on how many steps a batch holds: the preset, the frame
+    // rate and a scripted warm-up all slew alike.
+    const double batch_ft = euler_batch_time_ * std::max(mach_applied_, 0.3f) / s_.nx;
+    const float max_d = float(s_.mach_slew * batch_ft);
+    const float d = std::clamp(mach_command_ - mach_applied_, -max_d, max_d);
     if (d != 0.0f) {
         mach_applied_ += d;
         euler_->set_mach(mach_applied_);
@@ -442,6 +448,7 @@ void Tunnel::advance_transonic(int steps) {
     const std::array<double, 3>& f = loads.force;
     const std::array<double, 3>& m = loads.moment;
     euler_time_ = euler_->time();
+    euler_batch_time_ = euler_time_ - t0;
     ++batch_;
     bool finite = true;
     for (int k = 0; k < 3; ++k)
@@ -1102,7 +1109,15 @@ TunnelStatus Tunnel::status() const {
     TunnelStatus t;
     t.paused = paused_;
     t.model_label = model_.label;
-    t.phase = paused_ ? "PAUSED" : steps_done_ < s_.ramp_steps ? "RAMPING" : develop_.status();
+    // The settling line names the wind as a speed in sea-level air: the
+    // target while ramping, the applied speed after (THEORY 1.2).
+    t.airspeed_mach = airspeed::mach_from_lattice(u_applied_);
+    if (paused_)
+        t.phase = "PAUSED";
+    else if (steps_done_ < s_.ramp_steps)
+        t.phase = "RAMPING to " + airspeed::describe(airspeed::mach_from_lattice(u_command_));
+    else
+        t.phase = develop_.status() + " at " + airspeed::describe(t.airspeed_mach);
     t.developing = develop_.developing();
     t.settled = develop_.settled();
     t.flow_throughs = develop_.flow_throughs();
@@ -1155,6 +1170,7 @@ TunnelStatus Tunnel::status() const {
         const double u = std::max(double(u_applied_), 1e-3);
         t.rotor_ct = rotor_thrust_ema_ / (0.5 * u * u * area);
         t.rotor_cp = rotor_power_ema_ / (0.5 * u * u * u * area);
+        t.rotor_coeffs_ready = std::abs(u_applied_ - u_command_) <= 0.02f * u_command_;
         t.rotor_tsr = float(tsr);
         t.rotor_blockage = frontal / (double(s_.ny) * s_.nz);
         t.rotor_segments = alm_->blade_outlines();
@@ -1183,9 +1199,11 @@ TunnelStatus Tunnel::status() const {
         t.developing = ft < s_.develop_flow_throughs;
         t.settled = !t.developing;
         t.steps = euler_->steps_taken();
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "TRANSONIC  M %.3f -> %.3f   %s %.1f%s flow-throughs",
-                      mach_applied_, mach_command_, t.developing ? "DEVELOPING" : "", ft,
+        t.airspeed_mach = mach_applied_;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "TRANSONIC  M %.3f -> %.3f, %s   %s %.1f%s flow-throughs",
+                      mach_applied_, mach_command_, airspeed::describe(mach_applied_).c_str(),
+                      t.developing ? "DEVELOPING" : "", ft,
                       t.developing ? (" / " + fmt(s_.develop_flow_throughs, 0)).c_str() : "");
         t.phase = paused_ ? "PAUSED" : buf;
         const double q =
@@ -1196,6 +1214,8 @@ TunnelStatus Tunnel::status() const {
         t.cm = euler_moment_ema_[2] / (q * std::max(placement_.length_cells, 1.0f));
         t.re_sim = 0.0;
     }
+    t.airspeed_mps = airspeed::metres_per_second(t.airspeed_mach);
+    t.airspeed_mph = airspeed::mph(t.airspeed_mps);
     return t;
 }
 

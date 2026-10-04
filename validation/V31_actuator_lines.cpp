@@ -12,10 +12,9 @@
 //          the smeared force is the force applied.
 //      Measured, not gated, at C_T 0.5: the induction against 1-D momentum
 //      theory, a = (1 - sqrt(1 - C_T)) / 2, and Froude's ratio of far-wake to
-//      disc induction on the axis. Both relations hold for disc and stream-
-//      tube averages; the loaded disc's induction is not uniform (lowest at
-//      the centre), and the Gaussian smears the rim where it is highest
-//      (THEORY 3.12).
+//      disc induction on the axis. The induction reads 8 % short; a wider
+//      section, a narrower kernel and a lower viscosity barely move it, so its
+//      cause is open (THEORY 3.12).
 //   B. The app's tunnel (Tunnel, fast grid): the catalogue wind turbine in
 //      free air (a floor's friction would join the survey but not the
 //      balance), sized to a swept area of 5 % of the section, its actuator-line rotor

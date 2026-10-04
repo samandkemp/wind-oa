@@ -80,7 +80,7 @@ struct TunnelSettings {
     bool storage_f16 = false;
     // Transonic mode
     float mach_min = 0.3f, mach_max = 1.6f;
-    float mach_slew = 0.004f;           // per batch
+    float mach_slew = 0.4f;             // per flow-through of solver time
     double develop_flow_throughs = 2.0; // impulsive start: developing this long
     double force_ema_time = 60.0;       // sim time (cell sound-crossings)
     // Statistics and signals (THEORY 12)
@@ -177,6 +177,9 @@ struct TunnelStatus {
     double flow_throughs = 0.0;
     std::int64_t steps = 0;
     float u_applied = 0.0f, u_command = 0.0f;
+    // The applied freestream as the Mach-matched speed in sea-level air
+    // (airspeed.hpp, THEORY 1.2), in either regime.
+    double airspeed_mach = 0.0, airspeed_mps = 0.0, airspeed_mph = 0.0;
     double cd = 0, cl = 0, cs = 0, cm = 0; // EMA coefficients
     double re_sim = 0.0;
     double a_ref = 1.0, a_frontal = 1.0, a_planform = 1.0, a_manual = 100.0;
@@ -202,6 +205,9 @@ struct TunnelStatus {
     bool has_rotors = false, rotors_turning = false;
     float rotor_tsr = 0.0f;
     double rotor_ct = 0.0, rotor_cp = 0.0;
+    // False while the inlet ramps or slews: the rotor turns at the commanded
+    // tip-speed ratio, so coefficients over the instantaneous speed mean nothing.
+    bool rotor_coeffs_ready = false;
     double rotor_blockage = 0.0; // swept area projected on the stream, over the section
     std::vector<std::array<std::array<float, 3>, 2>> rotor_segments;
     std::string cache_note;
@@ -405,7 +411,8 @@ class Tunnel {
     bool euler_stale_ = true; // the model changed since the Euler grid was built
     float mach_command_ = 0.8f, mach_applied_ = 0.8f, peak_mach_ = 0.0f;
     std::array<double, 3> euler_force_ema_{}, euler_moment_ema_{};
-    double euler_time0_ = 0.0, euler_time_ = 0.0;
+    double euler_batch_time_ = 0.0,
+           euler_time_ = 0.0; // the last batch's solver time; since the restart
 };
 
 } // namespace windoa

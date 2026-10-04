@@ -132,13 +132,18 @@ the flow controls.
 
 - **DEVELOPING** after any change means the wake is forming and washing through the tunnel, which
   takes 2 - 4.5 flow-throughs; that is physics, not slowness. The numbers can be trusted once it
-  reads **SETTLED**. *skip developing* hands control back early.
+  reads **SETTLED**. *skip developing* hands control back early. The line ends with the wind as a
+  speed in sea-level air, for example "SETTLED after 2.5 flow-throughs at 29.5 m/s (66 mph)".
 - **Cd, Cl, Cs** are the drag, lift and side-force coefficients, over $q A_{\mathrm{ref}}$; **Cm_z**
   is the pitching moment about the model's centre, over $q A_{\mathrm{ref}} L$.
 - **Re_sim** is the Reynolds number actually simulated, about $10^3$. A car at motorway speed is
   about $4 \times 10^6$, so absolute Cd is qualitative and comparisons are trustworthy (Part 3).
-- **flow speed** is in lattice units (Mach = $u \sqrt{3}$, kept under about 0.19). Changes are
-  slew-limited so the lattice never shocks; a change of more than 10 % re-develops.
+- **flow speed** is in lattice units (Mach = $u \sqrt{3}$, kept under about 0.19), shown beside
+  its speed in mph: the speed in sea-level air at the same Mach number, from 7 mph at the bottom of
+  the slider to 145 mph at the top (66 mph at the default 0.05). It matches the compressibility,
+  not the Reynolds number, which stays near $10^3$ whatever the speed (THEORY §1.2); a faster wind
+  therefore changes the picture less than a real one would. Changes are slew-limited so the lattice
+  never shocks; a change of more than 10 % re-develops.
 - **inlet turbulence %** adds real-tunnel freestream turbulence, a divergence-free gust field
   carried in through the inlet (0 is a clean inlet; real tunnels run about 0.1 - 2 %).
 - **sim rate cap** slows the solver, to watch a flow evolve.
@@ -163,7 +168,8 @@ the flow controls.
 - *rotors turning* appears on models with rotors (the turbine, the propellers, the quadcopter).
   The blades are not solid: they are lines of lift and drag forces computed from the local flow,
   drawn as turning outlines (section 4.6). The *tip-speed ratio* is tip speed over wind speed,
-  starting at 6 (the turbine is designed for 7, the propellers for 4.5); parked, the blades still
+  starting at the rotor's design ratio (7 for the turbine, 4.5 for the propellers, 6 for the
+  quadcopter); parked, the blades still
   take the wind. The panel shows the rotor's thrust and power coefficients and warns when the
   rotor sweeps more than 5 % of the tunnel's section, where blockage moves them from their
   free-air values.
@@ -233,8 +239,7 @@ every overlay, the slices (`slice`, `hslice`, `xslice`) and the clean-picture sw
 `noplots`, `nobox`, `nosurface`); REFERENCE lists them all.
 
 The README's images come from these runs (each restores a settled flow from the cache when it
-has one, so a second run is quicker; the transonic runs take their frames after the warm-up because
-the Mach number slews once per batch, and the warm-up runs as a few long batches):
+has one, so a second run is quicker):
 
 ```
 windoa_app --model car_saloon --zoom 0.6 --view 40,22 --warmup 30000 --frames 240 --shot app.png
@@ -243,7 +248,7 @@ windoa_app fine --model wind_turbine --rotors 7 --show "q,nohaze,nosmoke,noui,no
 windoa_app --model ahmed_25deg --show "timelines,nohaze,noui,noplots" --zoom 0.5 --view 60,30 --warmup 25000 --frames 240 --shot ahmed_timelines.png
 windoa_app --model car_saloon --show "oil,nohaze,nosmoke,noui,noplots" --zoom 0.3 --view 150,30 --warmup 30000 --frames 60 --shot saloon_oil_flow.png
 windoa_app transonic --mach 0.8 --model wing_naca0012 --aoa 2 --field mach --show "slice,noui,noplots,nobox" --zoom 0.3 --view 90,0 --warmup 8000 --frames 120 --shot transonic_wing.png
-windoa_app transonic --mach 1.5 --model aim120 --size 90 --power 1 --field schlieren --show "slice,noui,noplots,nobox,nosurface" --zoom 0.55 --view 90,0 --warmup 20000 --frames 1000 --shot missile_plume.png
+windoa_app transonic --mach 1.5 --model aim120 --size 90 --power 1 --field schlieren --show "slice,noui,noplots,nobox,nosurface" --zoom 0.55 --view 90,0 --warmup 20000 --frames 120 --shot missile_plume.png
 ```
 
 # Part 2 - Building situations
@@ -324,8 +329,10 @@ The lattice Boltzmann solver is trusted to about Mach 0.3 and cannot form shocks
 TRANSONIC* hands the same tunnel and model to a compressible Euler solver (finite volume: MUSCL,
 HLLC, SSP-RK2, with image-point walls from the exact distance to the surface).
 
-- A *Mach* slider (0.3 - 1.6) replaces the speed. *schlieren* shows the shocks and *Mach* the
-  supersonic pockets; the panel shows the peak local Mach number.
+- A *Mach* slider (0.3 - 1.6, shown as 228 - 1,218 mph in sea-level air) replaces the speed.
+  A change is slewed at up to 0.4 Mach per flow-through, so the tunnel is never shocked by the
+  slider. *schlieren* shows the shocks and *Mach* the supersonic pockets; the panel shows the peak
+  local Mach number.
 - Cd, Cl and Cm_z are pressure forces and their moment only: the solver is inviscid, so there is
   wave drag but no skin friction.
 - After a switch or a new model the flow develops for two flow-throughs.
