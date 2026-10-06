@@ -1,4 +1,6 @@
-# GLSL compute shaders -> SPIR-V at build time -> embedded C++ arrays.
+# GLSL shaders (compute; the renderer's one vertex / fragment pair) ->
+# SPIR-V at build time -> embedded C++ arrays; glslc takes the stage from
+# the extension (.comp, .vert, .frag), so each name must be unique.
 # No runtime shader files and no JIT: a first-use compile would stall the
 # first solver steps and frames. Usage:
 #   windoa_add_shaders(<target> shaders/foo.comp ...)

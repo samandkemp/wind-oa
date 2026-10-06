@@ -1,5 +1,6 @@
 #include "window.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "imgui_impl_win32.h"
@@ -26,12 +27,25 @@ Window::Window(const wchar_t* title, int width, int height) {
     wc.lpszClassName = kClassName;
     RegisterClassExW(&wc);
 
+    // No size given: 80 % of the primary screen's work area, centred on it
+    // (in pixels: the process is DPI-aware, so a fixed size would be small on
+    // a large screen and large on a small one).
+    RECT work{0, 0, 1920, 1080};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    const int work_w = work.right - work.left, work_h = work.bottom - work.top;
+    if (width <= 0 || height <= 0) {
+        width = std::max(640, int(0.8 * work_w));
+        height = std::max(360, int(0.8 * work_h));
+    }
     // Size the client area (what Vulkan draws into), not the outer frame.
     RECT r{0, 0, width, height};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    const int outer_w = r.right - r.left, outer_h = r.bottom - r.top;
+    const int x = work.left + std::max(0, (work_w - outer_w) / 2);
+    const int y = work.top + std::max(0, (work_h - outer_h) / 2);
     // `this` rides along in lpParam so proc() can find the object.
-    hwnd_ = CreateWindowExW(0, kClassName, title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                            r.right - r.left, r.bottom - r.top, nullptr, nullptr, hinst_, this);
+    hwnd_ = CreateWindowExW(0, kClassName, title, WS_OVERLAPPEDWINDOW, x, y, outer_w, outer_h,
+                            nullptr, nullptr, hinst_, this);
     if (!hwnd_)
         throw std::runtime_error("CreateWindowExW failed");
     ShowWindow(hwnd_, SW_SHOWDEFAULT);
@@ -85,6 +99,12 @@ LRESULT CALLBACK Window::proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (self)
             self->resized_ = true;
         return 0;
+    case WM_DPICHANGED: { // moved to a monitor of another scale: take the size it suggests
+        const RECT* r = reinterpret_cast<const RECT*>(lp);
+        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
     case WM_SYSCOMMAND:
         if ((wp & 0xfff0) == SC_KEYMENU)
             return 0; // Alt would freeze the loop in a menu

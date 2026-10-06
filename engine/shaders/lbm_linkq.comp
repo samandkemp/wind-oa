@@ -1,0 +1,20 @@
+#version 450
+// Write wall-link fractions into the packed u8 link array (Solver::
+// set_link_q_sparse): entry k sets byte index[k] to value[k]. The region was
+// filled with 128 (half-way) first, in the same submission; several entries
+// may share a 32-bit word, so each clears and sets its byte atomically.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "lbm_params.glsl"
+
+layout(std430, binding = 0) buffer LinkQ { uint link_q[]; };  // packed u8, [Q][cell]
+layout(std430, binding = 1) readonly buffer Entries { uvec2 entries[]; };  // byte index, value
+
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    if (k >= uint(P.aux.x)) return;
+    const uvec2 e = entries[k];
+    const uint word = e.x >> 2u, shift = (e.x & 3u) * 8u;
+    atomicAnd(link_q[word], ~(0xFFu << shift));
+    atomicOr(link_q[word], (e.y & 0xFFu) << shift);
+}

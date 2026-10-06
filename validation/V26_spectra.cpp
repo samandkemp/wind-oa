@@ -78,7 +78,7 @@ void part_d(Context& ctx, gate::Gate& g) {
             for (int y = 0; y < NY; ++y)
                 for (int z = 0; z < NZ; ++z) {
                     const double rho = 1.0 + 1e-4 * std::cos(gate::kPi * (y + 0.5) / NY);
-                    f[std::size_t(i) * n + (std::size_t(x) * NY + y) * NZ + z] = float(w * rho);
+                    f[std::size_t(i) * n + Grid{NX, NY, NZ}.index(x, y, z)] = float(w * rho);
                 }
     }
     s.set_state(f);

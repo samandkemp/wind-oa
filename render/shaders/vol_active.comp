@@ -1,0 +1,68 @@
+#version 450
+// Where the march can skip (THEORY 10.11), each frame it may, in two modes:
+//   0  per occupancy block: active[b] = 1 where a cell of block b, or of the
+//      one-cell rim round it (a trilinear sample in the block reaches that
+//      far), can lift the haze above its floor -- by the march's own test:
+//      v > floor for the grey and Mach maps, |v| > floor for the others. A
+//      trilinear sample is a convex mixture of its cells, so in a block
+//      with no such cell every sample is below the floor.
+//   1  per macro block (MACRO^3 occupancy blocks): busy[m] = 1 where any of
+//      its blocks is near solid (occ) or, with the haze, active. A ray
+//      crosses a block that is not busy without anything to draw, so the
+//      march steps over a whole macro block at a time, then a single block.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "vol_common.glsl"
+
+layout(push_constant) uniform Params {
+    ivec4 dims;  // nx, ny, nz, colour mode
+    vec4 haze;   // floor, haze on (mode 1), mode, -
+} P;
+
+layout(std430, binding = 0) readonly buffer Field { float field[]; };
+layout(std430, binding = 1) buffer Active { uint block_active[]; };
+layout(std430, binding = 2) readonly buffer Occ { uint occ[]; };
+layout(std430, binding = 3) writeonly buffer MacroBusy { uint macro_busy[]; };
+
+void main() {
+    const ivec3 n = P.dims.xyz;
+    const ivec3 nb = (n + OCC_BLOCK - 1) / OCC_BLOCK;
+    const uint b = gl_GlobalInvocationID.x;
+    if (P.haze.z == 0.0) {
+        if (b >= uint(nb.x * nb.y * nb.z)) return;
+        const ivec3 bc = ivec3(int(b) / (nb.y * nb.z), (int(b) / nb.z) % nb.y, int(b) % nb.z);
+        const ivec3 lo = max(bc * OCC_BLOCK - 1, ivec3(0));
+        const ivec3 hi = min(bc * OCC_BLOCK + OCC_BLOCK, n - 1);  // inclusive
+        const bool signed_test = P.dims.w >= CMODE_GREY;
+        const float floor_v = P.haze.x;
+        uint hot = 0u;
+        for (int x = lo.x; x <= hi.x && hot == 0u; ++x)
+            for (int y = lo.y; y <= hi.y && hot == 0u; ++y)
+                for (int z = lo.z; z <= hi.z; ++z) {
+                    const float v = field[cell_index(x, y, z, n)];
+                    if (signed_test ? v > floor_v : abs(v) > floor_v) {
+                        hot = 1u;
+                        break;
+                    }
+                }
+        block_active[b] = hot;
+        return;
+    }
+    const ivec3 nm = (nb + MACRO_BLOCK - 1) / MACRO_BLOCK;
+    if (b >= uint(nm.x * nm.y * nm.z)) return;
+    const ivec3 mc = ivec3(int(b) / (nm.y * nm.z), (int(b) / nm.z) % nm.y, int(b) % nm.z);
+    const ivec3 lo = mc * MACRO_BLOCK;
+    const ivec3 hi = min(lo + MACRO_BLOCK, nb);  // exclusive
+    const bool haze = P.haze.y != 0.0;
+    uint busy = 0u;
+    for (int x = lo.x; x < hi.x && busy == 0u; ++x)
+        for (int y = lo.y; y < hi.y && busy == 0u; ++y)
+            for (int z = lo.z; z < hi.z; ++z) {
+                const int k = (x * nb.y + y) * nb.z + z;
+                if (occ[k] == 1u || (haze && block_active[k] != 0u)) {
+                    busy = 1u;
+                    break;
+                }
+            }
+    macro_busy[b] = busy;
+}

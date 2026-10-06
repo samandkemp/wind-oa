@@ -11,8 +11,11 @@
 // tau_plus 1.0 keeps a blob's mass to 0.04 % and C bounded (<= 1.07)
 // round the Ahmed body (V20).
 //
-// Stepping: once per flow step, after it -- lbm::Solver::step's per-step
-// hook calls record_step() with the step's fresh macro buffer.
+// Stepping: once per flow step. attach() fuses it into the flow's own step
+// kernel (lbm::Solver::fuse_scalar: no separate pass, and the flow's rho / u
+// stay lazy), the default; record_step() is the reference path, a pass after
+// each flow step through the solver's per-step hook. The two agree bit for
+// bit (tools/lbm_equiv).
 #pragma once
 
 #include <span>
@@ -26,6 +29,7 @@ namespace windoa {
 class Dye {
   public:
     Dye(Context& ctx, const lbm::Solver& solver, float tau = 0.53f, float tau_plus = 1.0f);
+    ~Dye();
     Dye(const Dye&) = delete;
     Dye& operator=(const Dye&) = delete;
 
@@ -37,10 +41,18 @@ class Dye {
     // Per-cell relaxation rates towards C = 1, 0..1 (0 = no source).
     void set_sources(std::span<const float> rates);
 
-    // Record one dye step after a flow step whose output is macro_buffer(k).
+    // Fused into `solver`'s steps until detach() (or destruction).
+    void attach(lbm::Solver& solver);
+    void detach();
+    bool attached() const { return attached_ != nullptr; }
+
+    // Reference path: one dye step after a flow step whose output is
+    // macro_buffer(k).
     void record_step(VkCommandBuffer cmd, int macro_index);
-    // Headless: n coupled steps (flow step, then dye step, n times).
+    // Headless: n coupled steps, fused (attached for the call when not
+    // already); step_with_reference() through the per-step hook instead.
     void step_with(lbm::Solver& solver, int n);
+    void step_with_reference(lbm::Solver& solver, int n);
 
     const Buffer& concentration_buffer() const { return conc_; }
     std::vector<float> concentration();
@@ -52,6 +64,7 @@ class Dye {
     std::size_t n_;
     Groups groups_;
     int parity_ = 0;
+    lbm::Solver* attached_ = nullptr;
     Buffer g_[2];
     Buffer conc_;
     Buffer src_;

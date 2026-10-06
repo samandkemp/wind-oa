@@ -28,7 +28,7 @@ const float TURB_SPAN = 0.2;  // turbulence intensity 0 - 20 % fills the scale
 layout(push_constant) uniform Params {
     ivec4 dims;  // nx, ny, nz, mode
     vec4 ref;    // u_ref, rho_ref (Euler: p_ref), pscale, gamma (0 = LBM)
-    vec4 stats;  // 1 / weight (0 = no statistics), recirc output on, -, -
+    vec4 stats;  // 1 / weight (0 = no statistics), recirc output on, colour range, log scale
 } P;
 
 layout(std430, binding = 0) readonly buffer Flags { uint flags[]; };
@@ -98,6 +98,11 @@ void main() {
             }
         }
     }
+    // The colour range and log scale chosen in the View panel: the value that
+    // fills the scale, and a log that keeps it while opening the weak end.
+    // Range 1 without the log leaves v exactly as computed.
+    if (P.stats.z > 0.0 && P.stats.z != 1.0) v /= P.stats.z;
+    if (P.stats.w > 0.0) v = sign(v) * log(1.0 + 9.0 * abs(v)) / log(10.0);
     field[c] = v;
     speed[c] = length(macro[c].xyz);
     if (P.stats.y > 0.0)

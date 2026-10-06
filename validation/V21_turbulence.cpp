@@ -78,7 +78,7 @@ double dcomp(const std::vector<float>& f, int S, int NY, int NZ, int s, int y, i
         a = (a + S) % S;
         b = (b + NY) % NY;
         c = (c + NZ) % NZ;
-        return double(f[((std::size_t(a) * NY + b) * NZ + c) * 3 + k]);
+        return double(f[Grid{S, NY, NZ}.index(a, b, c) * 3 + k]);
     };
     const int o[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
     return 0.5 * (at(s + o[ax][0], y + o[ax][1], z + o[ax][2]) -

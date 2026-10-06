@@ -1,6 +1,8 @@
 #version 450
 // Pass 2: one ray per pixel, front to back with a running transmittance,
-// compositing the model surface (voxel or smooth, optionally Cp-painted),
+// compositing the model surface (its mesh -- the distance and normal per
+// pixel from the raster pass, THEORY 10.10 -- or the solver's cells as
+// voxels or smoothed; optionally Cp-painted),
 // an opaque slice plane, Q-criterion vortex cores, dye smoke, the field
 // haze, the mean reversed-flow region and the tunnel box edges.
 // The surface can be painted with Cp, the near-wall speed, the near-wall
@@ -22,8 +24,11 @@ layout(local_size_x = 8, local_size_y = 8) in;
 const int SURFACE_HIDDEN = 0;
 const int SURFACE_VOXEL = 1;
 const int SURFACE_SMOOTH = 2;
+const int SURFACE_MESH = 3;
 const float SOLID_SUBSTEP = 0.5;
-const vec3 BACKGROUND = vec3(0.05, 0.05, 0.09);
+// The background: a gentle gradient, darker below.
+const vec3 BACKGROUND_LOW = vec3(0.025, 0.027, 0.045);
+const vec3 BACKGROUND_HIGH = vec3(0.080, 0.088, 0.135);
 
 // Feature bits in P.img.z
 const int F_BOX = 1;
@@ -34,6 +39,7 @@ const int F_DYE = 16;
 const int F_DYE_BY_SPEED = 32;
 const int F_RECIRC = 64;     // mean reversed-flow shells (needs t_recirc)
 const int F_SLICE_LIC = 128; // LIC texture on the slice
+const int F_SKIP = 2048;     // step over empty blocks (no dye, cores or shells drawn)
 
 // Surface paint (P.img.w >> 4), with F_PAINT_CP as the on switch
 const int PAINT_CP = 0;
@@ -49,7 +55,7 @@ const float DYE_SPEED_SPAN = 1.5;  // dye colour spans |u| / U in [0, 1.5]
 layout(push_constant) uniform Params {
     ivec4 dims;   // nx, ny, nz, n_steps
     ivec4 img;    // width, height, feature bits, surface | paint << 4
-    ivec4 modes;  // cmode, slice_axis (-1 = none), pscale (float bits), -
+    ivec4 modes;  // cmode, slice_axis (-1 = none), pscale, LIC phase (float bits)
     vec4 eye;     // xyz, tan(fov / 2)
     vec4 fwd;     // xyz, aspect
     vec4 right;   // xyz, u_ref
@@ -73,6 +79,22 @@ layout(std430, binding = 9) writeonly buffer Image { uint image[]; };
 layout(std430, binding = 10) writeonly buffer Depth { float depth[]; };
 layout(binding = 11) uniform sampler3D t_speed;  // |u| per cell
 layout(binding = 12) uniform sampler3D t_recirc;  // <u_x> / U per cell (F_RECIRC)
+// SURFACE_MESH: per pixel the mesh's normal and the distance to it (1e30: none)
+layout(std430, binding = 13) readonly buffer Surf { vec4 surf[]; };
+// F_SKIP: blocks where the haze can show, and macro blocks with anything to
+// draw (vol_active.comp)
+layout(std430, binding = 14) readonly buffer Active { uint block_active[]; };
+layout(std430, binding = 15) readonly buffer MacroBusy { uint macro_busy[]; };
+
+// Distance along d from eye to where it leaves the box [lo, lo + size).
+float box_exit(vec3 eye, vec3 d, vec3 lo, float size) {
+    float t = 1e30;
+    for (int k = 0; k < 3; ++k) {
+        if (d[k] > 1e-9) t = min(t, (lo[k] + size - eye[k]) / d[k]);
+        else if (d[k] < -1e-9) t = min(t, (lo[k] - eye[k]) / d[k]);
+    }
+    return t;
+}
 
 ivec3 N;
 
@@ -109,7 +131,28 @@ vec3 qcoremap(float t) {
     return mix(vec3(0.30, 0.95, 0.50), vec3(0.85, 0.55, 0.30), clamp(t, 0.0, 1.0));
 }
 
+// A sequential map with even lightness steps (after matplotlib's viridis).
+vec3 seqmap(float t) {
+    const float tc = clamp(t, 0.0, 1.0);
+    const vec3 c0 = vec3(0.267, 0.005, 0.329), c1 = vec3(0.229, 0.322, 0.546);
+    const vec3 c2 = vec3(0.128, 0.567, 0.551), c3 = vec3(0.369, 0.789, 0.383);
+    const vec3 c4 = vec3(0.993, 0.906, 0.144);
+    if (tc < 0.25) return mix(c0, c1, tc / 0.25);
+    if (tc < 0.5) return mix(c1, c2, (tc - 0.25) / 0.25);
+    if (tc < 0.75) return mix(c2, c3, (tc - 0.5) / 0.25);
+    return mix(c3, c4, (tc - 0.75) / 0.25);
+}
+
+int palette;          // 0: each field's own map (P.img.z bits 8 - 9)
+bool magnitude_field;  // P.img.z bit 10: a magnitude from zero (|vorticity|, schlieren, turbulence)
 vec3 fieldcolour(float sv, int cmode) {
+    if (palette > 0) {  // a signed field spans the map about its middle, a magnitude from zero
+        const float tp =
+            magnitude_field ? clamp(sv, 0.0, 1.0) : 0.5 + 0.5 * clamp(sv, -1.0, 1.0);
+        if (palette == 1) return seqmap(tp);
+        if (palette == 2) return coolwarm(tp);
+        return vec3(0.88, 0.92, 1.0) * tp;
+    }
     const float t = 0.5 + 0.5 * clamp(sv, -1.0, 1.0);
     if (cmode == CMODE_VORT) return vortmap(t);
     if (cmode == CMODE_GREY) return vec3(0.88, 0.92, 1.0) * clamp(sv, 0.0, 1.0);
@@ -222,12 +265,23 @@ vec3 wall_flow(vec3 p, vec3 nrm) {
     return u - dot(u, nrm) * nrm;
 }
 
+// Animated flow textures (the periodic motion filter of Cabral & Leedom
+// 1993): the samples along a streak are weighted by a ripple at arc length s
+// whose phase advances every frame, so the texture travels downstream with
+// the flow. A negative phase leaves the still texture exactly as it was.
+float lic_phase;
+float ripple(float s, float period) {
+    if (lic_phase < 0.0) return 1.0;
+    return 0.3 + 0.35 * (1.0 + cos(6.2831853 * (s / period - lic_phase)));
+}
+
 // Oil-flow streaks: the noise averaged along the near-wall flow over the
 // surface (a tent filter), so streaks follow the skin-friction lines and
 // break up where the flow separates or stalls.
 float surface_lic(vec3 p0, vec3 n0, float freq) {
-    float acc = lic_noise(p0, freq), wsum = 1.0;
-    const float h = 0.35 / freq;
+    const float h = 0.35 / freq, period = float(LIC_STEPS) * h;
+    const float r0 = ripple(0.0, period);
+    float acc = r0 * lic_noise(p0, freq), wsum = r0;
     for (int dir = -1; dir <= 1; dir += 2) {
         vec3 p = p0, nrm = n0;
         for (int k = 1; k <= LIC_STEPS; ++k) {
@@ -236,7 +290,8 @@ float surface_lic(vec3 p0, vec3 n0, float freq) {
             if (s < 1e-7) break;
             p += float(dir) * h * ut / s;
             nrm = smooth_normal(p);
-            const float w = 1.0 - float(k) / float(LIC_STEPS + 1);
+            const float w = (1.0 - float(k) / float(LIC_STEPS + 1)) *
+                            ripple(float(dir * k) * h, period);
             acc += w * lic_noise(p, freq);
             wsum += w;
         }
@@ -246,8 +301,9 @@ float surface_lic(vec3 p0, vec3 n0, float freq) {
 
 // The same along the slice's in-plane flow (axis = the slice normal).
 float slice_lic(vec3 p0, int axis, float freq) {
-    float acc = lic_noise(p0, freq), wsum = 1.0;
-    const float h = 0.35 / freq;
+    const float h = 0.35 / freq, period = float(LIC_SLICE_STEPS) * h;
+    const float r0 = ripple(0.0, period);
+    float acc = r0 * lic_noise(p0, freq), wsum = r0;
     for (int dir = -1; dir <= 1; dir += 2) {
         vec3 p = p0;
         for (int k = 1; k <= LIC_SLICE_STEPS; ++k) {
@@ -259,12 +315,44 @@ float slice_lic(vec3 p0, int axis, float freq) {
             if (any(lessThan(p, vec3(0.0))) || any(greaterThanEqual(p, vec3(N))) ||
                 is_solid_cell(cell_of(p)))
                 break;
-            const float w = 1.0 - float(k) / float(LIC_SLICE_STEPS + 1);
+            const float w = (1.0 - float(k) / float(LIC_SLICE_STEPS + 1)) *
+                            ripple(float(dir * k) * h, period);
             acc += w * lic_noise(p, freq);
             wsum += w;
         }
     }
     return acc / wsum;
+}
+
+// Lighting (THEORY 10.10): a key light from above to one side, a fill from
+// the eye, a rim on the silhouette and a soft glint, all dimmed by the
+// solid close round the point (corners, under the body, at the floor).
+const vec3 KEY_LIGHT = vec3(0.4, 0.8, 0.45) / length(vec3(0.4, 0.8, 0.45));
+
+// The solid fraction a little way out from the surface: 1 in the open,
+// less where the model or the floor closes round the point.
+float occlusion(vec3 p, vec3 n) {
+    const vec3 a = normalize(abs(n.y) < 0.9 ? cross(n, vec3(0.0, 1.0, 0.0))
+                                            : cross(n, vec3(1.0, 0.0, 0.0)));
+    const vec3 b = cross(n, a);
+    const vec3 q = p + 2.0 * n;
+    const float s = trilinear(1, q + 2.0 * a) + trilinear(1, q - 2.0 * a) +
+                    trilinear(1, q + 2.0 * b) + trilinear(1, q - 2.0 * b) +
+                    2.0 * trilinear(1, p + 3.5 * n);
+    return clamp(1.0 - 0.5 * s, 0.4, 1.0);
+}
+
+// `base` lit at p with normal n seen along d; `glint` scales the highlight
+// (lower on painted surfaces, so their colours read).
+vec3 shade(vec3 base, vec3 n, vec3 d, vec3 p, float glint) {
+    const float ndl = max(dot(n, KEY_LIGHT), 0.0);
+    const float fill = max(dot(n, -d), 0.0);
+    const float rim = 1.0 - abs(dot(n, d));
+    const float ao = occlusion(p, n);
+    const float diff = (0.24 + 0.52 * ndl + 0.26 * fill) * ao + 0.14 * rim * rim;
+    const vec3 h = normalize(KEY_LIGHT - d);
+    const float spec = glint * pow(max(dot(n, h), 0.0), 48.0) * ao;
+    return base * diff + vec3(spec);
 }
 
 // Contrast of a LIC average (white noise averaged over ~LIC_STEPS samples
@@ -284,6 +372,9 @@ void main() {
     const int W = P.img.x, H = P.img.y;
     if (px.x >= W || px.y >= H) return;  // no barrier() in this kernel
     N = P.dims.xyz;
+    lic_phase = intBitsToFloat(P.modes.w);
+    palette = (P.img.z >> 8) & 3;
+    magnitude_field = ((P.img.z >> 10) & 1) != 0;
     const int n_steps = P.dims.w;
     const int feat = P.img.z;
     const bool show_box = (feat & F_BOX) != 0, show_haze = (feat & F_HAZE) != 0;
@@ -301,9 +392,9 @@ void main() {
     const float u_ref = P.right.w, rho_ref = P.up.w;
     const float haze_gain = P.haze.x, haze_floor = P.haze.y, slice_pos = P.haze.z;
     const float inv_q = 1.0 / max(0.5 * u_ref * u_ref, 1e-12);
-    const vec3 light = normalize(vec3(0.4, 0.8, 0.45));
     const vec3 dims = vec3(N);
     const ivec3 nb = (N + OCC_BLOCK - 1) / OCC_BLOCK;
+    const ivec3 nm = (nb + MACRO_BLOCK - 1) / MACRO_BLOCK;
 
     const float u = (2.0 * (float(px.x) + 0.5) / float(W) - 1.0) * tan_half * aspect;
     const float v = (1.0 - 2.0 * (float(px.y) + 0.5) / float(H)) * tan_half;  // row 0 = top
@@ -326,6 +417,9 @@ void main() {
     vec3 acc = vec3(0.0);
     float trans = 1.0;
     float hit_t = 1e30;
+    const bool mesh_surface = surface == SURFACE_MESH;
+    const vec4 mesh_px = mesh_surface ? surf[px.y * W + px.x] : vec4(0.0, 1.0, 0.0, 1e30);
+    const float t_mesh = mesh_px.w;
 
     if (hit_box && t_far > t_near) {
         if (show_box) {  // an edge is where two coordinates sit on a box face
@@ -343,15 +437,51 @@ void main() {
         // Fixed per-pixel start offset: in-phase rays drew "wood-grain"
         // bands one step apart; dithered, they become fine grain.
         const float jit = fract(sin(float(px.x) * 12.9898 + float(px.y) * 78.233) * 43758.5453);
-        float t = t_near + jit * dt;
-        float last_rho = 1.0;
+        const float t_start = t_near + jit * dt;
+        // Empty-space skipping (THEORY 10.11): a block with no solid near it
+        // and no haze above its floor adds nothing, so the march jumps to its
+        // first sample beyond the block -- the same sample positions -- but
+        // never past the mesh's hit or into the slice's band.
+        const bool skip = (feat & F_SKIP) != 0;
+        float t_limit = t_mesh;
+        if (skip && slice_axis >= 0) {
+            const float da = d[slice_axis];
+            const float band = 0.6 * dt + 0.35;
+            const float off = slice_pos * dims[slice_axis] - eye[slice_axis];
+            if (abs(da) > 1e-6) {
+                const float t_band = off / da - band / abs(da);
+                if (off / da + band / abs(da) > t_near) // the band lies ahead
+                    t_limit = min(t_limit, t_band);
+            } else if (abs(off) < band) {
+                t_limit = -1e30; // along the slice, inside its band: no skipping
+            }
+        }
         for (int step = 0; step < n_steps; ++step) {
             if (trans < 0.01) break;
+            float t = t_start + float(step) * dt;
             vec3 p = eye + d * t;
             const ivec3 ci = cell_of(p);
             const ivec3 bi = ci / OCC_BLOCK;
+            const uint bidx = uint((bi.x * nb.y + bi.y) * nb.z + bi.z);
+            if (skip && t < t_limit) {
+                // a whole macro block when nothing in it is busy, else this block
+                const ivec3 mi = bi / MACRO_BLOCK;
+                float t_exit = -1.0;
+                if (macro_busy[(mi.x * nm.y + mi.y) * nm.z + mi.z] == 0u)
+                    t_exit = box_exit(eye, d, vec3(mi * (MACRO_BLOCK * OCC_BLOCK)),
+                                      float(MACRO_BLOCK * OCC_BLOCK));
+                else if (occ[bidx] != 1u && !(show_haze && block_active[bidx] != 0u))
+                    t_exit = box_exit(eye, d, vec3(bi * OCC_BLOCK), float(OCC_BLOCK));
+                if (t_exit > t) {
+                    const int m = int(floor((min(t_exit, t_limit) - t) / dt)) + 1;
+                    if (m > 1) {
+                        step += m - 1; // the loop adds the last
+                        continue;
+                    }
+                }
+            }
             bool solid = false;
-            if (occ[(bi.x * nb.y + bi.y) * nb.z + bi.z] == 1u) {
+            if (occ[bidx] == 1u) {
                 // Near geometry: re-walk this step finely from the previous
                 // sample so a surface is hit where it is and a 1-cell part
                 // cannot be stepped over.
@@ -375,11 +505,13 @@ void main() {
                         v0 = v1;
                         tprev = tt;
                     }
-                } else {
+                } else { // voxels; with the mesh, only the floor and walls
                     for (int k = 1; k <= nsub; ++k) {
                         const float tt = t0 + (t - t0) * float(k) / float(nsub);
                         const vec3 pp = eye + d * tt;
-                        if (is_solid_cell(cell_of(pp))) {
+                        const uint f = flags[cell_index(cell_of(pp).x, cell_of(pp).y,
+                                                        cell_of(pp).z, N)];
+                        if (f != FLUID && !(mesh_surface && f == 1u)) {
                             solid = true;
                             t = tt;
                             p = pp;
@@ -389,51 +521,62 @@ void main() {
                 }
             }
 
+            // The mesh, where it comes first along the ray (the floor, met
+            // above, may still be nearer).
+            bool mesh_hit = false;
+            if (mesh_surface && t_mesh <= t) {
+                solid = true;
+                mesh_hit = true;
+                t = max(t_mesh, t_near);
+                p = eye + d * t;
+            }
+
             if (solid) {
                 if (surface != SURFACE_HIDDEN) {
-                    const vec3 nrm = surface == SURFACE_SMOOTH ? smooth_normal(p) : voxel_normal(p);
-                    const float ndl = max(dot(nrm, light), 0.0);
-                    // a touch of view-facing rim so silhouettes survive
-                    const float rim = 0.25 * (1.0 - abs(dot(nrm, d)));
-                    const float diff = 0.38 + 0.55 * ndl + rim;
+                    const vec3 nrm = mesh_hit                     ? mesh_px.xyz
+                                     : surface == SURFACE_VOXEL ? voxel_normal(p)
+                                                                : smooth_normal(p);
                     // The model (OBSTACLE) is painted; a floor / belt / wall
                     // is plain darker grey, so it does not read as part of it.
                     const uint hit_flag = flags[cell_index(cell_of(p + 0.5 * d).x, cell_of(p + 0.5 * d).y,
                                                            cell_of(p + 0.5 * d).z, N)];
-                    const bool model_cell = hit_flag == 1u || hit_flag == FLUID;
-                    vec3 col = (model_cell ? vec3(0.80, 0.81, 0.84) : vec3(0.36, 0.37, 0.41)) * diff;
+                    const bool model_cell = mesh_hit || hit_flag == 1u || hit_flag == FLUID;
+                    vec3 base = model_cell ? vec3(0.80, 0.81, 0.84) : vec3(0.36, 0.37, 0.41);
+                    float glint = model_cell ? 0.22 : 0.08;
                     if (paint_cp && model_cell && paint_mode == PAINT_CP) {
-                        // Pressure half a cell back along the ray over FLUID
-                        // cells only (the single last fluid cell striped every
-                        // voxel staircase).
-                        const float rho_s = fluid_trilinear_rho(p - d * (0.5 + 0.5 * dt), last_rho);
+                        // Pressure over FLUID cells only (the single last fluid
+                        // cell striped every voxel staircase): half a cell back
+                        // along the ray from the cells, a cell out along the
+                        // normal from the mesh (it sits up to a cell off them).
+                        const vec3 ps = mesh_hit ? p + 0.75 * nrm : p - d * (0.5 + 0.5 * dt);
+                        // (no fluid cell in reach, as deep in a crevice: Cp 0)
+                        const float rho_s = fluid_trilinear_rho(ps, rho_ref);
                         const float cp = (rho_s - rho_ref) * pscale * inv_q;
-                        col = coolwarm(0.5 + 0.5 * clamp(cp, -1.0, 1.0)) * diff;
+                        base = coolwarm(0.5 + 0.5 * clamp(cp, -1.0, 1.0));
+                        glint = 0.10;
                     } else if (paint_cp && model_cell) {
                         // Near-wall flow, from the smooth normal whatever the
                         // surface style (a voxel normal is a staircase).
-                        const vec3 sn = smooth_normal(p);
+                        const vec3 sn = mesh_hit ? nrm : smooth_normal(p);
                         const vec3 ut = wall_flow(p, sn);
+                        glint = 0.10;
                         if (paint_mode == PAINT_WALL_SPEED) {
-                            col = dyemap(length(ut) / (WALL_SPEED_SPAN * max(u_ref, 1e-9))) * diff;
+                            base = dyemap(length(ut) / (WALL_SPEED_SPAN * max(u_ref, 1e-9)));
                         } else if (paint_mode == PAINT_REVERSED) {
-                            col = coolwarm(0.5 + 0.5 * clamp(ut.x / (0.5 * max(u_ref, 1e-9)), -1.0, 1.0)) *
-                                  diff;
+                            base = coolwarm(0.5 + 0.5 * clamp(ut.x / (0.5 * max(u_ref, 1e-9)), -1.0, 1.0));
                         } else {  // oil flow: pale streaks on a mid-grey film
                             const float l = surface_lic(p, sn, lic_freq(t, tan_half, H));
                             const float k = clamp(0.5 + 1.8 * (l - 0.5), 0.0, 1.0);
                             const vec3 ground = vec3(0.30, 0.31, 0.34), streak = vec3(0.95, 0.94, 0.88);
-                            col = mix(ground, streak, k) * diff;
+                            base = mix(ground, streak, k);
                         }
                     }
-                    acc += trans * col;
+                    acc += trans * shade(base, nrm, d, p, glint);
                     trans = 0.0;
                     hit_t = t;
                     break;
                 }
             } else {
-                last_rho = macro[cell_index(ci.x, ci.y, ci.z, N)].w;
-
                 if (slice_axis >= 0) {  // an opaque cut
                     if (abs(p[slice_axis] - slice_pos * dims[slice_axis]) < 0.6 * dt + 0.35) {
                         vec3 scol = fieldcolour(trilinear(0, p), cmode);
@@ -503,10 +646,10 @@ void main() {
                     trans *= 1.0 - alpha;
                 }
             }
-            t += dt;
         }
     }
 
-    image[px.y * W + px.x] = packUnorm4x8(vec4(acc + trans * BACKGROUND, 1.0));
+    const vec3 background = mix(BACKGROUND_LOW, BACKGROUND_HIGH, clamp(0.5 + 0.5 * v / tan_half, 0.0, 1.0));
+    image[px.y * W + px.x] = packUnorm4x8(vec4(acc + trans * background, 1.0));
     depth[px.y * W + px.x] = hit_t;
 }

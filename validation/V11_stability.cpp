@@ -26,7 +26,6 @@ using namespace windoa;
 
 namespace {
 
-constexpr int kEx[lbm::Q] = {0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, 0, 0, 0, 0};
 constexpr double kWq[lbm::Q] = {1.0 / 3,  1.0 / 18, 1.0 / 18, 1.0 / 18, 1.0 / 18,
                                 1.0 / 18, 1.0 / 18, 1.0 / 36, 1.0 / 36, 1.0 / 36,
                                 1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36,
@@ -48,12 +47,12 @@ void part_a(Context& ctx, gate::Gate& g) {
     const auto h0 = s.health();
     auto f = s.get_state();
     const std::size_t n = std::size_t(NX) * NY * NZ;
-    auto cell = [](int x, int y, int z) { return (std::size_t(x) * NY + y) * NZ + z; };
+    auto cell = [](int x, int y, int z) { return Grid{NX, NY, NZ}.index(x, y, z); };
     f[1 * n + cell(5, 5, 5)] = std::numeric_limits<float>::quiet_NaN();
     f[1 * n + cell(6, 6, 6)] = std::numeric_limits<float>::infinity();
     f[0 * n + cell(8, 8, 8)] = std::numeric_limits<float>::quiet_NaN();
     for (int i = 0; i < lbm::Q; ++i) { // equilibrium at rho 1, u (0.9, 0, 0)
-        const double eu = kEx[i] * 0.9;
+        const double eu = lattice::E[std::size_t(i)][0] * 0.9;
         f[i * n + cell(9, 9, 9)] = float(kWq[i] * (1 + 3 * eu + 4.5 * eu * eu - 1.5 * 0.81));
     }
     s.set_state(f);

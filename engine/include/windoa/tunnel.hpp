@@ -73,7 +73,9 @@ struct TunnelSettings {
     int health_every = 10;          // batches between full-grid health checks
     float dye_tau = 0.53f, dye_tau_plus = 1.0f;
     float dye_nozzle_rate = 0.5f; // relaxation towards C = 1 per step
-    int dye_nozzles = 6;          // per side: 6 x 6 single-cell filaments
+    int dye_nozzles = 6;          // per side: a 6 x 6 grid of filaments
+    int dye_nozzle_cells = 2;     // each filament's width in y and z, cells
+    float rake_x = 3.0f;          // the smoke wand and dye nozzles: cells from the inlet
     double flow_cache_mb = 512.0;
     // f16 distribution storage (lbm::Config::storage_f16): ~1.3x faster,
     // an approximation (tools/lbm_equiv --f16). Opt-in until the gates judge it.
@@ -106,7 +108,8 @@ struct Model {
     std::vector<catalogue::Spinner> spinners;
     std::vector<catalogue::Port> ports;
     std::vector<catalogue::Rotor> rotors;
-    std::string hash; // content hash of the mesh (flow-cache key)
+    double metres_per_unit = 0.0; // 0: no real size known (an imported STL)
+    std::string hash;             // content hash of the mesh (flow-cache key)
 };
 Model model_from_catalogue(const catalogue::Entry& e);
 // The box a model is fitted by: its mesh and its rotors' swept discs.
@@ -180,6 +183,9 @@ struct TunnelStatus {
     // The applied freestream as the Mach-matched speed in sea-level air
     // (airspeed.hpp, THEORY 1.2), in either regime.
     double airspeed_mach = 0.0, airspeed_mps = 0.0, airspeed_mph = 0.0;
+    // The real object's length along the axis the size slider sets, and its
+    // Reynolds number at that airspeed (0 when the model has no real size).
+    double full_scale_length_m = 0.0, full_scale_re = 0.0;
     double cd = 0, cl = 0, cs = 0, cm = 0; // EMA coefficients
     double re_sim = 0.0;
     double a_ref = 1.0, a_frontal = 1.0, a_planform = 1.0, a_manual = 100.0;
@@ -306,7 +312,21 @@ class Tunnel {
     // One batch of `steps` solver steps with everything around them: ramp /
     // slew, belt speed, dye, forces, guard, settling, cache. No-op if paused.
     void advance(int steps);
+    // advance() in two halves, for a host that keeps the GPU busy: submit a
+    // batch, then complete the one before it while the new one runs (the
+    // app's worker). Batches complete in order, at most two in flight; a
+    // batch begun before a reset or restart is waited for and dropped.
+    // advance_submit() returns whether a batch ran or went out (not while
+    // paused); `tail` rides on its submission (the compressible batch, which
+    // stays blocking, runs it in one of its own). advance_complete() returns
+    // whether the batch it finished was this flow's.
+    bool advance_submit(int steps, const lbm::Solver::Tail& tail = {});
+    bool advance_complete();
+    std::size_t batches_in_flight() const { return pending_.size(); }
     TunnelStatus status() const;
+    // The model's triangles as placed, in lattice cells: what is voxelised
+    // (fitted, turned, dropped onto the floor in ground mode).
+    geometry::Mesh placed_mesh() const;
 
   private:
     void revoxelise();
@@ -315,6 +335,7 @@ class Tunnel {
     void restart_transonic(const std::string& why);
     void begin_operating_point(const std::string& reason);
     void apply_moving_walls();
+    Grid grid() const { return {s_.nx, s_.ny, s_.nz}; }
     void build_rotors();
     void rotor_speeds();
     void diverged(float umax, int n_bad);
@@ -323,8 +344,14 @@ class Tunnel {
     void clear_statistics(bool signals_too);
     void record_signals(const lbm::MeanForces& mf);
     std::string operating_point_key() const;
-    geometry::Mesh placed_mesh() const;
     double q_dyn() const;
+    struct PendingBatch {
+        lbm::Solver::Ticket ticket;
+        int steps = 0;
+        bool health = false, plane = false;
+        std::uint64_t epoch = 0; // flow_epoch_ when submitted
+    };
+    std::deque<PendingBatch> pending_;
 
     Context& ctx_;
     TunnelSettings s_;
@@ -367,6 +394,18 @@ class Tunnel {
     float spin_ratio_ = 1.0f, spin_scale_ = 1.0f;
     bool power_on_ = false;
     float throttle_ = 1.0f, jet_scale_ = 1.0f;
+    // One wall-velocity request as the solver takes it: a port's face
+    // (set_wall_velocity) or a spinning part (set_rotation, with u its omega).
+    // The last list applied is kept, so an unchanged request -- a speed change
+    // on a model with nothing moving -- costs nothing; a re-voxelisation
+    // clears it, since the cells a request captures depend on the flags.
+    struct WallOp {
+        bool port = false;
+        lbm::Vec3 point{}, axis{}, u{};
+        float radius = 0.0f, half_len = 0.0f;
+        bool operator==(const WallOp&) const = default;
+    };
+    std::optional<std::vector<WallOp>> walls_applied_;
 
     // turbulence, dye
     float turb_pct_ = 0.0f;

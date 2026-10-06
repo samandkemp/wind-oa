@@ -32,7 +32,7 @@ constexpr float D = 20.0f, U = 0.05f, RE = 200.0f;
 constexpr double CX = 64.0, CY = 64.0; // centre on the cell boundary: symmetric about the walls
 
 std::size_t idx(int x, int y, int z) {
-    return (std::size_t(x) * NY + y) * NZ + z;
+    return Grid{NX, NY, NZ}.index(x, y, z);
 }
 
 // Host reference: weighted Welford in double.

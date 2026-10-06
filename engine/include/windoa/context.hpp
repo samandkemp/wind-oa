@@ -5,10 +5,11 @@
 // A window app shares this Context (ContextOptions::graphics) and adds its
 // own swapchain on top; see app/.
 //
-// Ownership: every object here holds raw Vulkan handles and frees them in
-// its destructor (RAII), so copying is deleted -- two owners would free the
-// same handle twice. Destroy kernels and buffers before their Context
-// (declare the Context first; C++ destroys members / locals in reverse).
+// Ownership: every object here owns its Vulkan handles (vk_handle.hpp) and
+// frees them when destroyed, also when its constructor throws part-way;
+// copying is deleted -- two owners would free the same handle twice.
+// Destroy kernels and buffers before their Context (declare the Context
+// first; C++ destroys members / locals in reverse).
 //
 // Memory is allocated with plain vkAllocateMemory, one allocation per
 // buffer. The engine holds a handful of large buffers, so a sub-allocator
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <stdexcept>
@@ -26,6 +28,7 @@
 #include <vulkan/vulkan.h>
 
 #include "windoa/device.hpp"
+#include "windoa/vk_handle.hpp"
 
 namespace windoa {
 
@@ -91,12 +94,22 @@ class Context {
     void submit_and_wait(const std::function<void(VkCommandBuffer)>& record);
     void submit_and_wait(const std::function<void(VkCommandBuffer)>& record, VkSemaphore signal,
                          std::uint64_t value);
+    // The same batch, returned from before it has run: a ticket for wait().
+    // A few may be in flight at once (kAsyncSlots; a submission beyond them
+    // waits for the oldest), so the GPU can run one batch while the host
+    // prepares the next. For one thread at a time (the solver's worker).
+    static constexpr int kAsyncSlots = 4;
+    std::uint64_t submit_async(const std::function<void(VkCommandBuffer)>& record,
+                               VkSemaphore signal = VK_NULL_HANDLE, std::uint64_t value = 0);
+    void wait(std::uint64_t ticket); // returns at once for a ticket long done
 
     // Timeline semaphores (caller destroys with vkDestroySemaphore).
     VkSemaphore create_timeline(std::uint64_t initial = 0) const;
     void wait_timeline(VkSemaphore s, std::uint64_t value) const; // host wait
 
-    // Host <-> device copies through a temporary staging buffer (blocking).
+    // Host <-> device copies through a staging buffer (blocking): a kept one
+    // for copies up to kStagingKeep bytes (the many small per-batch reads), a
+    // temporary one above.
     void upload(Buffer& dst, const void* src, VkDeviceSize bytes, VkDeviceSize dst_offset = 0);
     void download(const Buffer& src, void* dst, VkDeviceSize bytes, VkDeviceSize src_offset = 0);
     void fill_zero(Buffer& dst) { fill_u32(dst, 0u); }
@@ -111,6 +124,8 @@ class Context {
     static void barrier_full(VkCommandBuffer cmd);
 
   private:
+    void release(); // frees what exists (the destructor; a failed constructor)
+
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
@@ -120,10 +135,22 @@ class Context {
     std::uint32_t graphics_family_ = 0;
     std::uint32_t sharing_[2] = {};
     std::mutex submit_mutex_;
+    static constexpr VkDeviceSize kStagingKeep = VkDeviceSize{4} << 20;
+    std::mutex staging_mutex_; // held around a kept buffer's fill, copy and read
+    std::unique_ptr<Buffer> upload_staging_, download_staging_;
     std::uint32_t max_groups_x_ = 65535;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+    struct AsyncSlot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        std::uint64_t ticket = 0; // the submission it holds (0: never used)
+    };
+    AsyncSlot async_[kAsyncSlots];
+    std::uint64_t async_tickets_ = 0;
+    void record_batch(VkCommandBuffer cmd, const std::function<void(VkCommandBuffer)>& record);
+    void submit_batch(VkCommandBuffer cmd, VkFence fence, VkSemaphore signal, std::uint64_t value);
     VkPhysicalDeviceMemoryProperties mem_{};
     GpuInfo gpu_;
 };
@@ -142,7 +169,7 @@ class Buffer {
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 
-    VkBuffer handle() const { return buffer_; }
+    VkBuffer handle() const { return buffer_.get(); }
     VkDeviceSize size() const { return size_; }
     bool mapped() const { return mapped_ != nullptr; }
     void* data() const { return mapped_; }
@@ -156,8 +183,8 @@ class Buffer {
 
   private:
     VkDevice device_;
-    VkBuffer buffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    MemoryHandle memory_; // declared first: freed after the buffer
+    BufferHandle buffer_;
     VkDeviceSize size_ = 0;
     void* mapped_ = nullptr;
 };
@@ -186,19 +213,19 @@ class Image3D {
     Image3D(const Image3D&) = delete;
     Image3D& operator=(const Image3D&) = delete;
 
-    VkImage handle() const { return image_; }
-    VkImageView view() const { return view_; }
-    VkSampler sampler() const { return sampler_; }
+    VkImage handle() const { return image_.get(); }
+    VkImageView view() const { return view_.get(); }
+    VkSampler sampler() const { return sampler_.get(); }
     // Record the copy of `src` (nx ny nz floats, cell order) into the image.
     void record_copy_from(VkCommandBuffer cmd, const Buffer& src) const;
 
   private:
     VkDevice device_;
     VkExtent3D extent_{};
-    VkImage image_ = VK_NULL_HANDLE;
-    VkDeviceMemory memory_ = VK_NULL_HANDLE;
-    VkImageView view_ = VK_NULL_HANDLE;
-    VkSampler sampler_ = VK_NULL_HANDLE;
+    MemoryHandle memory_; // freed last
+    ImageHandle image_;
+    ImageViewHandle view_;
+    SamplerHandle sampler_;
 };
 
 // Descriptor kinds a ComputeKernel binding can hold.
@@ -256,12 +283,13 @@ class ComputeKernel {
     std::vector<Slot> slots_;
     std::uint32_t push_bytes_;
     std::uint32_t n_sets_;
-    VkShaderModule module_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
-    VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
-    VkDescriptorPool pool_ = VK_NULL_HANDLE;
-    VkDescriptorSet sets_[4] = {};
+    // in creation order, so destruction runs pool -> pipeline -> layouts -> module
+    ShaderModuleHandle module_;
+    SetLayoutHandle set_layout_;
+    PipelineLayoutHandle layout_;
+    PipelineHandle pipeline_;
+    DescriptorPoolHandle pool_;
+    VkDescriptorSet sets_[4] = {}; // freed with the pool
 };
 
 } // namespace windoa

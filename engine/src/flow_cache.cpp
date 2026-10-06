@@ -8,6 +8,7 @@
 
 #include "physics_hash.hpp"
 #include "windoa/half.hpp"
+#include "windoa/lattice.hpp"
 
 namespace windoa {
 
@@ -16,11 +17,6 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr char kMagic[8] = {'W', 'O', 'A', 'F', 'L', 'O', 'W', '1'};
-constexpr int kQ = 19;
-constexpr float kW[kQ] = {1.0f / 3,  1.0f / 18, 1.0f / 18, 1.0f / 18, 1.0f / 18,
-                          1.0f / 18, 1.0f / 18, 1.0f / 36, 1.0f / 36, 1.0f / 36,
-                          1.0f / 36, 1.0f / 36, 1.0f / 36, 1.0f / 36, 1.0f / 36,
-                          1.0f / 36, 1.0f / 36, 1.0f / 36, 1.0f / 36};
 
 } // namespace
 
@@ -67,7 +63,7 @@ FlowCache::load(const std::string& key) {
     in.read(magic, 8);
     in.read(reinterpret_cast<char*>(&n), sizeof(n));
     in.read(reinterpret_cast<char*>(&meta), sizeof(meta));
-    if (!in || std::memcmp(magic, kMagic, 8) != 0 || n % kQ != 0) {
+    if (!in || std::memcmp(magic, kMagic, 8) != 0 || n % lattice::Q != 0) {
         in.close();
         std::error_code ec;
         fs::remove(p, ec); // corrupt entry: drop it
@@ -78,11 +74,11 @@ FlowCache::load(const std::string& key) {
     if (!in)
         return std::nullopt;
     in.close();
-    const std::size_t cells = n / kQ;
+    const std::size_t cells = n / lattice::Q;
     std::vector<float> f(n);
-    for (int i = 0; i < kQ; ++i)
+    for (int i = 0; i < lattice::Q; ++i)
         for (std::size_t c = 0; c < cells; ++c)
-            f[i * cells + c] = from_half(h[i * cells + c]) + kW[i];
+            f[i * cells + c] = from_half(h[i * cells + c]) + lattice::W[std::size_t(i)];
     std::error_code ec;
     fs::last_write_time(p, fs::file_time_type::clock::now(), ec); // recently used
     return std::make_pair(std::move(f), meta);
@@ -92,11 +88,11 @@ double FlowCache::save(const std::string& key, std::span<const float> f, const M
     const auto t0 = std::chrono::steady_clock::now();
     if (8 + sizeof(std::uint64_t) + sizeof(Meta) + 2 * f.size() > budget_bytes_)
         return -1.0;
-    const std::size_t cells = f.size() / kQ;
+    const std::size_t cells = f.size() / lattice::Q;
     std::vector<std::uint16_t> h(f.size());
-    for (int i = 0; i < kQ; ++i)
+    for (int i = 0; i < lattice::Q; ++i)
         for (std::size_t c = 0; c < cells; ++c)
-            h[i * cells + c] = to_half(f[i * cells + c] - kW[i]);
+            h[i * cells + c] = to_half(f[i * cells + c] - lattice::W[std::size_t(i)]);
     const fs::path p = path(key), tmp = path(key + ".tmp");
     {
         std::ofstream out(tmp, std::ios::binary);

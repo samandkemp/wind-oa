@@ -4,8 +4,11 @@
 //   prepare   the transfer-function input once per cell (the march samples)
 //   Q         smoothed-velocity Q-criterion + an adaptive RMS threshold,
 //             reduced on the device (no host round trip)
-//   march     one ray per pixel, front to back: model surface (voxel or
-//             smooth, optionally painted with Cp, near-wall speed, reversed
+//   mesh      the model's triangles rasterised with the march's camera:
+//             per pixel, the distance to the true surface and its normal
+//   march     one ray per pixel, front to back: model surface (its mesh, or
+//             the solver's cells as voxels or smoothed; optionally painted
+//             with Cp, near-wall speed, reversed
 //             flow or oil-flow streaks), slice plane (optionally with a
 //             LIC texture), vortex cores, mean reversed-flow shells, dye
 //             smoke, field haze, box edges; writes a depth buffer
@@ -27,10 +30,15 @@
 #include <vector>
 
 #include "windoa/context.hpp"
+#include "windoa/mesh.hpp"
 
 namespace windoa::render {
 
-inline constexpr int kSlots = 2;
+class MeshRaster;
+
+// Snapshot slots: one being drawn, one being written by the batch in flight,
+// one free for the batch after it (the app's worker pipelines its batches).
+inline constexpr int kSlots = 3;
 
 // Field shown by the haze and the slice (values match the shaders).
 enum class Field : int {
@@ -45,7 +53,10 @@ enum class Field : int {
 };
 // What the model surface is painted with (THEORY 10.2, 10.7).
 enum class Paint : int { Cp = 0, WallSpeed = 1, Reversed = 2, OilFlow = 3 };
-enum class Surface : int { Hidden = 0, Voxel = 1, Smooth = 2 };
+// How the model is drawn: hidden; the solver's cells as voxels, or
+// smoothed (both what the flow sees); or its true shape from the mesh
+// (set_mesh(); THEORY 10.10). Mesh without a mesh draws Smooth.
+enum class Surface : int { Hidden = 0, Voxel = 1, Smooth = 2, Mesh = 3 };
 
 // Noise floor below which a sample is transparent, per field, in the
 // field's normalised units.
@@ -74,12 +85,21 @@ struct Settings {
     bool haze = true;
     float haze_gain = 1.0f;
     float haze_floor = -1.0f; // < 0: default_floor(field)
-    Surface surface = Surface::Smooth;
+    Surface surface = Surface::Mesh;
     bool paint_surface = true;
     Paint paint = Paint::Cp;
     int slice_axis = -1;    // -1 none, else 0 / 1 / 2
     float slice_pos = 0.5f; // fraction of the domain along slice_axis
     bool slice_lic = false; // LIC texture of the in-plane flow on the slice
+    // Flow textures (slice LIC, oil flow): < 0 still; otherwise the phase, in
+    // cycles, of a ripple that travels along each streak (THEORY 10.8).
+    float lic_phase = -1.0f;
+    // The field's colouring (THEORY 10.1): 0 its own map, 1 a sequential map,
+    // 2 a diverging one, 3 greyscale; the value that fills the scale as a
+    // multiple of the default (colour and haze together); a log scale.
+    int palette = 0;
+    float range = 1.0f;
+    bool log_scale = false;
     // time averages: 1 / their weight (0 = none in this slot), and the
     // translucent shells where the mean streamwise flow runs backwards
     float stats_inv_weight = 0.0f;
@@ -124,6 +144,9 @@ class VolumeRenderer {
     void set_sources(int slot, const Sources& s);
     // Returns an id for SplatDraw::source (at most 4 sources).
     int add_splat_source(const SplatSource& s);
+    // The model's triangles in lattice cells, as placed (Surface::Mesh); an
+    // empty mesh clears them. Waits for the graphics queue.
+    void set_mesh(const geometry::Mesh& m);
 
     // Output size in pixels. Waits for the graphics queue when it changes.
     void resize(std::uint32_t width, std::uint32_t height);
@@ -135,11 +158,33 @@ class VolumeRenderer {
     // Afterwards image() is in VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.
     void record(VkCommandBuffer cmd, const View& view, const Settings& s, int slot,
                 std::uint64_t geometry_version, std::span<const SplatDraw> splats = {});
-    VkImage image() const { return image_; }
+    VkImage image() const { return image_.get(); }
 
     // The last rendered frame as packed RGBA8, row 0 at the top (blocking;
     // for screenshots and tests).
     std::vector<std::uint32_t> read_pixels();
+
+    // GPU time per pass, ms, smoothed over recent frames (timestamps read
+    // back a few frames late, never waited for): what to optimise.
+    struct PassTimes {
+        float prepare = 0.0f; // solid fields when new, the field per cell
+        float q = 0.0f;       // vortex cores (every few frames)
+        float copies = 0.0f;  // into the 3-D textures
+        float mesh = 0.0f;    // the true shape's raster pass
+        float march = 0.0f;
+        float splats = 0.0f; // smoke, lines, arrows, markers
+        float total = 0.0f;
+    };
+    const PassTimes& pass_times() const { return times_; }
+
+    // Picking (click to place): after record(), copy pixel (x, y)'s depth --
+    // the distance along its ray to the first opaque hit (the model, the
+    // slice), 1e30 for none -- into the first 4 bytes of `dst`.
+    void record_pick(VkCommandBuffer cmd, std::uint32_t x, std::uint32_t y,
+                     const Buffer& dst) const;
+    // The point at distance t along pixel (x, y)'s ray for `view` (cells).
+    std::array<float, 3> point_at(const View& view, std::uint32_t x, std::uint32_t y,
+                                  float t) const;
 
   private:
     void create_target();
@@ -171,6 +216,8 @@ class VolumeRenderer {
     Buffer zero_;   // stands in for an absent dye / aux source
     Buffer speed_;  // |u| per cell (dye colour), from vol_prepare
     Buffer recirc_; // <u_x> / U per cell (reversed-flow shells), from vol_prepare
+    Buffer active_; // per occupancy block: the haze can show there (vol_active)
+    Buffer macro_;  // per macro block: anything to draw (vol_active)
     // what the march samples, as 3-D textures (hardware trilinear)
     Image3D t_field_, t_raw_, t_blur_, t_q_, t_dye_, t_speed_, t_recirc_;
 
@@ -180,14 +227,25 @@ class VolumeRenderer {
     ComputeKernel smooth_;
     ComputeKernel q_;
     ComputeKernel qstat_kernel_;
+    ComputeKernel active_kernel_;
     ComputeKernel march_;
     ComputeKernel splat_;
 
+    std::unique_ptr<MeshRaster> raster_;
     std::uint32_t width_ = 0, height_ = 0;
     std::unique_ptr<Buffer> pixels_;
     std::unique_ptr<Buffer> depth_;
-    VkImage image_ = VK_NULL_HANDLE;
-    VkDeviceMemory image_memory_ = VK_NULL_HANDLE;
+    std::unique_ptr<Buffer> surface_; // vec4 per pixel from raster_: normal, distance
+    MemoryHandle image_memory_;       // declared first: freed after the image
+    ImageHandle image_;
+
+    static constexpr std::uint32_t kStamps = 7, kStampSets = 3; // sets: frames in flight + 1
+    QueryPoolHandle queries_;
+    std::uint32_t stamp_set_ = 0;
+    bool stamps_written_[kStampSets] = {};
+    double tick_ms_ = 1e-6;
+    PassTimes times_;
+    void read_stamps(std::uint32_t set);
 };
 
 } // namespace windoa::render

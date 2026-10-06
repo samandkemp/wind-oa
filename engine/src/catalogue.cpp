@@ -1500,6 +1500,24 @@ std::vector<Entry> build_entries() {
         {propeller_rotor({0.3, 0.0, 0.0}, kPropR, 3, 4.5, 1)});
     add("Rotating", "frisbee", "Frisbee", m_frisbee, 0.0, G::Air,
         {{{0.0, 16.0, 0.0}, {0, 1, 0}, 137.5, 16.0, 1, 0.0}});
+    // Model units are metres unless listed (tunnel_run --catalogue prints each
+    // model's full size): the generic shapes have no real size, the ball is a
+    // football (the unit sphere 0.22 m across), the quadcopter an Inspire-
+    // class frame (0.6 m between diagonal motors); the Ahmed body, the saloons,
+    // the munitions and the frisbee are in millimetres.
+    const std::pair<const char*, double> units[] = {
+        {"sphere", 0.0},       {"cube", 0.0},
+        {"cylinder", 0.0},     {"cone", 0.0},
+        {"ball_spin", 0.22},   {"ahmed_25deg", 0.001},
+        {"car_saloon", 0.001}, {"car_saloon_wing", 0.001},
+        {"uav_quad", 0.07},    {"round_556", 0.001},
+        {"shell_105", 0.001},  {"apfsds", 0.001},
+        {"aim120", 0.001},     {"ballistic_missile", 0.001},
+        {"frisbee", 0.001}};
+    for (Entry& x : e)
+        for (const auto& [id, mpu] : units)
+            if (x.id == id)
+                x.metres_per_unit = mpu;
     return e;
 }
 

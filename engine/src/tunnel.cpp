@@ -138,6 +138,7 @@ Model model_from_catalogue(const catalogue::Entry& e) {
     m.spinners = e.spinners;
     m.ports = e.ports;
     m.rotors = e.rotors;
+    m.metres_per_unit = e.metres_per_unit;
     m.hash = content_hash(m.mesh.xyz.data(), m.mesh.xyz.size() * sizeof(float));
     return m;
 }
@@ -278,14 +279,16 @@ void Tunnel::revoxelise() {
         for (int x = 0; x < s_.nx; ++x)
             for (int y = 0; y < std::min(s_.floor_height, s_.ny); ++y)
                 for (int z = 0; z < s_.nz; ++z)
-                    flags_[(std::size_t(x) * s_.ny + y) * s_.nz + z] = floor;
+                    flags_[grid().index(x, y, z)] = floor;
     }
     const auto t0 = Clock::now();
     vox_stats_ = vox_->voxelise(tris, flags_);
     solver_->set_flags(flags_);
-    if (s_.sub_cell_walls) // where each wall link crosses the true surface
-        solver_->set_link_q(shapes::link_fractions(flags_, vox_->signed_distance(flags_), s_.nx,
-                                                   s_.ny, s_.nz, &tris));
+    if (s_.sub_cell_walls) { // where each wall link crosses the true surface
+        const shapes::LinkSet ls =
+            shapes::link_set(flags_, vox_->signed_distance(flags_), s_.nx, s_.ny, s_.nz, &tris);
+        solver_->set_link_q_sparse(ls.x0, ls.x1, ls.index, ls.q);
+    }
     vox_ms_ = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
     // Reference areas: frontal (x-projection, car convention), planform
@@ -297,7 +300,7 @@ void Tunnel::revoxelise() {
     for (int x = 0; x < nx; ++x)
         for (int y = 0; y < ny; ++y)
             for (int z = 0; z < nz; ++z) {
-                if (flags_[(std::size_t(x) * ny + y) * nz + z] != lbm::OBSTACLE)
+                if (flags_[grid().index(x, y, z)] != lbm::OBSTACLE)
                     continue;
                 front[std::size_t(y) * nz + z] = 1;
                 plan[std::size_t(x) * nz + z] = 1;
@@ -325,6 +328,7 @@ void Tunnel::revoxelise() {
 
     if (new_body)
         reset_flow("new model"); // from rest, ramped (the cache may still win)
+    walls_applied_.reset();      // new flags: the requests capture new cells
     apply_moving_walls();
     build_rotors();
     if (dye_)
@@ -371,7 +375,7 @@ void Tunnel::load_euler() {
         for (int x = 0; x < s_.nx; ++x)
             for (int y = 0; y < std::min(s_.floor_height, s_.ny); ++y)
                 for (int z = 0; z < s_.nz; ++z)
-                    ef[(std::size_t(x) * s_.ny + y) * s_.nz + z] = lbm::WALL;
+                    ef[grid().index(x, y, z)] = lbm::WALL;
     vox_->voxelise(placed_mesh(), ef);
     const std::vector<float> phi = vox_->signed_distance(ef); // before the ports are marked
     // Engine exhausts: each face (the port's disc, 2 cells inside the true
@@ -391,8 +395,7 @@ void Tunnel::load_euler() {
             for (std::size_t i = 0; i < ef.size(); ++i) {
                 if (ef[i] != lbm::OBSTACLE)
                     continue;
-                const int x = int(i / (std::size_t(s_.ny) * s_.nz));
-                const int y = int((i / s_.nz) % s_.ny), z = int(i % s_.nz);
+                const auto [x, y, z] = grid().coords(i);
                 const double d[3] = {x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]};
                 const double along = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
                 const double perp2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - along * along;
@@ -442,12 +445,14 @@ void Tunnel::advance_transonic(int steps) {
         euler_->set_mach(mach_applied_);
     }
     const double t0 = euler_time_;
-    euler_->step(steps);
-    // Moments about the placed centre, as in the subsonic regime (THEORY 8.11).
-    const euler::Solver::Loads loads = euler_->body_loads(placed_centre_);
-    const std::array<double, 3>& f = loads.force;
-    const std::array<double, 3>& m = loads.moment;
-    euler_time_ = euler_->time();
+    // The batch and its readings in one submission: moments about the placed
+    // centre, as in the subsonic regime (THEORY 8.11), the simulated time,
+    // the render fields, and the health every health_every batches.
+    const bool health_due = (batch_ + 1) % std::max(s_.health_every, 1) == 0;
+    const euler::Solver::Batch b = euler_->step_with_readings(steps, placed_centre_, health_due);
+    const std::array<double, 3>& f = b.loads.force;
+    const std::array<double, 3>& m = b.loads.moment;
+    euler_time_ = b.time;
     euler_batch_time_ = euler_time_ - t0;
     ++batch_;
     bool finite = true;
@@ -462,14 +467,12 @@ void Tunnel::advance_transonic(int steps) {
         euler_force_ema_[k] += a * (f[k] - euler_force_ema_[k]);
         euler_moment_ema_[k] += a * (m[k] - euler_moment_ema_[k]);
     }
-    if (batch_ % std::max(s_.health_every, 1) == 0) {
-        const euler::Solver::Health h = euler_->health();
+    if (b.health) {
+        const euler::Solver::Health& h = *b.health;
         peak_mach_ = h.max_mach;
         if (h.bad_cells > 0 || !std::isfinite(h.max_mach) || h.max_mach > 5.0f)
             restart_transonic("max Mach " + fmt(h.max_mach, 2) + ", " +
                               std::to_string(h.bad_cells) + " bad cells");
-    } else {
-        euler_->refresh(); // render fields for the snapshot
     }
 }
 
@@ -587,6 +590,10 @@ void Tunnel::set_dye(bool on) {
         dye_ = std::make_unique<Dye>(ctx_, *solver_, s_.dye_tau, s_.dye_tau_plus);
         build_dye_nozzles();
     }
+    if (dye_ && on) // fused into the flow's step (no separate pass)
+        dye_->attach(*solver_);
+    else if (dye_)
+        dye_->detach();
 }
 
 void Tunnel::set_dye_rake(float x, float cy, float cz, float half_y, float half_z) {
@@ -598,8 +605,11 @@ void Tunnel::set_dye_rake(float x, float cy, float cz, float half_y, float half_
         build_dye_nozzles();
 }
 
-// An n x n grid of single-cell nozzles on the wand plane, like a real smoke
-// rake (9 x 9 nozzles of 2 x 2 cells merged into one opaque sheet).
+// An n x n grid of nozzles on the wand plane, like a real smoke rake. The
+// wand sits at the inlet, so a filament travels the tunnel's length before
+// the model: each is dye_nozzle_cells wide in y and z, or it would diffuse
+// below the renderer's threshold on the way (a single cell faded out before
+// the saloon, 90 cells downstream).
 void Tunnel::build_dye_nozzles() {
     const int nx = s_.nx, ny = s_.ny, nz = s_.nz, n = s_.dye_nozzles;
     std::vector<float> src(solver_->cells(), 0.0f);
@@ -609,12 +619,16 @@ void Tunnel::build_dye_nozzles() {
         for (int b = 0; b < n; ++b) {
             const float j = n > 1 ? cy - hy + 2 * hy * a / float(n - 1) : cy;
             const float k = n > 1 ? cz - hz + 2 * hz * b / float(n - 1) : cz;
-            const int jj = std::clamp(int(j), 1, ny - 3), kk = std::clamp(int(k), 1, nz - 3);
-            for (int x = xr - 1; x < xr + 1; ++x) {
-                const std::size_t c = (std::size_t(x) * ny + jj) * nz + kk;
-                if (flags_[c] == lbm::FLUID)
-                    src[c] = s_.dye_nozzle_rate;
-            }
+            const int w = std::max(s_.dye_nozzle_cells, 1);
+            const int jj = std::clamp(int(j) - (w - 1) / 2, 1, ny - 2 - w);
+            const int kk = std::clamp(int(k) - (w - 1) / 2, 1, nz - 2 - w);
+            for (int x = xr - 1; x < xr + 1; ++x)
+                for (int dj = 0; dj < w; ++dj)
+                    for (int dk = 0; dk < w; ++dk) {
+                        const std::size_t c = grid().index(x, jj + dj, kk + dk);
+                        if (flags_[c] == lbm::FLUID)
+                            src[c] = s_.dye_nozzle_rate;
+                    }
         }
     dye_->set_sources(src);
 }
@@ -633,67 +647,91 @@ void Tunnel::build_dye_nozzles() {
 // capture cylinders would miss road-car wheels (~40 cells above them at
 // the fast preset).
 void Tunnel::apply_moving_walls() {
-    solver_->clear_wall_velocity();
     spin_scale_ = 1.0f;
     jet_scale_ = 1.0f;
     const bool spinning = spin_on_ && !model_.spinners.empty();
     const bool powered = power_on_ && !model_.ports.empty();
-    if ((!spinning && !powered) || model_.mesh.empty())
-        return;
-    const ModelFrame frame = model_frame(model_.mesh, model_.rotors, placement_, s_);
-    const double scale = frame.scale;
-    auto place_point = [&](const std::array<double, 3>& c) { return frame.point(c); };
-    auto place_dir = [&](const std::array<double, 3>& a) { return frame.dir(a); };
-    if (powered) {
-        struct Jet {
-            std::array<double, 3> point, dir;
-            double r, speed;
+    std::vector<WallOp> plan;
+    if ((spinning || powered) && !model_.mesh.empty()) {
+        const ModelFrame frame = model_frame(model_.mesh, model_.rotors, placement_, s_);
+        const double scale = frame.scale;
+        auto f3 = [](const std::array<double, 3>& a) {
+            return lbm::Vec3{float(a[0]), float(a[1]), float(a[2])};
         };
-        std::vector<Jet> jets;
-        for (const catalogue::Port& po : model_.ports) {
-            const double sign = po.kind == catalogue::Port::Kind::Exhaust ? 1.0 : -1.0;
-            const double speed = po.speed_ratio * throttle_ * std::max(double(u_command_), 1e-3);
-            if (speed > s_.max_jet_speed)
-                jet_scale_ = std::min(jet_scale_, float(s_.max_jet_speed / speed));
-            jets.push_back(
-                {place_point(po.c), place_dir(po.n), std::max(po.r * scale, 1.0), sign * speed});
+        if (powered) {
+            struct Jet {
+                std::array<double, 3> point, dir;
+                double r, speed;
+            };
+            std::vector<Jet> jets;
+            for (const catalogue::Port& po : model_.ports) {
+                const double sign = po.kind == catalogue::Port::Kind::Exhaust ? 1.0 : -1.0;
+                const double speed =
+                    po.speed_ratio * throttle_ * std::max(double(u_command_), 1e-3);
+                if (speed > s_.max_jet_speed)
+                    jet_scale_ = std::min(jet_scale_, float(s_.max_jet_speed / speed));
+                jets.push_back({frame.point(po.c), frame.dir(po.n), std::max(po.r * scale, 1.0),
+                                sign * speed});
+            }
+            for (const Jet& j : jets) {
+                // the face cells: the port's disc, from 2 cells inside the true
+                // face to 1 outside (the staircase straddles it)
+                const double v = j.speed * jet_scale_;
+                WallOp op;
+                op.port = true;
+                op.point = f3({j.point[0] - 0.5 * j.dir[0], j.point[1] - 0.5 * j.dir[1],
+                               j.point[2] - 0.5 * j.dir[2]});
+                op.axis = f3(j.dir);
+                op.u = f3({v * j.dir[0], v * j.dir[1], v * j.dir[2]});
+                op.radius = float(j.r);
+                op.half_len = 1.5f;
+                plan.push_back(op);
+            }
         }
-        for (const Jet& j : jets) {
-            // the face cells: the port's disc, from 2 cells inside the true face
-            // to 1 outside (the staircase straddles it)
-            const double v = j.speed * jet_scale_;
-            solver_->set_wall_velocity(
-                {float(j.point[0] - 0.5 * j.dir[0]), float(j.point[1] - 0.5 * j.dir[1]),
-                 float(j.point[2] - 0.5 * j.dir[2])},
-                {float(j.dir[0]), float(j.dir[1]), float(j.dir[2])}, float(j.r), 1.5f,
-                {float(v * j.dir[0]), float(v * j.dir[1]), float(v * j.dir[2])});
+        if (spinning) {
+            struct Part {
+                std::array<double, 3> point, omega;
+                double capture_r, half_len;
+            };
+            std::vector<Part> parts;
+            for (const catalogue::Spinner& sp : model_.spinners) {
+                const std::array<double, 3> p = frame.point(sp.c), ax = frame.dir(sp.axis);
+                const double r_cells = std::max(sp.r * scale, 1.0);
+                const double w =
+                    sp.sense * spin_ratio_ * std::max(double(u_command_), 1e-3) / r_cells;
+                Part part{
+                    p, {ax[0] * w, ax[1] * w, ax[2] * w}, sp.r * scale * 1.2, sp.hl * scale * 1.4};
+                const double fastest = std::abs(w) * part.capture_r;
+                const double cap =
+                    std::min(double(s_.max_wall_speed),
+                             sp.max_wall > 0.0 ? sp.max_wall : double(s_.max_wall_speed));
+                if (fastest > cap)
+                    spin_scale_ = std::min(spin_scale_, float(cap / fastest));
+                parts.push_back(part);
+            }
+            for (const Part& p : parts) {
+                WallOp op;
+                op.point = f3(p.point);
+                op.u = {float(p.omega[0] * spin_scale_), float(p.omega[1] * spin_scale_),
+                        float(p.omega[2] * spin_scale_)};
+                op.radius = float(p.capture_r);
+                op.half_len = float(p.half_len);
+                plan.push_back(op);
+            }
         }
     }
-    if (!spinning)
-        return;
-    struct Part {
-        std::array<double, 3> point, omega;
-        double capture_r, half_len;
-    };
-    std::vector<Part> parts;
-    for (const catalogue::Spinner& sp : model_.spinners) {
-        const std::array<double, 3> p = place_point(sp.c), ax = place_dir(sp.axis);
-        const double r_cells = std::max(sp.r * scale, 1.0);
-        const double w = sp.sense * spin_ratio_ * std::max(double(u_command_), 1e-3) / r_cells;
-        Part part{p, {ax[0] * w, ax[1] * w, ax[2] * w}, sp.r * scale * 1.2, sp.hl * scale * 1.4};
-        const double fastest = std::abs(w) * part.capture_r;
-        const double cap = std::min(double(s_.max_wall_speed),
-                                    sp.max_wall > 0.0 ? sp.max_wall : double(s_.max_wall_speed));
-        if (fastest > cap)
-            spin_scale_ = std::min(spin_scale_, float(cap / fastest));
-        parts.push_back(part);
+    if (walls_applied_ && *walls_applied_ == plan)
+        return; // the same request: nothing to clear, scan or upload
+    // Ports first, then spinning parts (a part overrides a port it overlaps).
+    solver_->begin_wall_update();
+    for (const WallOp& op : plan) {
+        if (op.port)
+            solver_->set_wall_velocity(op.point, op.axis, op.radius, op.half_len, op.u);
+        else
+            solver_->set_rotation(op.point, op.u, op.radius, op.half_len);
     }
-    for (const Part& p : parts) {
-        solver_->set_rotation({float(p.point[0]), float(p.point[1]), float(p.point[2])},
-                              {float(p.omega[0] * spin_scale_), float(p.omega[1] * spin_scale_),
-                               float(p.omega[2] * spin_scale_)},
-                              float(p.capture_r), float(p.half_len));
-    }
+    solver_->end_wall_update();
+    walls_applied_ = std::move(plan);
 }
 
 // Everything that determines the settled flow, as a canonical string.
@@ -844,12 +882,23 @@ double Tunnel::q_dyn() const {
 // -- running ------------------------------------------------------------------------------
 
 void Tunnel::advance(int steps) {
+    advance_submit(steps);
+    while (!pending_.empty())
+        advance_complete();
+}
+
+bool Tunnel::advance_submit(int steps, const lbm::Solver::Tail& tail) {
     if (paused_ || steps <= 0 || model_.mesh.empty())
-        return;
-    if (transonic_ && euler_) {
+        return false;
+    if (transonic_ && euler_) { // the compressible batch stays blocking
         advance_transonic(steps);
-        return;
+        if (tail.record)
+            ctx_.submit_and_wait([&](VkCommandBuffer cmd) { tail.record(cmd, 0); }, tail.signal,
+                                 tail.value);
+        return true;
     }
+    if (pending_.size() >= 2) // two in flight at most
+        advance_complete();
 
     // A significant speed change is a new operating point: develop again.
     if (!develop_.developing() &&
@@ -869,17 +918,45 @@ void Tunnel::advance(int steps) {
     if (turb_pct_ > 0.0f)
         solver_->set_turbulence_convection(std::max(u_applied_, 1e-3f));
 
-    const bool dye = dye_on_ && dye_;
-    if (dye || alm_) // lock-step with the flow: the dye, then the rotors' forces
-        solver_->step(steps, [&](VkCommandBuffer cmd, int macro_index) {
-            if (dye)
-                dye_->record_step(cmd, macro_index);
-            if (alm_)
-                alm_->record_step(cmd, macro_index);
-        });
+    // The batch's readings ride on its own submission (no round trips): the
+    // health check every health_every batches, the reference density every
+    // fourth, the probes every batch.
+    PendingBatch b;
+    b.steps = steps;
+    b.epoch = flow_epoch_;
+    const std::int64_t n = batch_ + std::int64_t(pending_.size()) + 1; // this batch's number
+    b.health = n % std::max(s_.health_every, 1) == 0;
+    b.plane = n % 4 == 0;
+    if (b.health)
+        solver_->request_health();
+    if (b.plane)
+        solver_->request_plane_density(x_ref_);
+    if (!probe_cells_.empty())
+        solver_->request_probes(probe_cells_);
+
+    // The dye rides in the flow's step (attached); the rotors' forces need
+    // the flow's rho / u after every step, through the per-step hook.
+    if (alm_)
+        b.ticket = solver_->step_async(
+            steps,
+            [&](VkCommandBuffer cmd, int macro_index) { alm_->record_step(cmd, macro_index); },
+            tail);
     else
-        solver_->step(steps);
+        b.ticket = solver_->step_async(steps, {}, tail);
     steps_done_ += steps;
+    pending_.push_back(b);
+    return true;
+}
+
+bool Tunnel::advance_complete() {
+    if (pending_.empty())
+        return false;
+    const PendingBatch b = pending_.front();
+    pending_.pop_front();
+    solver_->finish(b.ticket);
+    if (b.epoch != flow_epoch_) // begun before a reset or restart: not this flow's
+        return false;
+    const int steps = b.steps;
     ++batch_;
     if (alm_) { // the rotors' thrust and power (the last step of the batch)
         double thrust = 0.0, power = 0.0, fx = 0.0;
@@ -902,17 +979,17 @@ void Tunnel::advance(int steps) {
         finite = finite && std::isfinite(mf.force[k]) && std::isfinite(mf.torque[k]);
     if (!finite) {
         diverged(0.0f, -1);
-        return;
+        return false;
     }
-    if (batch_ % std::max(s_.health_every, 1) == 0) {
-        health_ = solver_->health();
+    if (b.health) {
+        health_ = solver_->last_health();
         if (health_.bad_cells > 0 || health_.max_speed > s_.diverge_speed) {
             diverged(health_.max_speed, health_.bad_cells);
-            return;
+            return false;
         }
     }
-    if (batch_ % 4 == 0)
-        rho_ref_ = solver_->plane_mean_density(x_ref_);
+    if (b.plane)
+        rho_ref_ = solver_->last_plane_density();
     const double a = 1.0 - std::exp(-mf.steps / s_.force_ema_steps);
     for (int k = 0; k < 3; ++k) {
         force_ema_[k] += a * (mf.force[k] - force_ema_[k]);
@@ -924,6 +1001,7 @@ void Tunnel::advance(int steps) {
                  s_.nx);
     maybe_save_settled_flow();
     record_signals(mf);
+    return true;
 }
 
 // -- statistics and signals -------------------------------------------------------------
@@ -958,7 +1036,7 @@ void Tunnel::set_probes(const std::vector<std::array<float, 3>>& positions) {
         const int x = std::clamp(int(std::floor(q[0])), 0, s_.nx - 1);
         const int y = std::clamp(int(std::floor(q[1])), 0, s_.ny - 1);
         const int z = std::clamp(int(std::floor(q[2])), 0, s_.nz - 1);
-        probe_cells_.push_back((std::size_t(x) * s_.ny + y) * s_.nz + z);
+        probe_cells_.push_back(grid().index(x, y, z));
     }
     ++probe_epoch_; // older samples belong to the old positions
 }
@@ -987,8 +1065,8 @@ void Tunnel::record_signals(const lbm::MeanForces& mf) {
     smp.cs = float(mf.force[2] / qa);
     smp.probe_epoch = probe_epoch_;
     if (!probe_cells_.empty()) {
-        const auto v = solver_->macro_at(probe_cells_);
-        for (std::size_t i = 0; i < v.size(); ++i)
+        const auto& v = solver_->last_probes();
+        for (std::size_t i = 0; i < std::min(v.size(), probe_cells_.size()); ++i)
             smp.probe[i] = v[i];
     }
     signals_.push_back(smp);
@@ -1216,6 +1294,11 @@ TunnelStatus Tunnel::status() const {
     }
     t.airspeed_mps = airspeed::metres_per_second(t.airspeed_mach);
     t.airspeed_mph = airspeed::mph(t.airspeed_mps);
+    if (model_.metres_per_unit > 0.0 && !model_.mesh.empty()) {
+        t.full_scale_length_m =
+            double(model_bounds(model_.mesh, model_.rotors).longest()) * model_.metres_per_unit;
+        t.full_scale_re = airspeed::full_scale_reynolds(t.airspeed_mps, t.full_scale_length_m);
+    }
     return t;
 }
 

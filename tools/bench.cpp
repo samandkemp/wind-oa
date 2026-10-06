@@ -1,18 +1,23 @@
 // Throughput benchmark (a measurement, not a gate): the LBM at each grid
 // preset -- plain, with the app's moving boundaries, with dye -- and the
-// Euler solver. The baseline for performance work. kUsage below is the
-// reference for the command line.
+// Euler solver. The baseline for performance work. `bench controls` times
+// instead what a slider costs the app's worker: one speed change. kUsage
+// below is the reference for the command line.
 //
-// Timing: steps submitted in 128-step batches after a warm-up, wall clock
-// around blocking submits (so it includes submit overhead, like the app).
-// Run it twice before believing a difference.
+// Timing: wall clock around blocking submits of 64 steps (so it includes
+// submit overhead, like the app), after a second of warm-up -- the GPU's
+// clocks take about that long to rise from idle, and a short run once read
+// 2,964 MLUPS where a long one read 3,450 -- and over at least `--steps`
+// steps and two seconds. Run it twice before believing a difference.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <string>
 #include <vector>
 
+#include "windoa/catalogue.hpp"
 #include "windoa/context.hpp"
 #include "windoa/dye.hpp"
 #include "windoa/euler.hpp"
@@ -27,6 +32,21 @@ namespace {
 
 double seconds_since(Clock::time_point t0) {
     return std::chrono::duration<double>(Clock::now() - t0).count();
+}
+
+// Million cell updates a second: `run(k)` advances k steps (blocking).
+template <class Run> double timed_rate(double cells, int steps, Run run) {
+    constexpr int kChunk = 64;
+    const auto w0 = Clock::now();
+    while (seconds_since(w0) < 1.0) // pipelines, caches, clocks
+        run(kChunk);
+    const auto t0 = Clock::now();
+    long long done = 0;
+    while (done < steps || seconds_since(t0) < 2.0) {
+        run(kChunk);
+        done += kChunk;
+    }
+    return cells * double(done) / seconds_since(t0) / 1e6;
 }
 
 // A sphere of diameter ny / 6 at x = nx / 4 (lbm_run's body).
@@ -60,10 +80,7 @@ double lbm_mlups(Context& ctx, const TunnelSettings& t, bool moving, bool dye, i
         else
             s.step(n);
     };
-    run(50); // warm-up: pipelines, clocks
-    const auto t0 = Clock::now();
-    run(steps);
-    return double(s.cells()) * steps / seconds_since(t0) / 1e6;
+    return timed_rate(double(s.cells()), steps, run);
 }
 
 double euler_mcells(Context& ctx, const TunnelSettings& t, int steps) {
@@ -75,30 +92,64 @@ double euler_mcells(Context& ctx, const TunnelSettings& t, int steps) {
     euler::Solver s(ctx, c);
     s.set_flags(sphere_flags(t.nx, t.ny, t.nz));
     s.init_freestream();
-    s.step(20);
-    const auto t0 = Clock::now();
-    s.step(steps);
-    return double(s.cells()) * steps / seconds_since(t0) / 1e6;
+    return timed_rate(double(s.cells()), steps, [&](int n) { s.step(n); });
+}
+
+// The worker's cost of one speed change (Tunnel::set_speed re-requests every
+// wall velocity, since spinning parts and engine faces scale with the wind):
+// a model with nothing moving, the saloon with its wheels spinning, and the
+// open-wheel car with wheels spinning and engines on. Blocking host time,
+// uploads included; the mean over alternating changes.
+void controls(Context& ctx, const TunnelSettings& t) {
+    const auto cache = std::filesystem::temp_directory_path() / "windoa_bench_controls";
+    struct Case {
+        const char* id;
+        bool spin, power;
+    };
+    for (const Case& k : {Case{"ahmed_25deg", false, false}, Case{"car_saloon", true, false},
+                          Case{"car_open_wheel", true, true}}) {
+        std::filesystem::remove_all(cache);
+        Tunnel tn(ctx, t, cache);
+        const catalogue::Entry* e = catalogue::find(k.id);
+        Model m = model_from_catalogue(*e);
+        const Placement pl = default_placement(*e, t, m.mesh);
+        tn.set_model(std::move(m), pl);
+        if (k.spin)
+            tn.set_spin(true, 1.0f);
+        if (k.power)
+            tn.set_power(true, 1.0f);
+        constexpr int n = 20;
+        const auto t0 = Clock::now();
+        for (int i = 0; i < n; ++i)
+            tn.set_speed(i % 2 ? 0.055f : 0.05f);
+        std::printf("  %-16s %8.2f ms per speed change\n", k.id, 1000.0 * seconds_since(t0) / n);
+    }
+    std::filesystem::remove_all(cache);
 }
 
 } // namespace
 
 const char* const kUsage =
     R"(usage: bench [fast|balanced|fine|ultra|all] [--steps N]
+       bench controls [fast|balanced|fine|ultra]
 
   fast|balanced|fine|ultra|all
                            the preset to measure (default all: every one but ultra)
   --steps N                LBM steps per measurement (default 1000; Euler a quarter)
+  controls                 the worker's cost of one speed change instead (default fast)
   -h, --help               this text
 )";
 
 int main(int argc, char** argv) {
     std::string which = "all";
     int steps = 1000;
+    bool control_costs = false;
     for (int a = 1; a < argc; ++a) {
         const std::string s = argv[a];
         if (s == "--steps" && a + 1 < argc)
             steps = std::atoi(argv[++a]);
+        else if (s == "controls")
+            control_costs = true;
         else if (s == "fast" || s == "balanced" || s == "fine" || s == "ultra" || s == "all")
             which = s;
         else if (s == "-h" || s == "--help") {
@@ -112,6 +163,12 @@ int main(int argc, char** argv) {
     try {
         Context ctx;
         std::printf("device: %s\n", ctx.gpu().name.c_str());
+        if (control_costs) {
+            const std::string p = which == "all" ? "fast" : which;
+            std::printf("speed changes, %s preset:\n", p.c_str());
+            controls(ctx, tunnel_preset(p));
+            return 0;
+        }
         std::printf("%-9s %8s  %9s %9s %9s %9s  %11s\n", "preset", "Mcells", "LBM", "+moving",
                     "+dye", "f16", "Euler");
         std::printf("%-9s %8s  %9s %9s %9s %9s  %11s\n", "", "", "MLUPS", "MLUPS", "MLUPS", "MLUPS",

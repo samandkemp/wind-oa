@@ -79,7 +79,7 @@ Disc disc_run(Context& ctx, double ct) {
                     const double dy = y + 0.5 - NY / 2.0, dz = z + 0.5 - NZ / 2.0;
                     if (dy * dy + dz * dz > frac * frac * R * R)
                         continue;
-                    sum += v[3 * ((std::size_t(x) * NY + y) * NZ + z)];
+                    sum += v[3 * (Grid{NX, NY, NZ}.index(x, y, z))];
                     ++n;
                 }
         return sum / n;

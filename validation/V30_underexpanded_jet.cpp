@@ -45,8 +45,7 @@ Jet run(gate::Gate& g, Context& ctx, double npr) {
                 if (r2 > 14.0 * 14.0)
                     continue;
                 const bool port = x >= int(X_EXIT) - 2 && r2 <= (D / 2) * (D / 2);
-                flags[(std::size_t(x) * NY + y) * NZ + z] =
-                    port ? euler::kPortFlag : std::uint8_t(1);
+                flags[Grid{NX, NY, NZ}.index(x, y, z)] = port ? euler::kPortFlag : std::uint8_t(1);
             }
     s.set_flags(flags);
     // sonic, cold: T_e = T0 / 1.2 = T_a / 1.2, p_e = p0 / 1.893; Euler units

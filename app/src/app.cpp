@@ -11,21 +11,26 @@
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "imgui_impl_win32.h"
+#include "imgui_internal.h" // settings handlers, FindWindowByName
 
 #include <vulkan/vulkan_win32.h>
 
 #include "png.hpp"
+#include "ui_common.hpp"
 #include "windoa/airspeed.hpp"
+#include "windoa/voxeliser.hpp"
 
 namespace windoa::app {
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
 constexpr float kRevoxSettle = 0.5f; // s after the last placement edit
-// --no-vsync: frames at most this often. Uncapped, the window drew ~900 frames a
-// second and the graphics queue starved the solver's (3,040 -> 1,280 MLUPS).
-constexpr double kMaxFps = 240.0;
+// Frames at most this often, with or without vsync: every frame's rendering
+// is GPU time the solver does not get, and beyond about 90 a second the view
+// gains little. Uncapped (--no-vsync), the window drew ~900 frames a second
+// and starved the solver's queue (3,040 -> 1,280 MLUPS); a 144 Hz display
+// with vsync would draw 144.
+constexpr double kMaxFps = 90.0;
 
 void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to,
                    VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
@@ -70,42 +75,6 @@ int imgui_create_surface(ImGuiViewport* vp, ImU64 instance, const void* allocato
     return static_cast<int>(r);
 }
 
-// Colour stops for the legends -- the same tables as the shaders' maps.
-struct Stop {
-    float t, r, g, b;
-};
-const std::vector<Stop> kCoolwarm = {{0.0f, 0, 0, 1}, {0.5f, 1, 1, 1}, {1.0f, 1, 0, 0}};
-const std::vector<Stop> kVort = {{0.0f, 40 / 255.f, 130 / 255.f, 1.0f},
-                                 {0.3f, 10 / 255.f, 30 / 255.f, 90 / 255.f},
-                                 {0.5f, 3 / 255.f, 4 / 255.f, 8 / 255.f},
-                                 {0.7f, 110 / 255.f, 25 / 255.f, 20 / 255.f},
-                                 {1.0f, 1.0f, 140 / 255.f, 40 / 255.f}};
-const std::vector<Stop> kDye = {{0.0f, 0.20f, 0.07f, 0.42f},
-                                {0.35f, 0.66f, 0.13f, 0.46f},
-                                {0.65f, 0.98f, 0.45f, 0.18f},
-                                {1.0f, 1.00f, 0.93f, 0.62f}};
-const std::vector<Stop> kQcore = {{0.0f, 0.30f, 0.95f, 0.50f}, {1.0f, 0.85f, 0.55f, 0.30f}};
-const std::vector<Stop> kGrey = {{0.0f, 0, 0, 0}, {1.0f, 0.88f, 0.92f, 1.0f}};
-
-ImU32 ramp(const std::vector<Stop>& s, float t) {
-    t = std::clamp(t, 0.0f, 1.0f);
-    for (std::size_t i = 1; i < s.size(); ++i) {
-        if (t <= s[i].t) {
-            const float u = (t - s[i - 1].t) / std::max(s[i].t - s[i - 1].t, 1e-6f);
-            return ImGui::ColorConvertFloat4ToU32({s[i - 1].r + u * (s[i].r - s[i - 1].r),
-                                                   s[i - 1].g + u * (s[i].g - s[i - 1].g),
-                                                   s[i - 1].b + u * (s[i].b - s[i - 1].b), 1.0f});
-        }
-    }
-    return ImGui::ColorConvertFloat4ToU32({s.back().r, s.back().g, s.back().b, 1.0f});
-}
-
-const char* kFieldNames[] = {"speed vs freestream",   "pressure (Cp)",
-                             "|vorticity|",           "streamwise vorticity",
-                             "local Mach number",     "schlieren (shocks)",
-                             "mean speed (averaged)", "turbulence intensity (averaged)"};
-const std::vector<Stop> kRecirc = {{0.0f, 0.25f, 0.75f, 0.85f}, {1.0f, 0.10f, 0.35f, 0.95f}};
-
 } // namespace
 
 // -- construction ----------------------------------------------------------------
@@ -113,7 +82,11 @@ const std::vector<Stop> kRecirc = {{0.0f, 0.25f, 0.75f, 0.85f}, {1.0f, 0.10f, 0.
 App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
     ts_.storage_f16 = o.f16;
     ImGui_ImplWin32_EnableDpiAwareness();
-    window_ = std::make_unique<Window>(L"wind-oa -- LBM wind tunnel", 1600, 900);
+    // Scripted runs keep a fixed size, so their pictures repeat on any screen.
+    const std::array<int, 2> win = o.window       ? *o.window
+                                   : o.scripted() ? std::array<int, 2>{1600, 900}
+                                                  : std::array<int, 2>{0, 0};
+    window_ = std::make_unique<Window>(L"wind-oa -- LBM wind tunnel", win[0], win[1]);
 
     ContextOptions co;
     co.instance_extensions = {VK_KHR_SURFACE_EXTENSION_NAME, "VK_KHR_win32_surface"};
@@ -139,6 +112,7 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
     sim_ = std::make_unique<SimWorker>(*ctx_, ts_, std::filesystem::path("cache") / "flow");
     renderer_ = std::make_unique<render::VolumeRenderer>(*ctx_, ts_.nx, ts_.ny, ts_.nz);
     tracers_ = std::make_unique<render::Tracers>(*ctx_, ts_.nx, ts_.ny, ts_.nz);
+    static_assert(SimWorker::kSlots == render::kSlots, "one renderer source set per snapshot slot");
     for (int k = 0; k < SimWorker::kSlots; ++k) {
         const SimWorker::Snapshot& sn = sim_->snapshot(k);
         renderer_->set_sources(k, {sn.flags.get(), sn.macro.get(), sn.aux.get(), sn.dye.get(),
@@ -160,10 +134,10 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(ctx_->physical(), &props);
     tick_ms_ = props.limits.timestampPeriod * 1e-6;
-    if (o.no_vsync) // the frame cap's timer (Windows 10 1803 or later; else a plain one)
-        frame_timer_ = CreateWaitableTimerExW(
-            nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (o.no_vsync && !frame_timer_)
+    // the frame cap's timer (Windows 10 1803 or later; else a plain one)
+    frame_timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                          TIMER_ALL_ACCESS);
+    if (!frame_timer_)
         frame_timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
 
     // Model menu: the catalogue, then any STL dropped into ./models ("Imported";
@@ -185,7 +159,7 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
         if (menu_[i].entry && menu_[i].entry->id == o.model)
             start = i;
     camera_.frame_start(ts_.nx, ts_.ny, ts_.nz);
-    rs_.surface = render::Surface::Smooth;
+    rs_.surface = render::Surface::Mesh;
     u_command_ = ts_.u_inlet;
     // Scripted view (tests / screenshots)
     auto has = [&](const char* w) {
@@ -219,6 +193,8 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
         show_plots_ = false;
     if (has("voxel"))
         rs_.surface = render::Surface::Voxel;
+    if (has("smooth"))
+        rs_.surface = render::Surface::Smooth;
     if (has("avg"))
         averaging_ = true;
     if (has("recirc"))
@@ -237,6 +213,14 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
         paint_mode_ = 3;
     if (has("oil"))
         paint_mode_ = 4;
+    if (has("sequential"))
+        rs_.palette = 1;
+    if (has("greyscale"))
+        rs_.palette = 3;
+    if (has("logscale"))
+        rs_.log_scale = true;
+    // Scripted runs are for repeatable pictures: still textures unless asked.
+    animate_textures_ = opt_.max_frames <= 0 || has("animate");
     if (has("analysis"))
         analysis_open_ = true;
     if (has("probes"))
@@ -253,7 +237,7 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
         if (o.size > 0.0f) // the size slider's range
             placement_.length_cells = std::clamp(o.size, 12.0f, 0.8f * float(ts_.nx));
         const Placement p = placement_;
-        sim_->post([p](Tunnel& t) { t.set_placement(p); });
+        sim_->post("placement", [p](Tunnel& t) { t.set_placement(p); });
     }
     if (o.spin >= 0.0f) {
         spin_on_ = true;
@@ -286,8 +270,12 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
     if (o.mach > 0.0f) {
         mach_command_ = o.mach;
         const float m = o.mach;
-        sim_->post([m](Tunnel& t) { t.set_mach(m); });
+        sim_->post("mach", [m](Tunnel& t) { t.set_mach(m); });
     }
+    // The smoke wand and dye nozzles go to the inlet before any stepping, so
+    // a warm-up already carries smoke and dye from there.
+    sim_->flush();
+    update_rake(sim_->status());
     if (o.warmup_steps > 0) { // tests: develop the flow before the first frame
         const int n = o.warmup_steps;
         sim_->set_running(false);
@@ -299,6 +287,16 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
         sim_->set_running(true);
     }
     sim_->flush();
+    if (has("paused")) { // after the warm-up: every frame shows the same flow
+        sim_->post([](Tunnel& t) { t.set_paused(true); });
+        sim_->flush();
+    }
+    if (o.look > 0) // after the warm-up: a look's slice goes through the placed model
+        apply_look(o.look, sim_->status());
+    if (!o.record.empty()) {
+        record_every_ = o.record_every;
+        start_recording(o.record);
+    }
     if (o.zoom > 0.0f) { // scripted close-ups
         camera_.target = sim_->status().placed_centre;
         camera_.distance *= o.zoom;
@@ -307,6 +305,11 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
         camera_.azimuth = (*o.view)[0] * 3.14159265f / 180.0f;
         camera_.elevation = (*o.view)[1] * 3.14159265f / 180.0f;
     }
+    // An interactive run opens on the model, three-quarters from upstream,
+    // gliding in from the whole tunnel ("tunnel" on the quick bar goes back);
+    // a scripted one keeps the tunnel view its --zoom and --view refer to.
+    if (!o.scripted() && !o.view && o.zoom <= 0.0f)
+        view_preset(3, sim_->status());
     if (n_probes_ > 0) { // scripted: probes in the wake (centreline, shear layer)
         const TunnelStatus st = sim_->status();
         const float L = placement_.length_cells;
@@ -319,6 +322,15 @@ App::App(const Options& o) : opt_(o), ts_(tunnel_preset(o.preset)) {
 }
 
 App::~App() {
+    if (recording_)
+        stop_recording();
+    { // the writer drains its queue, then stops
+        std::lock_guard<std::mutex> lock(png_mu_);
+        png_stop_ = true;
+    }
+    png_cv_.notify_all();
+    if (png_writer_.joinable())
+        png_writer_.join();
     if (ctx_)
         vkQueueWaitIdle(ctx_->graphics_queue());
     sim_.reset(); // stop the worker before anything it hands frames to
@@ -329,6 +341,7 @@ App::~App() {
     if (frame_timer_)
         CloseHandle(frame_timer_);
     shot_buf_.reset(); // every Vulkan object goes before the Context
+    pick_buf_.reset();
     tracers_.reset();
     renderer_.reset();
     if (imgui_ready_) {
@@ -346,14 +359,48 @@ void App::init_imgui() {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = "windoa_imgui.ini";
-    const float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(window_->hwnd());
-    ImGui::StyleColorsDark();
-    ImGuiStyle& st = ImGui::GetStyle();
-    st.WindowRounding = 4.0f;
-    st.FrameRounding = 3.0f;
-    st.Colors[ImGuiCol_WindowBg].w = 0.86f;
-    st.ScaleAllSizes(dpi);
-    st.FontScaleDpi = dpi;
+    // The app's preferences ride in the same file, as a [windoa][prefs] entry
+    // (a settings handler: Dear ImGui's hook for an application's own data).
+    // Scripted runs ignore them, so their pictures do not depend on them.
+    ImGuiSettingsHandler prefs;
+    prefs.TypeName = "windoa";
+    prefs.TypeHash = ImHashStr("windoa");
+    prefs.UserData = this;
+    prefs.ReadOpenFn = [](ImGuiContext*, ImGuiSettingsHandler* h, const char*) -> void* {
+        return h->UserData;
+    };
+    prefs.ReadLineFn = [](ImGuiContext*, ImGuiSettingsHandler*, void* app, const char* line) {
+        static_cast<App*>(app)->read_pref(line);
+    };
+    prefs.WriteAllFn = [](ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBuffer* out) {
+        static_cast<const App*>(h->UserData)->write_prefs(*out);
+    };
+    ImGui::AddSettingsHandler(&prefs);
+    ImGui::LoadIniSettingsFromDisk(io.IniFilename);
+    if (!opt_.scripted()) {
+        ui_scale_ = saved_prefs_.ui_scale;
+        ui_font_ = saved_prefs_.font;
+        speed_unit_ = saved_prefs_.speed_unit;
+        render_scale_ = saved_prefs_.render_scale;
+    }
+    if (opt_.ui_scale > 0.0f)
+        ui_scale_ = std::clamp(opt_.ui_scale, kUiScaleMin, kUiScaleMax);
+
+    // Fonts: the system's UI font (Segoe UI, part of Windows: nothing to
+    // download) and Dear ImGui's built-in scalable font, the fallback. Both
+    // are rasterised at whatever size is asked for (ImGui 1.92 dynamic
+    // fonts), so a scale change stays sharp.
+    fonts_[1] = io.Fonts->AddFontDefaultVector();
+    wchar_t windir[MAX_PATH] = {};
+    const UINT n = GetWindowsDirectoryW(windir, MAX_PATH);
+    const std::filesystem::path segoe =
+        std::filesystem::path(std::wstring(windir, n)) / "Fonts" / "segoeui.ttf";
+    std::error_code ec;
+    if (n > 0 && std::filesystem::is_regular_file(segoe, ec)) {
+        const std::u8string path = segoe.u8string();
+        fonts_[0] = io.Fonts->AddFontFromFileTTF(reinterpret_cast<const char*>(path.c_str()));
+    }
+    apply_style();
     ImGui_ImplWin32_Init(window_->hwnd());
     ImGui::GetPlatformIO().Platform_CreateVkSurface = imgui_create_surface;
 
@@ -377,10 +424,73 @@ void App::init_imgui() {
     imgui_ready_ = true;
 }
 
+// The style for the monitor's DPI x the user's scale, rebuilt from the base
+// (ScaleAllSizes multiplies, so scaling a scaled style would compound).
+void App::apply_style() {
+    const float dpi = window_ ? ImGui_ImplWin32_GetDpiScaleForHwnd(window_->hwnd()) : 1.0f;
+    if (dpi == style_dpi_ && ui_scale_ == style_scale_ && ui_font_ == style_font_)
+        return;
+    const float ratio = style_dpi_ > 0.0f ? dpi * ui_scale_ / (style_dpi_ * style_scale_) : 1.0f;
+    ImGuiStyle st;
+    ImGui::StyleColorsDark(&st);
+    st.WindowRounding = 4.0f;
+    st.FrameRounding = 3.0f;
+    st.Colors[ImGuiCol_WindowBg].w = 0.86f;
+    st.ScaleAllSizes(dpi * ui_scale_);
+    const bool system_font = ui_font_ == 0 && fonts_[0];
+    st.FontSizeBase = system_font ? 17.0f : 15.0f; // ~10 pt Segoe UI at 100 %
+    st.FontScaleMain = ui_scale_;
+    st.FontScaleDpi = dpi;
+    ImGui::GetStyle() = st;
+    ImGui::GetIO().FontDefault = system_font ? fonts_[0] : fonts_[1];
+    // Undocked panels keep their place and grow or shrink with the text, so
+    // a larger scale does not leave their contents clipped.
+    if (ratio != 1.0f)
+        for (const char* name : kPanelNames)
+            if (const ImGuiWindow* w = ImGui::FindWindowByName(name); w && !w->DockIsActive)
+                ImGui::SetWindowSize(name, {w->SizeFull.x * ratio, w->SizeFull.y * ratio});
+    style_dpi_ = dpi;
+    style_scale_ = ui_scale_;
+    style_font_ = ui_font_;
+}
+
+void App::set_ui_scale(float s) {
+    const float v = std::clamp(std::round(s * 20.0f) / 20.0f, kUiScaleMin, kUiScaleMax);
+    if (v == ui_scale_)
+        return;
+    ui_scale_ = v;
+    ImGui::MarkIniSettingsDirty();
+    char msg[48];
+    std::snprintf(msg, sizeof(msg), "UI scale %.0f %%", 100.0f * v);
+    toast_ = msg;
+    toast_t_ = Clock::now();
+}
+
+// Parsed into saved_prefs_ whatever the run; applied by init_imgui() unless
+// scripted, and written back unchanged by a scripted run.
+void App::read_pref(const char* line) {
+    float f = 0.0f;
+    int i = 0;
+    if (sscanf_s(line, "UiScale=%f", &f) == 1)
+        saved_prefs_.ui_scale = std::clamp(f, kUiScaleMin, kUiScaleMax);
+    else if (sscanf_s(line, "Font=%d", &i) == 1)
+        saved_prefs_.font = std::clamp(i, 0, 1);
+    else if (sscanf_s(line, "SpeedUnit=%d", &i) == 1)
+        saved_prefs_.speed_unit = std::clamp(i, 0, 2);
+    else if (sscanf_s(line, "RenderScale=%f", &f) == 1)
+        saved_prefs_.render_scale = std::clamp(f, 0.25f, 1.0f);
+}
+
+void App::write_prefs(ImGuiTextBuffer& out) const {
+    const Prefs p =
+        opt_.scripted() ? saved_prefs_ : Prefs{ui_scale_, ui_font_, speed_unit_, render_scale_};
+    out.appendf("[windoa][prefs]\nUiScale=%.3f\nFont=%d\nSpeedUnit=%d\nRenderScale=%.3f\n\n",
+                p.ui_scale, p.font, p.speed_unit, p.render_scale);
+}
+
 // -- model -------------------------------------------------------------------------------
 
 void App::choose_model(std::size_t index) {
-    model_index_ = index;
     const MenuItem& it = menu_[index];
     Model m;
     try {
@@ -390,6 +500,13 @@ void App::choose_model(std::size_t index) {
         toast_t_ = Clock::now();
         return;
     }
+    if (m.mesh.triangles() > Voxeliser::kMaxTriangles) {
+        toast_ = "could not load: " + std::to_string(m.mesh.triangles()) +
+                 " triangles (the voxeliser takes up to 1,048,576)";
+        toast_t_ = Clock::now();
+        return;
+    }
+    model_index_ = index; // loaded: the menu shows it
     if (it.entry) {
         placement_ = default_placement(*it.entry, ts_, m.mesh);
     } else {
@@ -406,7 +523,7 @@ void App::choose_model(std::size_t index) {
     if (has_rotors) {
         const bool on = rotors_on_;
         const float tsr = rotor_tsr_;
-        sim_->post([on, tsr](Tunnel& t) { t.set_rotors(on, tsr); });
+        sim_->post("rotors", [on, tsr](Tunnel& t) { t.set_rotors(on, tsr); });
     }
     cd_.clear();
     cl_.clear();
@@ -437,12 +554,13 @@ int App::run() {
         if (placement_dirty_ &&
             std::chrono::duration<float>(Clock::now() - placement_edit_).count() > kRevoxSettle) {
             const Placement p = placement_;
-            sim_->post([p](Tunnel& t) { t.set_placement(p); });
+            sim_->post("placement", [p](Tunnel& t) { t.set_placement(p); });
             placement_dirty_ = false;
         }
         update_rake(st);
 
         // -- UI --
+        apply_style(); // a new monitor DPI or UI scale
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -461,7 +579,14 @@ int App::run() {
         const std::uint64_t rv = ++render_value_;
         const SimWorker::Frame sf = sim_->acquire(rv);
         const bool last_frame = opt_.max_frames > 0 && frames + 1 == opt_.max_frames;
-        const bool shot = screenshot_pending_ || (!opt_.shot.empty() && last_frame);
+        if (opt_.pick && frames == 10 && renderer_->width() > 0) { // a scripted Ctrl + click
+            pick_request_ = std::array<std::uint32_t, 2>{
+                std::uint32_t((*opt_.pick)[0] * float(renderer_->width())),
+                std::uint32_t((*opt_.pick)[1] * float(renderer_->height()))};
+            pick_mode_ = click_mode_;
+        }
+        const bool record_due = recording_ && record_tick_++ % record_every_ == 0;
+        const bool shot = screenshot_pending_ || (!opt_.shot.empty() && last_frame) || record_due;
         record_frame(f, sf, st, shot);
         std::vector<Swapchain::Timeline> waits, signals;
         if (sf.slot >= 0)
@@ -470,12 +595,29 @@ int App::run() {
         signals.push_back({sim_->render_timeline(), rv, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT});
         if (!swapchain_->end(f, waits, signals))
             swapchain_->rebuild(w, h);
-        if (shot) {
+        if (pick_recorded_)
+            resolve_pick(st);
+        if (record_due) { // hand the frame to the writer; drop it if the writer is behind
+            PendingPng p;
+            p.rgba = capture_rgba(p.w, p.h);
+            char name[32];
+            std::snprintf(name, sizeof(name), "frame_%05d.png", record_count_);
+            p.path = (std::filesystem::path(record_dir_) / name).string();
+            std::lock_guard<std::mutex> lock(png_mu_);
+            if (png_queue_.size() < 6) {
+                png_queue_.push_back(std::move(p));
+                ++record_count_;
+                png_cv_.notify_one();
+            } else {
+                ++record_dropped_;
+            }
+        }
+        if (screenshot_pending_ || (!opt_.shot.empty() && last_frame)) {
             write_screenshot(screenshot_pending_ ? std::string() : opt_.shot);
             screenshot_pending_ = false;
         }
 
-        if (opt_.no_vsync) { // wait out the frame, then yield up to the deadline
+        { // the frame cap: wait out the frame, then yield up to the deadline
             const auto due = last + std::chrono::duration_cast<Clock::duration>(
                                         std::chrono::duration<double>(1.0 / kMaxFps));
             const double left_ms =
@@ -501,30 +643,36 @@ int App::run() {
                 "render %.2f ms GPU, frame %.1f ms; %s\n",
                 frames, static_cast<long long>(st.steps), sim_->mlups(), sim_->ms_per_step(),
                 sim_->last_batch_steps(), render_gpu_ms_, frame_ms_, st.phase.c_str());
+    const render::VolumeRenderer::PassTimes& pt = renderer_->pass_times();
+    std::printf("render passes, ms: field %.2f, cores %.2f, copies %.2f, shape %.2f, march %.2f, "
+                "splats %.2f; tracers etc. %.2f\n",
+                pt.prepare, pt.q, pt.copies, pt.mesh, pt.march, pt.splats,
+                std::max(0.0f, float(render_gpu_ms_) - pt.total));
     return 0;
 }
 
 void App::update_rake(const TunnelStatus& st) {
-    // The smoke wand tracks the model: upstream of it, centred on its y, z.
-    const float nx = float(ts_.nx), ny = float(ts_.ny), nz = float(ts_.nz);
+    // The smoke wand (and the dye nozzles on it) sits at the inlet, so the
+    // smoke runs the whole tunnel: centred on the model's y, z while it
+    // follows the model, else where the y / z controls (or a click) put it.
+    const float ny = float(ts_.ny), nz = float(ts_.nz);
     float half_y = rake_autofit_ ? st.ext_y_half * 1.1f : rake_h_frac_ * ny;
     float half_z = rake_autofit_ ? st.ext_z_half * 1.1f : rake_w_frac_ * nz;
-    float x, cy, cz;
+    const float x = ts_.rake_x;
+    float cy, cz;
     if (rake_track_) {
-        x = std::max(4.0f, st.placed_centre[0] - 0.18f * nx);
         cy = st.placed_centre[1];
         cz = st.placed_centre[2];
         rake_y_ = cy / ny;
         rake_z_ = cz / nz;
     } else {
-        x = tracers_->rake()[0];
         cy = rake_y_ * ny;
         cz = rake_z_ * nz;
     }
     const std::array<float, 5> r{x, cy, cz, half_y, half_z};
     if (r != last_rake_) {
         tracers_->set_rake(x, cy, cz, half_y, half_z);
-        sim_->post([r](Tunnel& t) { t.set_dye_rake(r[0], r[1], r[2], r[3], r[4]); });
+        sim_->post("rake", [r](Tunnel& t) { t.set_dye_rake(r[0], r[1], r[2], r[3], r[4]); });
         last_rake_ = r;
     }
 }
@@ -572,8 +720,16 @@ void App::record_frame(const Swapchain::Frame& f, const SimWorker::Frame& sf,
         if (lbm)
             tracers_->record(cmd, sf.slot, steps, u_ref, show_smoke_, show_streamlines_);
 
+        if (sf.geometry_version != mesh_seen_) { // the placed triangles (true shape)
+            const SimWorker::PlacedMesh pm = sim_->placed_mesh();
+            if (pm.mesh && pm.version == sf.geometry_version) {
+                renderer_->set_mesh(*pm.mesh);
+                mesh_seen_ = pm.version;
+            }
+        }
         render::Settings s = rs_;
         s.slice_axis = slice_mode_ == 1 ? 2 : slice_mode_ == 2 ? 1 : slice_mode_ == 3 ? 0 : -1;
+        s.lic_phase = animate_textures_ ? lic_phase_ : -1.0f;
         if (lbm) {
             s.u_ref = u_ref;
             s.rho_ref = float(st.rho_ref);
@@ -617,6 +773,15 @@ void App::record_frame(const Swapchain::Frame& f, const SimWorker::Frame& sf,
             splats.push_back({lines_id_, render::Tracers::line_segments(), true, 0.0f, 0.8f});
         renderer_->record(cmd, camera_.view(fov_deg_), s, sf.slot, sf.geometry_version, splats);
         drew_volume = true;
+        if (pick_request_) { // read the depth under the cursor once the frame is done
+            if (!pick_buf_)
+                pick_buf_ = std::make_unique<Buffer>(*ctx_, 16, MemoryUse::Readback);
+            pick_px_ = *pick_request_;
+            pick_view_ = camera_.view(fov_deg_);
+            renderer_->record_pick(cmd, pick_px_[0], pick_px_[1], *pick_buf_);
+            pick_recorded_ = true;
+            pick_request_.reset();
+        }
     }
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries_, 2 * f.slot + 1);
     slot_written_[f.slot] = true;
@@ -686,11 +851,14 @@ void App::record_frame(const Swapchain::Frame& f, const SimWorker::Frame& sf,
 
 // Written once the frame that copied it has completed. `path` empty: a
 // timestamped file under screenshots/ (gitignored).
-void App::write_screenshot(std::string path) {
+// The frame copied for a screenshot, as RGBA (it waits for the frame).
+std::vector<std::uint8_t> App::capture_rgba(std::uint32_t& w, std::uint32_t& h) {
+    w = h = 0;
     if (!shot_buf_)
-        return;
+        return {};
     vkQueueWaitIdle(ctx_->graphics_queue());
-    const std::uint32_t w = shot_extent_.width, h = shot_extent_.height;
+    w = shot_extent_.width;
+    h = shot_extent_.height;
     std::vector<std::uint8_t> rgba(std::size_t(w) * h * 4);
     std::memcpy(rgba.data(), shot_buf_->data(), rgba.size());
     if (colour_format_ == VK_FORMAT_B8G8R8A8_UNORM || colour_format_ == VK_FORMAT_B8G8R8A8_SRGB)
@@ -698,6 +866,14 @@ void App::write_screenshot(std::string path) {
             std::swap(rgba[i], rgba[i + 2]);
     for (std::size_t i = 3; i < rgba.size(); i += 4)
         rgba[i] = 255;
+    return rgba;
+}
+
+void App::write_screenshot(std::string path) {
+    std::uint32_t w = 0, h = 0;
+    const std::vector<std::uint8_t> rgba = capture_rgba(w, h);
+    if (rgba.empty())
+        return;
     if (path.empty()) {
         std::error_code ec;
         std::filesystem::create_directories("screenshots", ec);
@@ -723,8 +899,30 @@ void App::handle_keys(const TunnelStatus& st) {
     const ImGuiIO& io = ImGui::GetIO();
     if (io.WantCaptureKeyboard)
         return;
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
-        PostQuitMessage(0);
+    // Esc closes the help; otherwise it asks once and quits on a second press
+    // within 2 s (one stray key no longer ends a long run).
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        if (show_help_) {
+            show_help_ = false;
+        } else if (Clock::now() - quit_armed_ < std::chrono::seconds(2)) {
+            PostQuitMessage(0);
+        } else {
+            quit_armed_ = Clock::now();
+            toast_ = "press Esc again to quit";
+            toast_t_ = quit_armed_;
+        }
+    }
+    if (io.KeyCtrl) { // the UI scale: Ctrl + = / - / 0, as in a browser
+        if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd))
+            set_ui_scale(ui_scale_ * 1.1f);
+        if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract))
+            set_ui_scale(ui_scale_ / 1.1f);
+        if (ImGui::IsKeyPressed(ImGuiKey_0, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad0, false))
+            set_ui_scale(1.0f);
+        if (!io.WantCaptureMouse && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            request_pick(click_mode_); // click to place
+        return;                        // Ctrl + a key is never one of the plain keys below
+    }
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
         const bool p = !st.paused;
         sim_->post([p](Tunnel& t) { t.set_paused(p); });
@@ -736,7 +934,40 @@ void App::handle_keys(const TunnelStatus& st) {
     if (ImGui::IsKeyPressed(ImGuiKey_P, false))
         screenshot_pending_ = true;
     if (ImGui::IsKeyPressed(ImGuiKey_F, false))
-        camera_.target = st.placed_centre;
+        camera_.fly_to(st.placed_centre, camera_.distance, camera_.azimuth, camera_.elevation);
+    for (int k = 0; k < kLooks; ++k) // 1 - 9: the looks
+        if (ImGui::IsKeyPressed(static_cast<ImGuiKey>(ImGuiKey_1 + k), false))
+            apply_look(k + 1, st);
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false))
+        step_model(-1);
+    if (ImGui::IsKeyPressed(ImGuiKey_RightBracket, false))
+        step_model(+1);
+    if (ImGui::IsKeyPressed(ImGuiKey_O, false))
+        orbit_ = !orbit_;
+    if (!io.WantCaptureMouse && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+        request_pick(0); // a double click focuses the camera there
+    if (ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+        if (recording_)
+            stop_recording();
+        else
+            start_recording("");
+    }
+}
+
+// The render pixel under the cursor, read back after the next frame
+// (resolve_pick); `mode` as click_mode_.
+void App::request_pick(int mode) {
+    if (renderer_->width() == 0)
+        return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float fx = (io.MousePos.x - vp->Pos.x) / std::max(vp->Size.x, 1.0f);
+    const float fy = (io.MousePos.y - vp->Pos.y) / std::max(vp->Size.y, 1.0f);
+    if (fx < 0.0f || fx >= 1.0f || fy < 0.0f || fy >= 1.0f)
+        return;
+    pick_request_ = std::array<std::uint32_t, 2>{std::uint32_t(fx * float(renderer_->width())),
+                                                 std::uint32_t(fy * float(renderer_->height()))};
+    pick_mode_ = mode;
 }
 
 // -- panels ---------------------------------------------------------------------------------
@@ -745,646 +976,54 @@ void App::ui(const TunnelStatus& st) {
     update_title(st);
     if (st.analysis_version != analysis_.version)
         analysis_ = sim_->analysis();
+    // Kept here, not in the View panel, so a look or a key works with the
+    // panels hidden.
+    if (!st.transonic && show_dye_ != st.dye_on) {
+        const bool d = show_dye_;
+        sim_->post("dye", [d](Tunnel& t) { t.set_dye(d); });
+    }
+    if (animate_textures_) // about one ripple every two seconds
+        lic_phase_ = std::fmod(lic_phase_ + 0.5f * ImGui::GetIO().DeltaTime, 1.0f);
+    camera_.orbit_rate = orbit_ ? 0.25f : 0.0f; // a turn in 25 s
+    if (sweep_) {                               // eased to and fro between the two speeds
+        sweep_t_ += ImGui::GetIO().DeltaTime;
+        const float ph =
+            0.5f - 0.5f * std::cos(6.2831853f * sweep_t_ / std::max(sweep_period_, 2.0f));
+        if (st.transonic) {
+            mach_command_ = std::clamp(sweep_lo_mach_ + (sweep_hi_mach_ - sweep_lo_mach_) * ph,
+                                       ts_.mach_min, ts_.mach_max);
+            const float m = mach_command_;
+            sim_->post("mach", [m](Tunnel& t) { t.set_mach(m); });
+        } else {
+            const double v = sweep_lo_mps_ + (sweep_hi_mps_ - sweep_lo_mps_) * ph;
+            u_command_ = std::clamp(float(mps_to_lattice(v)), 0.005f, ts_.u_max);
+            const float u = u_command_;
+            sim_->post("speed", [u](Tunnel& t) { t.set_speed(u); });
+        }
+    }
     if (show_plots_)
         plot_strip(st);
+    quick_bar_height_ = 0.0f;
+    if (show_ui_)
+        quick_bar(st);
     legends(st);
     if (show_help_)
         help_window();
+    toast_overlay();
     if (!show_ui_)
         return;
+    const ImVec2 size = ImGui::GetMainViewport()->WorkSize;
+    relayout_from_ = layout_size_.x > 0.0f && (size.x != layout_size_.x || size.y != layout_size_.y)
+                         ? layout_size_
+                         : ImVec2(0.0f, 0.0f);
     panel_tunnel(st);
     panel_model(st);
     panel_compare(st);
     panel_view(st);
     panel_analysis(st);
+    layout_size_ = size;
     reset_layout_ = want_reset_layout_; // the button, or a layout that does not fit
     want_reset_layout_ = false;
-}
-
-float App::plot_strip_height() const {
-    return show_plots_ ? 0.16f * ImGui::GetMainViewport()->WorkSize.y : 0.0f;
-}
-
-// A panel: its initial layout as fractions of the viewport (ImGui remembers
-// later moves and docking in windoa_imgui.ini). An undocked panel must stay
-// inside the area above the plot strip: one being dragged or resized is held
-// there, and a layout that does not fit (saved on a larger window, or the
-// window shrunk) is put back to the defaults for the current size, since
-// pulling each panel in separately piles them on top of one another. Items
-// leave a fixed label column, so long labels are not clipped.
-bool App::begin_panel(const char* name, float x, float y, float w, float h) {
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const ImGuiCond cond = reset_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
-    ImGui::SetNextWindowPos(
-        {vp->WorkPos.x + x * vp->WorkSize.x, vp->WorkPos.y + y * vp->WorkSize.y}, cond);
-    ImGui::SetNextWindowSize({w * vp->WorkSize.x, h * vp->WorkSize.y}, cond);
-    if (reset_layout_)
-        ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
-    const bool open = ImGui::Begin(name);
-    if (!ImGui::IsWindowDocked()) {
-        const ImVec2 lo = vp->WorkPos;
-        const ImVec2 hi = {vp->WorkPos.x + vp->WorkSize.x,
-                           vp->WorkPos.y + vp->WorkSize.y - plot_strip_height()};
-        const ImVec2 pos = ImGui::GetWindowPos(), size = ImGui::GetWindowSize();
-        const ImVec2 fit = {std::min(size.x, hi.x - lo.x), std::min(size.y, hi.y - lo.y)};
-        const ImVec2 inside = {std::clamp(pos.x, lo.x, hi.x - fit.x),
-                               std::clamp(pos.y, lo.y, hi.y - fit.y)};
-        const bool misfit =
-            fit.x != size.x || fit.y != size.y || inside.x != pos.x || inside.y != pos.y;
-        if (misfit && ImGui::IsAnyMouseDown()) {
-            ImGui::SetWindowSize(fit);
-            ImGui::SetWindowPos(inside);
-        } else if (misfit) {
-            want_reset_layout_ = true;
-        }
-    }
-    ImGui::PushItemWidth(
-        -(ImGui::CalcTextSize("render quality (steps)").x + ImGui::GetStyle().ItemInnerSpacing.x));
-    return open;
-}
-
-void App::end_panel() {
-    ImGui::PopItemWidth();
-    ImGui::End();
-}
-
-void App::panel_tunnel(const TunnelStatus& st) {
-    begin_panel("Tunnel", 0.01f, 0.02f, 0.24f, 0.40f);
-    int regime = st.transonic ? 1 : 0;
-    static const char* kRegime[] = {"subsonic (LBM)", "TRANSONIC (Euler)"};
-    if (ImGui::Combo("regime", &regime, kRegime, 2)) {
-        const bool on = regime == 1;
-        sim_->post([on](Tunnel& t) { t.set_transonic(on); });
-        if (on && rs_.field == render::Field::Speed)
-            rs_.field = render::Field::Mach;
-        if (!on && rs_.field == render::Field::Mach)
-            rs_.field = render::Field::Speed;
-        rs_.haze_floor = -1.0f;
-    }
-    if (st.transonic) {
-        panel_transonic(st);
-        end_panel();
-        return;
-    }
-    const bool settled = st.settled && !st.developing;
-    const ImVec4 phase_col = st.paused       ? ImVec4(1.0f, 0.75f, 0.3f, 1.0f)
-                             : st.developing ? ImVec4(0.55f, 0.8f, 1.0f, 1.0f)
-                             : settled       ? ImVec4(0.45f, 0.95f, 0.55f, 1.0f)
-                                             : ImVec4(1, 1, 1, 1);
-    ImGui::PushStyleColor(ImGuiCol_Text, phase_col);
-    ImGui::TextWrapped("%s", st.phase.c_str());
-    ImGui::PopStyleColor();
-    ImGui::Text("step %lld   %.0f MLUPS (%s)   %d steps/batch", static_cast<long long>(st.steps),
-                sim_->mlups(), ts_.storage_f16 ? "f16" : "f32", sim_->last_batch_steps());
-    if (!st.cache_note.empty())
-        ImGui::TextDisabled("flow cache: %s", st.cache_note.c_str());
-    if (!st.health_note.empty() && (st.paused || st.health_note_age < 15.0))
-        ImGui::TextColored({1.0f, 0.45f, 0.4f, 1.0f}, "%s", st.health_note.c_str());
-    ImGui::Text("ms: sim %.2f/step   render %.2f (GPU)   frame %.1f", sim_->ms_per_step(),
-                render_gpu_ms_, frame_ms_);
-    ImGui::Separator();
-    ImGui::Text("Re_sim %.0f   A_ref %.0f cells^2", st.re_sim, st.a_ref);
-    ImGui::Text("Cd %+.3f  Cl %+.3f  Cs %+.3f%s", st.cd, st.cl, st.cs,
-                st.developing ? "   (settling)" : "");
-    ImGui::Text("Cm_z %+.4f   max|u| %.3f", st.cm, st.max_speed);
-    ImGui::Separator();
-    // The slider reads in lattice units and, beside them, the Mach-matched
-    // speed in sea-level air (airspeed.hpp; ImGui takes the label as a format).
-    char speed_fmt[48];
-    std::snprintf(speed_fmt, sizeof(speed_fmt), "%%.3f  = %.0f mph",
-                  airspeed::mph(airspeed::metres_per_second(
-                      airspeed::mach_from_lattice(double(u_command_)))));
-    if (ImGui::SliderFloat("flow speed", &u_command_, 0.005f, ts_.u_max, speed_fmt)) {
-        const float u = u_command_;
-        sim_->post([u](Tunnel& t) { t.set_speed(u); });
-    }
-    ImGui::SetItemTooltip(
-        "Freestream speed in lattice units (Mach = u sqrt 3, kept under ~0.19).\n"
-        "mph and m/s are the speed in sea-level air at that Mach number; the\n"
-        "Reynolds number stays near 10^3 whatever the speed (see Re_sim).\n"
-        "Slew-limited so the lattice never shocks; a change over 10 %% re-develops.");
-    ImGui::Text("  u %.3f -> %.3f   Ma %.3f", st.u_applied, st.u_command, st.airspeed_mach);
-    if (ImGui::SliderFloat("inlet turbulence %", &turb_pct_, 0.0f, 2.0f, "%.1f")) {
-        const float t = turb_pct_;
-        sim_->post([t](Tunnel& tn) { tn.set_turbulence(t); });
-    }
-    ImGui::SetItemTooltip(
-        "Real-tunnel freestream turbulence: a divergence-free gust field\n"
-        "carried in through the inlet (0 = clean; real tunnels about 0.1 - 2 %%).");
-    if (ImGui::SliderFloat("sim rate cap", &sim_rate_cap_, 0.0f, 5000.0f,
-                           sim_rate_cap_ <= 0.0f ? "flat out" : "%.0f steps/s"))
-        sim_->set_max_steps_per_second(sim_rate_cap_);
-    ImGui::SetItemTooltip("The solver runs flat out on its own GPU queue; cap it to watch the\n"
-                          "flow evolve slowly. The window stays smooth either way.");
-    if (st.developing && ImGui::Button("skip developing"))
-        sim_->post([](Tunnel& t) { t.skip_develop(); });
-    if (st.developing)
-        ImGui::SameLine();
-    if (ImGui::Button(st.paused ? "resume (Space)" : "pause (Space)")) {
-        const bool p = !st.paused;
-        sim_->post([p](Tunnel& t) { t.set_paused(p); });
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("reset flow"))
-        sim_->post([](Tunnel& t) { t.reset_flow("flow reset"); });
-    ImGui::SetItemTooltip("Restart from rest with the inlet ramp (never from the flow cache).");
-    ImGui::TextDisabled("keys: F1 help, H hide panels, P screenshot, F focus");
-    if (!toast_.empty() && std::chrono::duration<float>(Clock::now() - toast_t_).count() < 6.0f)
-        ImGui::TextColored({1.0f, 0.8f, 0.4f, 1.0f}, "%s", toast_.c_str());
-    end_panel();
-}
-
-void App::panel_transonic(const TunnelStatus& st) {
-    ImGui::PushStyleColor(ImGuiCol_Text, st.developing ? ImVec4(0.55f, 0.8f, 1.0f, 1.0f)
-                                                       : ImVec4(0.45f, 0.95f, 0.55f, 1.0f));
-    ImGui::TextWrapped("%s", st.phase.c_str());
-    ImGui::PopStyleColor();
-    ImGui::Text("peak local Mach %.2f   %d steps/batch   %.2f ms/step", st.peak_mach,
-                sim_->last_batch_steps(), sim_->ms_per_step());
-    ImGui::Text("Cd %+.3f  Cl %+.3f  Cs %+.3f", st.cd, st.cl, st.cs);
-    ImGui::Text("Cm_z %+.4f", st.cm);
-    ImGui::TextDisabled("  inviscid: pressure + wave drag only");
-    if (!st.health_note.empty() && st.health_note_age < 15.0)
-        ImGui::TextColored({1.0f, 0.45f, 0.4f, 1.0f}, "%s", st.health_note.c_str());
-    char mach_fmt[48];
-    std::snprintf(mach_fmt, sizeof(mach_fmt), "%%.3f  = %.0f mph",
-                  airspeed::mph(airspeed::metres_per_second(double(mach_command_))));
-    if (ImGui::SliderFloat("Mach", &mach_command_, ts_.mach_min, ts_.mach_max, mach_fmt)) {
-        const float m = mach_command_;
-        sim_->post([m](Tunnel& t) { t.set_mach(m); });
-    }
-    if (ImGui::Button(st.paused ? "resume (Space)" : "pause (Space)")) {
-        const bool p = !st.paused;
-        sim_->post([p](Tunnel& t) { t.set_paused(p); });
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("restart flow"))
-        sim_->post([](Tunnel& t) { t.restart_flow(); });
-    ImGui::TextDisabled("LBM paused (kept for switching back). Smoke, dye,");
-    ImGui::TextDisabled("vortex cores, spin and rotors are subsonic-only.");
-    ImGui::TextDisabled("Try field: schlieren for the shocks.");
-}
-
-void App::panel_model(const TunnelStatus& st) {
-    begin_panel("Model", 0.01f, 0.43f, 0.24f, 0.38f);
-    const MenuItem& cur = menu_[model_index_];
-    if (ImGui::BeginCombo("model", cur.label.c_str(), ImGuiComboFlags_HeightLarge)) {
-        std::string group;
-        for (std::size_t i = 0; i < menu_.size(); ++i) {
-            if (menu_[i].group != group) {
-                group = menu_[i].group;
-                ImGui::SeparatorText(group.c_str());
-            }
-            if (ImGui::Selectable(menu_[i].label.c_str(), i == model_index_) && i != model_index_)
-                choose_model(i);
-        }
-        ImGui::EndCombo();
-    }
-    if (placement_dirty_)
-        ImGui::TextDisabled("  [voxelising when you stop adjusting...]");
-    else if (st.out_of_bounds)
-        ImGui::TextColored({1.0f, 0.6f, 0.3f, 1.0f},
-                           "  ! extends outside the tunnel: reduce size / turn");
-    ImGui::TextDisabled("%zu tris -> %zu voxels (%.0f ms)", st.n_tris, st.n_solid, st.vox_ms);
-
-    bool changed = false;
-    static const char* kGround[] = {"aviation (free air)", "rolling road", "fixed ground"};
-    int g = static_cast<int>(placement_.ground);
-    if (ImGui::Combo("placement", &g, kGround, 3)) {
-        placement_.ground = static_cast<catalogue::Ground>(g);
-        if (placement_.ground == catalogue::Ground::Fixed)
-            placement_.ride_height = 0.0f;
-        else if (placement_.ground == catalogue::Ground::Road)
-            placement_.ride_height = std::max(4.0f, 0.06f * placement_.length_cells);
-        else
-            placement_.pos_frac[1] = 0.5f;
-        changed = true;
-    }
-    changed |=
-        ImGui::SliderFloat("size [cells]", &placement_.length_cells, 12.0f, 0.8f * ts_.nx, "%.0f");
-    changed |= ImGui::SliderFloat("pitch / AoA", &placement_.aoa_deg, -180.0f, 180.0f, "%.1f deg");
-    changed |= ImGui::SliderFloat("yaw", &placement_.yaw_deg, -180.0f, 180.0f, "%.1f deg");
-    changed |= ImGui::SliderFloat("roll", &placement_.roll_deg, -180.0f, 180.0f, "%.1f deg");
-    if (ImGui::Button("reset attitude")) {
-        placement_.aoa_deg = placement_.yaw_deg = placement_.roll_deg = 0.0f;
-        changed = true;
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(Ctrl+click a slider to type)");
-    changed |= ImGui::SliderFloat("pos x", &placement_.pos_frac[0], 0.1f, 0.8f, "%.3f");
-    if (placement_.ground != catalogue::Ground::Air) {
-        changed |= ImGui::SliderFloat("ride height", &placement_.ride_height, 0.0f, 0.25f * ts_.ny,
-                                      "%.1f");
-        if (placement_.ride_height < 3.5f && placement_.ground == catalogue::Ground::Road)
-            ImGui::TextColored({1.0f, 0.7f, 0.3f, 1.0f},
-                               "  low: a thin under-body gap may destabilise");
-    } else {
-        changed |= ImGui::SliderFloat("pos y", &placement_.pos_frac[1], 0.15f, 0.85f, "%.3f");
-    }
-    if (changed) {
-        placement_dirty_ = true;
-        placement_edit_ = Clock::now();
-    }
-
-    static const char* kArea[] = {"frontal", "planform", "manual"};
-    if (ImGui::Combo("ref area", &area_mode_, kArea, 3) ||
-        (area_mode_ == 2 &&
-         ImGui::SliderFloat("manual area", &a_manual_, 10.0f, 5000.0f, "%.0f"))) {
-        const int m = area_mode_;
-        const double a = a_manual_;
-        sim_->post([m, a](Tunnel& t) { t.set_area_mode(static_cast<AreaMode>(m), a); });
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("%.0f", st.a_ref);
-    if (st.has_spinners) {
-        bool post = ImGui::Checkbox("spinning parts", &spin_on_);
-        if (spin_on_)
-            post |= ImGui::SliderFloat("spin ratio (rim/U)", &spin_ratio_, 0.0f, 3.0f, "%.2f");
-        if (post) {
-            const bool on = spin_on_;
-            const float r = spin_ratio_;
-            sim_->post([on, r](Tunnel& t) { t.set_spin(on, r); });
-        }
-        if (spin_on_ && st.spin_scale < 0.999f)
-            ImGui::TextColored({1.0f, 0.8f, 0.4f, 1.0f}, "  limited to %.2f (wall speed cap)",
-                               spin_ratio_ * st.spin_scale);
-    }
-    if (st.has_rotors) {
-        bool post = ImGui::Checkbox("rotors turning", &rotors_on_);
-        ImGui::SetItemTooltip(
-            "The blades are actuator lines: lines of lift and drag forces from the local flow\n"
-            "(blade-element theory), drawn turning, not solid. Parked, they still take the\n"
-            "wind. The tip-speed ratio is tip speed over the wind speed (a turbine runs ~7).");
-        if (rotors_on_)
-            post |= ImGui::SliderFloat("tip-speed ratio", &rotor_tsr_, 0.0f, 12.0f, "%.1f");
-        if (post) {
-            const bool on = rotors_on_;
-            const float t = rotor_tsr_;
-            sim_->post([on, t](Tunnel& tn) { tn.set_rotors(on, t); });
-        }
-        if (st.rotor_coeffs_ready)
-            ImGui::TextDisabled("  rotor C_T %+.3f  C_P %+.3f%s", st.rotor_ct, st.rotor_cp,
-                                st.rotor_cp > 0.0 ? " (driven)" : "");
-        else
-            ImGui::TextDisabled("  rotor C_T, C_P: once the wind is at speed");
-        if (st.rotor_blockage > 0.05)
-            ImGui::TextColored({1.0f, 0.75f, 0.35f, 1.0f},
-                               "  swept area %.0f %% of the section: blocked, not free air",
-                               100.0 * st.rotor_blockage);
-        ImGui::SetItemTooltip("In a closed tunnel the walls hold the flow round a large rotor;\n"
-                              "past ~5 %% of the section its coefficients depart from free-air\n"
-                              "values (a turbine's C_P can pass even the Betz limit).\n"
-                              "Reduce the size for free-air numbers.");
-    }
-    if (st.has_ports) {
-        bool post = ImGui::Checkbox("engines (jets / intakes)", &power_on_);
-        ImGui::SetItemTooltip(
-            "Exhausts blow and intakes draw. Subsonic: each face moves at its speed ratio x\n"
-            "throttle x U. Transonic: exhausts emit their exit state (a hot, under-expanded\n"
-            "plume: shock diamonds). The balance then reads the net force, thrust included.");
-        if (power_on_)
-            post |= ImGui::SliderFloat("throttle", &throttle_, 0.0f, 3.0f, "%.2f");
-        if (post) {
-            const bool on = power_on_;
-            const float t = throttle_;
-            sim_->post([on, t](Tunnel& tn) { tn.set_power(on, t); });
-        }
-        if (power_on_ && st.jet_scale < 0.999f)
-            ImGui::TextColored({1.0f, 0.8f, 0.4f, 1.0f}, "  limited to %.2f (jet speed cap)",
-                               throttle_ * st.jet_scale);
-    }
-    end_panel();
-}
-
-void App::panel_compare(const TunnelStatus& st) {
-    begin_panel("Compare", 0.75f, 0.02f, 0.24f, 0.20f);
-    const Snap now{menu_[model_index_].label,
-                   placement_.aoa_deg,
-                   placement_.length_cells,
-                   st.cd,
-                   st.cl,
-                   st.cm};
-    if (ImGui::Button("save as A"))
-        ab_[0] = now;
-    ImGui::SameLine();
-    if (ImGui::Button("save as B"))
-        ab_[1] = now;
-    for (int k = 0; k < 2; ++k) {
-        if (!ab_[k])
-            continue;
-        const Snap& r = *ab_[k];
-        ImGui::Text("%c: %.24s  AoA %+.0f  size %.0f", 'A' + k, r.model.c_str(), r.aoa, r.size);
-        ImGui::Text("   Cd %+.3f  Cl %+.3f  Cm %+.4f", r.cd, r.cl, r.cm);
-    }
-    if (ab_[0] && ab_[1])
-        ImGui::TextColored({0.6f, 0.9f, 1.0f, 1.0f}, "B-A: dCd %+.3f  dCl %+.3f",
-                           ab_[1]->cd - ab_[0]->cd, ab_[1]->cl - ab_[0]->cl);
-    end_panel();
-}
-
-void App::panel_view(const TunnelStatus& st) {
-    begin_panel("View", 0.75f, 0.23f, 0.24f, 0.58f);
-    static const char* kSurface[] = {"hidden", "voxel", "smooth"};
-    int surf = static_cast<int>(rs_.surface);
-    if (ImGui::Combo("surface", &surf, kSurface, 3))
-        rs_.surface = static_cast<render::Surface>(surf);
-    static const char* kPaint[] = {"none", "pressure (Cp)", "near-wall speed", "reversed flow",
-                                   "oil flow"};
-    ImGui::Combo("surface paint", &paint_mode_, kPaint, 5);
-    ImGui::SetItemTooltip(
-        "Cp: pressure of the air touching the model (red compression, blue suction).\n"
-        "Near-wall speed: the flow one cell off the surface, which scales with the skin\n"
-        "friction. Reversed flow: blue where the near-wall flow runs upstream (separated).\n"
-        "Oil flow: streaks along the near-wall flow, as in a tunnel oil-film test.");
-    int field = static_cast<int>(rs_.field);
-    if (ImGui::Combo("field", &field, kFieldNames, IM_ARRAYSIZE(kFieldNames))) {
-        rs_.field = static_cast<render::Field>(field);
-        rs_.haze_floor = -1.0f;
-    }
-    if (field >= 6 && st.avg_samples == 0)
-        ImGui::TextColored({1.0f, 0.75f, 0.35f, 1.0f}, "  needs time averaging (Analysis panel)");
-    ImGui::Checkbox("flow haze (3D, translucent)", &rs_.haze);
-    ImGui::SetItemTooltip("The field through the whole tunnel; undisturbed flow is transparent,\n"
-                          "so only what the model changes shows. 'haze floor' sets the cut.");
-    if (rs_.haze) {
-        ImGui::SliderFloat("  haze strength", &rs_.haze_gain, 0.2f, 4.0f, "%.2f");
-        float floor_v = rs_.haze_floor >= 0.0f ? rs_.haze_floor : render::default_floor(rs_.field);
-        if (ImGui::SliderFloat("  haze floor", &floor_v, 0.0f, 0.5f, "%.3f"))
-            rs_.haze_floor = floor_v;
-    }
-    static const char* kSlice[] = {"off", "vertical (x-y)", "horizontal (x-z)", "cross (y-z)"};
-    ImGui::Combo("field slice", &slice_mode_, kSlice, 4);
-    if (slice_mode_) {
-        ImGui::SliderFloat("  slice pos", &rs_.slice_pos, 0.02f, 0.98f, "%.2f");
-        ImGui::Checkbox("  flow texture (LIC)", &rs_.slice_lic);
-        ImGui::SetItemTooltip("Line-integral convolution: noise smeared along the in-plane flow,\n"
-                              "so the slice shows every streamline at once.");
-        ImGui::Checkbox("  velocity arrows", &slice_arrows_);
-        if (slice_arrows_)
-            ImGui::SliderFloat("  arrow spacing", &arrow_spacing_, 2.0f, 12.0f, "%.0f cells");
-    }
-    ImGui::Separator();
-    if (st.transonic) {
-        ImGui::TextDisabled("(smoke, dye, streamlines, vortex cores: subsonic only)");
-    } else {
-        ImGui::Checkbox("smoke", &show_smoke_);
-        if (show_smoke_) {
-            static const char* kSmoke[] = {"streaklines (wand)", "timelines (pulsed wire)"};
-            ImGui::Combo("  smoke as", &smoke_mode_, kSmoke, 2);
-            ImGui::SetItemTooltip(
-                "Streaklines: continuous smoke from the wand. Timelines: a line of\n"
-                "particles released across the wand every few steps, as from a pulsed\n"
-                "hydrogen-bubble wire; their deformation shows the velocity profile.");
-            if (smoke_mode_ == 1)
-                ImGui::SliderInt("  pulse every", &pulse_steps_, 20, 300, "%d steps");
-        }
-        ImGui::Checkbox("dye smoke (volumetric)", &show_dye_);
-        ImGui::SetItemTooltip(
-            "A transported concentration from nozzles on the smoke wand: fills and\n"
-            "marks the wake like theatrical smoke (never leaks into the model).");
-    }
-    if (!st.transonic && show_dye_ != st.dye_on) {
-        const bool d = show_dye_;
-        sim_->post([d](Tunnel& t) { t.set_dye(d); });
-    }
-    if (!st.transonic && show_dye_) {
-        ImGui::SliderFloat("  dye density", &rs_.dye_gain, 0.2f, 10.0f, "%.1f");
-        ImGui::Checkbox("  colour by speed", &rs_.dye_by_speed);
-    }
-    if (!st.transonic) {
-        ImGui::Checkbox("streamlines", &show_streamlines_);
-        ImGui::Checkbox("vortex cores (Q)", &rs_.vortex_cores);
-        ImGui::SetItemTooltip(
-            "Where rotation beats strain (Q criterion on a smoothed velocity),\n"
-            "thresholded at a multiple of the flow's own RMS: the dominant cores.");
-        if (rs_.vortex_cores)
-            ImGui::SliderFloat("  Q threshold", &rs_.q_sense, 0.1f, 10.0f, "%.2f");
-        ImGui::Checkbox("mean reversed flow", &rs_.recirculation);
-        ImGui::SetItemTooltip("Translucent shells where the time-averaged streamwise flow runs\n"
-                              "backwards: the mean recirculation bubbles. Needs time averaging.");
-        if (rs_.recirculation && st.avg_samples == 0)
-            ImGui::TextColored({1.0f, 0.75f, 0.35f, 1.0f},
-                               "  needs time averaging (Analysis panel)");
-    }
-    if (!st.transonic && (show_smoke_ || show_dye_)) {
-        ImGui::Checkbox("smoke tracks model", &rake_track_);
-        ImGui::Checkbox("fit smoke to model", &rake_autofit_);
-        if (!rake_autofit_) {
-            ImGui::SliderFloat("smoke height", &rake_h_frac_, 0.03f, 0.50f, "%.2f");
-            ImGui::SliderFloat("smoke width", &rake_w_frac_, 0.03f, 0.50f, "%.2f");
-        }
-        if (!rake_track_) {
-            ImGui::SliderFloat("smoke y", &rake_y_, 0.1f, 0.9f, "%.2f");
-            ImGui::SliderFloat("smoke z", &rake_z_, 0.1f, 0.9f, "%.2f");
-        }
-        ImGui::SliderFloat("smoke detail", &smoke_radius_, 0.06f, 0.35f, "%.2f");
-    }
-    ImGui::Separator();
-    ImGui::Checkbox("time plots", &show_plots_);
-    if (show_plots_) {
-        ImGui::SameLine();
-        if (ImGui::Button("refit plots")) {
-            cd_.refit_recent(0.5);
-            cl_.refit_recent(0.5);
-            cm_.refit_recent(0.5);
-        }
-    }
-    ImGui::Checkbox("tunnel box", &rs_.box);
-    ImGui::SameLine();
-    if (ImGui::Button("reset layout"))
-        want_reset_layout_ = true;
-    ImGui::SetItemTooltip("Put every panel back where it starts (undocked, Analysis folded).");
-    ImGui::SliderInt("render quality (steps)", &rs_.steps, 32, 256);
-    ImGui::SliderFloat("render scale", &render_scale_, 0.25f, 1.0f, "%.2f");
-    ImGui::SliderFloat("field of view", &fov_deg_, 20.0f, 90.0f, "%.0f deg");
-    ImGui::TextDisabled("RMB orbit, MMB pan, wheel zoom, WASD/QE, F focus");
-    end_panel();
-}
-
-void App::post_probes() {
-    const std::vector<std::array<float, 3>> p(probe_pos_.begin(), probe_pos_.begin() + n_probes_);
-    sim_->post([p](Tunnel& t) { t.set_probes(p); });
-}
-
-// Time averaging, the wake survey, probes and spectra (THEORY 12).
-void App::panel_analysis(const TunnelStatus& st) {
-    ImGui::SetNextWindowCollapsed(!analysis_open_,
-                                  reset_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
-    if (!begin_panel("Analysis", 0.505f, 0.46f, 0.24f, 0.35f)) {
-        end_panel();
-        return;
-    }
-    const TunnelAnalysis& a = analysis_;
-    const ImVec4 warn{1.0f, 0.75f, 0.35f, 1.0f};
-    const float plot_h = 110.0f * ImGui::GetStyle().FontScaleDpi;
-    auto plot_area = [&](float h) {
-        const ImVec2 p0 = ImGui::GetCursorScreenPos();
-        const float w = ImGui::GetContentRegionAvail().x;
-        ImGui::Dummy({w, h});
-        return std::pair<ImVec2, ImVec2>{p0, {p0.x + w, p0.y + h}};
-    };
-
-    ImGui::SeparatorText("time averaging");
-    if (st.transonic)
-        ImGui::TextDisabled("(subsonic only)");
-    if (ImGui::Checkbox("average the flow", &averaging_)) {
-        const bool on = averaging_;
-        sim_->post([on](Tunnel& t) { t.set_averaging(on); });
-    }
-    ImGui::SetItemTooltip(
-        "Accumulate the mean and the variance of every cell while the flow is\n"
-        "developed; a new operating point restarts the window. Feeds the mean-speed\n"
-        "and turbulence fields, the reversed-flow shells and the wake survey.");
-    if (averaging_) {
-        ImGui::SameLine();
-        if (ImGui::Button("restart"))
-            sim_->post([](Tunnel& t) { t.restart_averaging(); });
-        if (st.averaging_active)
-            ImGui::Text("%d samples over %.2f flow-throughs", st.avg_samples, st.avg_flow_throughs);
-        else
-            ImGui::TextDisabled("waiting for the flow to settle");
-    }
-
-    ImGui::SeparatorText("wake survey");
-    if (!averaging_) {
-        ImGui::TextDisabled("needs time averaging");
-    } else if (!a.wake_valid) {
-        ImGui::TextDisabled("collecting the mean flow...");
-    } else {
-        ImGui::Text("momentum balance   Cd %.4f", a.cd_wake);
-        ImGui::Text("force balance      Cd %.4f   (%+.2f %%)", a.cd_balance,
-                    (a.cd_wake / std::max(std::abs(a.cd_balance), 1e-12) - 1.0) * 100.0);
-        ImGui::SetItemTooltip(
-            "Two measurements of one drag: the fall in the mean flow's momentum flux\n"
-            "between the upstream plane and the survey plane, and the force on the\n"
-            "model averaged over the same window (THEORY 12.2).");
-        ImGui::TextDisabled("planes x = %d and %d;  mass flux change %.1e", a.x_upstream,
-                            a.x_survey, a.mass_imbalance);
-        if (a.includes_floor)
-            ImGui::TextColored(warn, "ground mode: the floor's shear is inside the volume");
-        std::vector<double> y(a.profile_y.begin(), a.profile_y.end()),
-            uy(a.profile_uy.begin(), a.profile_uy.end()), z(a.profile_z.begin(), a.profile_z.end()),
-            uz(a.profile_uz.begin(), a.profile_uz.end());
-        const auto [p0, p1] = plot_area(plot_h);
-        plot_xy(ImGui::GetWindowDrawList(), p0, p1,
-                {{&y, &uy, IM_COL32(255, 140, 50, 255)}, {&z, &uz, IM_COL32(80, 180, 255, 255)}},
-                "cells", "mean u_x / U: across y, z");
-    }
-    ImGui::Checkbox("show planes", &show_planes_);
-    ImGui::SameLine();
-    if (ImGui::Checkbox("auto plane", &wake_auto_)) {
-        const int x = wake_auto_ ? -1 : (a.x_survey > 0 ? a.x_survey : ts_.nx / 2);
-        wake_x_ = x < 0 ? wake_x_ : x;
-        sim_->post([x](Tunnel& t) { t.set_wake_plane(x); });
-    }
-    if (!wake_auto_ && ImGui::SliderInt("survey plane x", &wake_x_, 1, ts_.nx - 2)) {
-        const int x = wake_x_;
-        sim_->post([x](Tunnel& t) { t.set_wake_plane(x); });
-    }
-
-    ImGui::SeparatorText("probes and spectra");
-    int n = n_probes_;
-    if (ImGui::SliderInt("probes", &n, 0, kMaxProbes)) {
-        // new probes start in the wake: centreline, shear layer, further
-        // downstream, and upstream as a freestream reference
-        const float L = placement_.length_cells;
-        const auto c = st.placed_centre;
-        const std::array<std::array<float, 3>, kMaxProbes> defaults = {
-            {{c[0] + 0.8f * L, c[1], c[2]},
-             {c[0] + 0.8f * L, c[1] + st.ext_y_half, c[2]},
-             {c[0] + 1.4f * L, c[1], c[2]},
-             {std::max(4.0f, c[0] - 0.6f * L), c[1], c[2]}}};
-        for (int i = n_probes_; i < n; ++i) {
-            probe_pos_[i] = defaults[i];
-            probe_pos_[i][0] = std::min(probe_pos_[i][0], float(ts_.nx - ts_.outlet_sponge - 2));
-        }
-        n_probes_ = n;
-        spec_source_ = std::min(spec_source_, n_probes_);
-        post_probes();
-    }
-    for (int i = 0; i < n_probes_; ++i) {
-        ImGui::PushID(i);
-        const auto& pc = render::Tracers::kProbeColours[i];
-        ImGui::ColorButton("##c", {pc[0], pc[1], pc[2], 1.0f}, ImGuiColorEditFlags_NoTooltip,
-                           {ImGui::GetFrameHeight(), ImGui::GetFrameHeight()});
-        ImGui::SameLine();
-        if (ImGui::DragFloat3("x y z", probe_pos_[i].data(), 0.25f, 0.0f, float(ts_.nx - 1),
-                              "%.1f")) {
-            probe_pos_[i][1] = std::clamp(probe_pos_[i][1], 0.0f, float(ts_.ny - 1));
-            probe_pos_[i][2] = std::clamp(probe_pos_[i][2], 0.0f, float(ts_.nz - 1));
-            post_probes();
-        }
-        ImGui::PopID();
-    }
-    std::vector<std::string> names{"lift (Cl)"};
-    for (int i = 0; i < n_probes_; ++i)
-        names.push_back("probe " + std::to_string(i + 1));
-    std::vector<const char*> cnames;
-    for (const auto& s : names)
-        cnames.push_back(s.c_str());
-    ImGui::Combo("signal", &spec_source_, cnames.data(), int(cnames.size()));
-    if (spec_source_ > 0) {
-        static const char* kComp[] = {"u_x", "u_y", "u_z", "rho (pressure)"};
-        ImGui::Combo("component", &spec_comp_, kComp, 4);
-    }
-    const bool probe = spec_source_ > 0 && spec_source_ <= a.n_probes;
-    const Spectrum& sp = probe ? a.probe_spec[spec_source_ - 1][spec_comp_] : a.lift;
-    if (sp.freq.empty()) {
-        ImGui::TextDisabled(st.developing ? "waiting for the flow to settle"
-                                          : "collecting the developed signal...");
-    } else {
-        const double st_scale = a.l_ref / std::max(a.u_ref, 1e-9); // St per (cycles / step)
-        const double st_peak = sp.peak_freq * st_scale;
-        const double st_ac = a.f_acoustic * st_scale; // the first acoustic mode, as St
-        if (!probe && a.st_shedding > 0.0)
-            ImGui::Text("shedding St %.3f   (period %.0f steps)", a.st_shedding,
-                        st_scale / a.st_shedding);
-        if (sp.peak_amp > 0.0) {
-            const double mode = st_peak / std::max(st_ac, 1e-12);
-            const bool acoustic = std::abs(mode - std::round(mode)) < 0.05 && mode > 0.8;
-            ImGui::Text("strongest peak St %.3f   (period %.0f steps)%s", st_peak,
-                        1.0 / sp.peak_freq, acoustic ? "  = acoustic mode" : "");
-        } else {
-            ImGui::TextDisabled("no peak: the signal is steady");
-        }
-        ImGui::SetItemTooltip(
-            "St = f h / U with h = %.0f cells, the body's height across the flow.\n"
-            "Window: %.0f steps of the developed flow. Dashed lines: the tunnel's\n"
-            "transverse acoustic modes (sound between the side walls, St %.2f apart).",
-            a.l_ref, a.window_steps, st_ac);
-        std::vector<double> stx, amp;
-        for (std::size_t k = 1; k < sp.freq.size(); ++k) {
-            const double s = sp.freq[k] * st_scale;
-            if (s > std::max(2.0, 3.0 * st_peak))
-                break;
-            stx.push_back(s);
-            amp.push_back(sp.amp[k]);
-        }
-        const auto [p0, p1] = plot_area(plot_h);
-        std::vector<double> modes;
-        for (int m = 1; m <= 8; ++m)
-            modes.push_back(m * st_ac);
-        plot_xy(ImGui::GetWindowDrawList(), p0, p1, {{&stx, &amp, IM_COL32(255, 220, 120, 255)}},
-                "St", "amplitude spectrum", true,
-                !probe && a.st_shedding > 0.0 ? a.st_shedding : st_peak, modes);
-    }
-    // the signal's recent history
-    std::vector<double> ht = a.hist_t, hv;
-    if (probe)
-        hv.assign(a.hist_probe[spec_source_ - 1][spec_comp_].begin(),
-                  a.hist_probe[spec_source_ - 1][spec_comp_].end());
-    else
-        hv = a.hist_cl;
-    if (!ht.empty()) {
-        const ImU32 col = probe ? ImGui::ColorConvertFloat4ToU32(
-                                      {render::Tracers::kProbeColours[spec_source_ - 1][0],
-                                       render::Tracers::kProbeColours[spec_source_ - 1][1],
-                                       render::Tracers::kProbeColours[spec_source_ - 1][2], 1.0f})
-                                : IM_COL32(69, 171, 255, 255);
-        const auto [p0, p1] = plot_area(0.8f * plot_h);
-        plot_xy(ImGui::GetWindowDrawList(), p0, p1, {{&ht, &hv, col}}, "step", "history");
-    }
-    end_panel();
 }
 
 // The window title names the model and the regime (and the phase), so a
@@ -1401,150 +1040,112 @@ void App::update_title(const TunnelStatus& st) {
     SetWindowTextW(window_->hwnd(), w.c_str());
 }
 
-void App::help_window() {
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(
-        {vp->WorkPos.x + 0.5f * vp->WorkSize.x, vp->WorkPos.y + 0.5f * vp->WorkSize.y},
-        ImGuiCond_Appearing, {0.5f, 0.5f});
-    ImGui::Begin("Help (F1)", &show_help_,
-                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking);
-    ImGui::SeparatorText("Camera");
-    ImGui::BulletText("Right drag: orbit.  Middle drag: pan.  Wheel or Q / E: zoom.");
-    ImGui::BulletText("W A S D: pan the focus point.  F: focus on the model.");
-    ImGui::SeparatorText("Run");
-    ImGui::BulletText("Space: pause / resume.  H: hide the panels.  P: screenshot.  Esc: quit.");
-    ImGui::BulletText("Ctrl + click a slider to type an exact value.");
-    ImGui::BulletText("Panels move, fold and dock; View > reset layout puts them back.");
-    ImGui::SeparatorText("Reading it");
-    ImGui::BulletText("DEVELOPING: the wake is still forming -- wait for SETTLED before");
-    ImGui::Text("    reading the numbers (2 - 4.5 flow-throughs: physics, not slowness).");
-    ImGui::BulletText("Re_sim ~10^3, not a real car's ~10^6: trust comparisons (Compare");
-    ImGui::Text("    panel) and flow topology; treat absolute Cd as qualitative.");
-    ImGui::BulletText("Speed haze shows DEVIATION from the freestream: blue slower, red faster.");
-    ImGui::BulletText("Transonic: inviscid Euler, Mach 0.3-1.6 -- try the schlieren field.");
-    ImGui::SeparatorText("Measuring it");
-    ImGui::BulletText("Analysis panel: average the flow once SETTLED, then the mean-speed and");
-    ImGui::Text("    turbulence fields, the reversed-flow shells and the wake survey work.");
-    ImGui::BulletText("Probes record the flow at points; the spectrum gives the shedding");
-    ImGui::Text("    frequency as a Strouhal number (St = f h / U).");
-    ImGui::BulletText("Surface paint: Cp, near-wall speed, reversed flow or oil-flow streaks.");
-    ImGui::SeparatorText("More");
-    ImGui::TextDisabled("docs/GUIDE.md (operating it), docs/MODEL.md (how it works),");
-    ImGui::TextDisabled("docs/REFERENCE.md (every control and default)");
-    ImGui::End();
+void App::step_model(int delta) {
+    const int n = int(menu_.size());
+    if (n == 0)
+        return;
+    choose_model(std::size_t((int(model_index_) + delta % n + n) % n));
 }
 
-// Colour legends, top centre: one per colour-coded layer that is on.
-void App::legends(const TunnelStatus& st) {
-    struct Entry {
-        const std::vector<Stop>* stops;
-        const char* title;
-        const char* ends;
-    };
-    std::vector<Entry> list;
-    const bool field_shown = rs_.haze || slice_mode_ != 0;
-    const int f = static_cast<int>(rs_.field);
-    if (field_shown) {
-        static const char* titles[] = {"speed vs freestream",   "Cp colour scale",
-                                       "|vorticity| / U",       "streamwise vorticity",
-                                       "local Mach number",     "schlieren  |grad rho|",
-                                       "mean speed (averaged)", "turbulence intensity"};
-        static const char* ends[] = {"blue slower .. red faster",
-                                     "blue suction .. red stagnation",
-                                     "white weak .. red strong",
-                                     "blue / orange = opposite spin",
-                                     "blue subsonic, white M = 1, red super",
-                                     "bright = shocks and expansions",
-                                     "blue slower .. red faster (mean)",
-                                     "0 .. 20 %% of U (rms of the fluctuations)"};
-        const std::vector<Stop>* s = f == 3   ? &kVort
-                                     : f == 5 ? &kGrey
-                                     : f == 7 ? &kDye
-                                              : &kCoolwarm;
-        list.push_back({s, titles[f], ends[f]});
-    }
-    const bool surface_shown = rs_.surface != render::Surface::Hidden;
-    if (surface_shown && paint_mode_ == 1 && !(field_shown && f == 1))
-        list.push_back({&kCoolwarm, "surface Cp", "blue suction .. red stagnation"});
-    else if (surface_shown && paint_mode_ == 2)
-        list.push_back({&kDye, "surface: near-wall speed", "still .. 1.2 U (skin friction)"});
-    else if (surface_shown && paint_mode_ == 3)
-        list.push_back({&kCoolwarm, "surface: near-wall flow", "blue reversed .. red forward"});
-    if (!st.transonic && rs_.recirculation && st.avg_samples > 0)
-        list.push_back({&kRecirc, "mean reversed flow", "time-averaged u_x < 0"});
-    if (!st.transonic && show_dye_ && st.dye_on && rs_.dye_by_speed)
-        list.push_back({&kDye, "dye smoke: local speed", "violet still .. yellow 1.5 U"});
-    if (!st.transonic && rs_.vortex_cores)
-        list.push_back({&kQcore, "vortex cores (Q criterion)", "green at threshold .. amber 4x"});
+// -- recording (F8) ------------------------------------------------------------------
 
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float w = 270.0f * ImGui::GetStyle().FontScaleDpi;
-    float y = vp->WorkPos.y + 6.0f;
-    for (std::size_t k = 0; k < list.size() && k < 4; ++k) {
-        ImGui::SetNextWindowPos({vp->WorkPos.x + 0.5f * (vp->WorkSize.x - w), y});
-        ImGui::SetNextWindowSize({w, 0});
-        ImGui::SetNextWindowBgAlpha(0.72f);
-        char id[48];
-        std::snprintf(id, sizeof(id), "%s###legend%zu", list[k].title, k);
-        ImGui::Begin(id, nullptr,
-                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
-                         ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoFocusOnAppearing |
-                         ImGuiWindowFlags_NoNav);
-        ImGui::TextUnformatted(list[k].ends);
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        const float bw = ImGui::GetContentRegionAvail().x,
-                    bh = 10.0f * ImGui::GetStyle().FontScaleDpi;
-        const int n = 48;
-        for (int i = 0; i < n; ++i) {
-            const float t0 = float(i) / n, t1 = float(i + 1) / n;
-            dl->AddRectFilledMultiColor({p.x + bw * t0, p.y}, {p.x + bw * t1, p.y + bh},
-                                        ramp(*list[k].stops, t0), ramp(*list[k].stops, t1),
-                                        ramp(*list[k].stops, t1), ramp(*list[k].stops, t0));
+// Every frame (or every N-th) as a numbered PNG in `dir` (default a fresh
+// screenshots/rec_<time> folder). A background thread compresses and writes
+// them, so the window keeps its pace; frames it cannot keep up with are
+// dropped and counted, never queued without bound.
+void App::start_recording(std::string dir) {
+    if (dir.empty()) {
+        char name[64];
+        const std::time_t t = std::time(nullptr);
+        std::tm tm{};
+        localtime_s(&tm, &t);
+        std::strftime(name, sizeof(name), "screenshots/rec_%Y%m%d_%H%M%S", &tm);
+        dir = name;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        toast_ = "could not create " + dir;
+        toast_t_ = Clock::now();
+        return;
+    }
+    if (!png_writer_.joinable())
+        png_writer_ = std::thread([this] { png_writer_loop(); });
+    record_dir_ = dir;
+    record_tick_ = record_count_ = record_dropped_ = 0;
+    recording_ = true;
+    toast_ = "recording to " + dir;
+    toast_t_ = Clock::now();
+}
+
+void App::stop_recording() {
+    if (!recording_)
+        return;
+    recording_ = false;
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "recorded %d frames to %s%s", record_count_,
+                  record_dir_.c_str(), record_dropped_ > 0 ? " (some dropped)" : "");
+    toast_ = msg;
+    toast_t_ = Clock::now();
+    std::printf("%s\n", msg);
+}
+
+void App::png_writer_loop() {
+    for (;;) {
+        PendingPng p;
+        {
+            std::unique_lock<std::mutex> lock(png_mu_);
+            png_cv_.wait(lock, [&] { return png_stop_ || !png_queue_.empty(); });
+            if (png_queue_.empty())
+                return; // stopping, and nothing left to write
+            p = std::move(png_queue_.front());
+            png_queue_.pop_front();
         }
-        ImGui::Dummy({bw, bh});
-        y += ImGui::GetWindowHeight() + 4.0f;
-        ImGui::End();
+        if (!write_png(p.path, p.rgba.data(), p.w, p.h))
+            std::fprintf(stderr, "could not write %s\n", p.path.c_str());
     }
 }
 
-// Cd / Cl / Cm along the bottom (expand-only scales; refit once settled).
-void App::plot_strip(const TunnelStatus& st) {
-    if (st.steps != plotted_steps_ && st.steps > 0 && !st.paused) {
-        if (st.steps < plotted_steps_) { // a reset: new history
-            cd_.clear();
-            cl_.clear();
-            cm_.clear();
-        }
-        cd_.append(st.cd);
-        cl_.append(st.cl);
-        cm_.append(st.cm);
-        plotted_steps_ = st.steps;
-        if (st.settled && !was_settled_) { // scaled to the transient: refocus
-            cd_.refit_recent(0.25);
-            cl_.refit_recent(0.25);
-            cm_.refit_recent(0.25);
-        }
-        was_settled_ = st.settled;
+// -- click to place (F10) --------------------------------------------------------------
+
+// The point under a Ctrl + click (the model's surface or the slice): the
+// camera's focus glides there, a probe is placed there (the four in turn),
+// or the smoke wand moves there.
+void App::resolve_pick(const TunnelStatus& st) {
+    pick_recorded_ = false;
+    vkQueueWaitIdle(ctx_->graphics_queue()); // the frame that copied the depth
+    float t = 1e30f;
+    std::memcpy(&t, pick_buf_->data(), sizeof(t));
+    toast_t_ = Clock::now();
+    if (!(t < 1e29f)) {
+        toast_ = "nothing under the cursor to place on (click the model or a slice)";
+        std::printf("pick: nothing under the cursor\n");
+        return;
     }
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float h = plot_strip_height();
-    ImGui::SetNextWindowPos({vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y - h});
-    ImGui::SetNextWindowSize({vp->WorkSize.x, h});
-    ImGui::SetNextWindowBgAlpha(0.0f);
-    ImGui::Begin("##plots", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
-                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
-                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 o = ImGui::GetWindowPos();
-    const float pw = vp->WorkSize.x / 3.0f, m = 8.0f;
-    const TimeSeries* s[3] = {&cd_, &cl_, &cm_};
-    for (int k = 0; k < 3; ++k)
-        s[k]->draw(dl, {o.x + k * pw + m, o.y + m}, {o.x + (k + 1) * pw - m, o.y + h - m});
-    ImGui::End();
+    const std::array<float, 3> p = renderer_->point_at(pick_view_, pick_px_[0], pick_px_[1], t);
+    char msg[96];
+    if (pick_mode_ == 0) {
+        camera_.fly_to(p, camera_.distance, camera_.azimuth, camera_.elevation);
+        std::snprintf(msg, sizeof(msg), "focus at (%.0f, %.0f, %.0f)", p[0], p[1], p[2]);
+    } else if (pick_mode_ == 1) {
+        const int i = next_probe_;
+        probe_pos_[std::size_t(i)] = {std::clamp(p[0], 0.0f, float(ts_.nx - 1)),
+                                      std::clamp(p[1], 0.0f, float(ts_.ny - 1)),
+                                      std::clamp(p[2], 0.0f, float(ts_.nz - 1))};
+        n_probes_ = std::max(n_probes_, i + 1);
+        next_probe_ = (i + 1) % kMaxProbes;
+        post_probes();
+        std::snprintf(msg, sizeof(msg), "probe %d at (%.0f, %.0f, %.0f)", i + 1, p[0], p[1], p[2]);
+    } else { // the wand stays at the inlet, on the point's y, z
+        show_smoke_ = true;
+        rake_track_ = false;
+        rake_y_ = std::clamp(p[1] / float(ts_.ny), 0.02f, 0.98f);
+        rake_z_ = std::clamp(p[2] / float(ts_.nz), 0.02f, 0.98f);
+        std::snprintf(msg, sizeof(msg), "smoke from the inlet at y %.0f, z %.0f", p[1], p[2]);
+    }
+    (void)st;
+    toast_ = msg;
+    std::printf("pick: %s (depth %.1f)\n", msg, t);
 }
 
 } // namespace windoa::app

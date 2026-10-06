@@ -3,6 +3,7 @@
 # GUI) -- the app blits the result to its swapchain.
 add_library(windoa_render STATIC
     src/volume.cpp
+    src/mesh_raster.cpp
     src/tracers.cpp
 )
 windoa_add_shaders(windoa_render
@@ -12,11 +13,14 @@ windoa_add_shaders(windoa_render
     shaders/vol_smooth.comp
     shaders/vol_q.comp
     shaders/vol_qstat.comp
+    shaders/vol_active.comp
     shaders/vol_march.comp
     shaders/vol_splat.comp
     shaders/smoke.comp
     shaders/streamlines.comp
     shaders/arrows.comp
+    shaders/mesh_vs.vert
+    shaders/mesh_fs.frag
 )
 target_include_directories(windoa_render PUBLIC include)
 target_link_libraries(windoa_render PUBLIC windoa_engine)

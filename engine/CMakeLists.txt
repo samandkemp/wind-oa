@@ -20,6 +20,7 @@ add_library(windoa_engine STATIC
 )
 windoa_add_shaders(windoa_engine
     shaders/lbm_init.comp
+    shaders/lbm_linkq.comp
     shaders/lbm_step.comp
     shaders/lbm_reduce.comp
     shaders/lbm_stats.comp
@@ -63,6 +64,7 @@ set(WINDOA_PHYSICS_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lbm_step.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lbm_reduce.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lbm_init.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lbm_linkq.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lbm_refresh.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lbm_turb.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/turb_blur.comp
@@ -70,7 +72,10 @@ set(WINDOA_PHYSICS_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vox_winding.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vox_votes.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vox_shell_mark.comp
-    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vox_shell_apply.comp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vox_shell_apply.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vox_dist_band.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vox_phi.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/voxeliser.cpp)
 set(physics_hash ${CMAKE_CURRENT_BINARY_DIR}/generated/physics_hash.hpp)
 add_custom_command(
     OUTPUT ${physics_hash}

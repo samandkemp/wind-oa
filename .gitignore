@@ -3,11 +3,17 @@
 /build-vl/
 /out/
 
-# Working notes -- kept locally, not part of the public repo
+# Working notes and assistant instructions -- kept locally, not part of the public repo
 /docs/PLAN.md
 /docs/PROGRESS.md
 /docs/QUESTIONS.md
+/docs/REVIEW.md
 /docs/TRANSITION.md
+/CLAUDE.md
+.claude/
+
+# The app's results table (Compare: append to results.csv)
+/results/
 
 # Settled-flow cache (app; safe to delete)
 /cache/
@@ -22,22 +28,35 @@
 # ...but images deliberately committed for the docs/README are kept
 !docs/images/*.png
 
-# Imported STLs never ship -- only the procedural catalogue does
+# Imported models never ship -- only the procedural catalogue does
+/models/
 *.stl
 
-# Editor / OS noise
+# Editor, IDE and per-user tool settings
+.vscode/
 .vs/
 .idea/
+*.user
+*.suo
+CMakeUserPresets.json
 *.swp
 *~
 .DS_Store
 Thumbs.db
 .VSCodeCounter/
 
+# Scratch scripts' byproducts
+__pycache__/
+*.pyc
+
 # vulkaninfo / Vulkan-Profiles device dumps (machine-specific, ~400 KB)
 VP_VULKANINFO_*.json
 
-# Dear ImGui window layout (per user)
+# The validation layers' settings file, written temporarily to switch on
+# synchronisation validation (GUIDE 15)
+vk_layer_settings.txt
+
+# Dear ImGui window layout and the app's preferences (per user)
 *imgui.ini
 
 # App screenshots (P key)

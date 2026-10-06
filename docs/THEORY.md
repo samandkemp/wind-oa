@@ -153,7 +153,11 @@ The default $U = 0.05$ is 29.5 m/s (66 mph) and the top of the slider, 0.11, is 
 settling line and the speed sliders carry it (`airspeed.hpp`). It matches the compressibility the
 lattice represents, and only that: the Reynolds number does not follow it. A car 4.5 m long at
 29.5 m/s runs at $\mathrm{Re} \approx 9 \times 10^6$, against the 2,400 simulated, so the speed is
-a guide to the regime, not a claim of similarity.
+a guide to the regime, not a claim of similarity. The Tunnel panel and `tunnel_run` show that full-size
+number beside the simulated one, $\mathrm{Re}_{\mathrm{full}} = V L_{\mathrm{full}} / \nu_0$, with
+$\nu_0 = 1.461 \times 10^{-5}$ m$^2$/s (sea-level air at 15 °C) and $L_{\mathrm{full}}$ the real
+object's length along the same axis the size slider sets (the catalogue records each model's units;
+REFERENCE lists the full sizes).
 
 ### 1.3 Grid conventions
 
@@ -1104,6 +1108,15 @@ opacity in proportion to the deviation above a noise floor, so undisturbed flow 
 In the transonic regime the same fields use the Euler state: $U$ is the Mach number, $p$ is the
 pressure itself, and $M = |\mathbf{u}| / \sqrt{\gamma p / \rho}$.
 
+The View panel can reshape the value $v$ before it is drawn. A **colour range** $k$ divides it,
+$v \to v / k$, so $k < 1$ gives more contrast and $k > 1$ a wider span, and it moves the haze's
+opacity with the colour; a **log scale** maps $v \to \operatorname{sign}(v)\, \log_{10}(1 +
+9|v|)$, which keeps $|v| = 1$ in place while opening up the weak end. With $k = 1$ and no log the
+value is exactly as computed. A **colour map** other than the field's own replaces the colouring
+only: a sequential map with even steps of lightness (after matplotlib's viridis), a diverging map
+or greyscale, spanning a signed field about its middle and a magnitude (vorticity, schlieren,
+turbulence) from zero.
+
 ### 10.2 Pressure coefficient and its reference
 
 The reference pressure is the mean density on an upstream plane, half-way between the inlet and the
@@ -1196,6 +1209,17 @@ the field's colour, so the slice shows the field and every in-plane streamline a
 saddles, the shear layers and the shedding. It is a picture of the projected, instantaneous
 flow, not a measured quantity.
 
+**Moving textures.** Both convolutions can be animated with the periodic motion filter of Cabral
+and Leedom (1993): each sample at arc length $s$ along the streak (positive downstream) is weighted,
+besides the tent, by a ripple
+
+$$r(s) = 0.3 + 0.35 \left[1 + \cos 2\pi \left(\frac{s}{\lambda} - \varphi\right)\right],$$
+
+with $\lambda$ the length of one half of the streak and a phase $\varphi$ that advances by half a
+cycle a second. The bright part of each streak then travels downstream, so the texture shows the
+direction of the flow as well as its lines. A negative phase leaves every weight at exactly one:
+the still texture, which the scripted runs use so that a picture repeats.
+
 ### 10.9 Arrows and timelines
 
 **Arrows** sample the in-plane velocity on a regular grid over the slice and draw it as a shaft
@@ -1208,6 +1232,43 @@ bubble wire: 200 particles across the wand's height are released together every 
 marks the fluid that crossed the wire at one instant. Its deformation is the velocity profile
 integrated over its age: a boundary layer lags, a wake bows back, a shear layer rolls up. Every
 fifth line is highlighted so the sequence reads.
+
+### 10.10 The model's true shape, and its lighting
+
+The solver sees the model as cells, so the voxel and smoothed surfaces show what the flow meets.
+The **true shape** draws the model's own triangles instead. They are rasterised, before the march,
+with the march's camera basis: a corner at $\mathbf{r}$ from the eye goes to
+$x = (\mathbf{r}\cdot\hat{\mathbf{e}}_r)/(z \tan\tfrac{\theta}{2}\, a)$ and
+$y = -(\mathbf{r}\cdot\hat{\mathbf{e}}_u)/(z \tan\tfrac{\theta}{2})$ with
+$z = \mathbf{r}\cdot\hat{\mathbf{e}}_f$, so each pixel is the same ray in both passes. The depth
+is reversed ($z_\text{near}/z$) and only orders the triangles; each pixel keeps the exact distance
+$|\mathbf{r}|$ and a shading normal, which the march takes as its surface hit (the floor and walls
+are still found in the cells). The normal at a corner averages, by area, the faces round its
+position whose normals lie within $40^\circ$ of its own, so curved panels shade smoothly and sharper
+edges stay sharp. The paints read the same flow as before; the pressure is sampled $0.75$ of a cell
+out along the normal over fluid cells, since the triangles sit up to a cell off the solid cells.
+On the saloon the true-shape and voxel depths under the same pixel agree to within $0.3$ of a cell.
+
+Every surface is lit by a key light from above to one side, a fill from the eye, a rim term
+$0.14\,(1 - |\hat{\mathbf{n}}\cdot\hat{\mathbf{d}}|)^2$ and a Blinn glint (exponent 48, weaker
+on painted surfaces so their colours read), the diffuse part scaled by an occlusion factor
+$1 - \tfrac{1}{2} s$, clamped to $[0.4, 1]$, where $s$ sums the solid indicator at four points two
+cells out along the normal and two cells to each side, and twice at $3.5$ cells straight out. It
+darkens corners, the underbody and the floor beside the model, and leaves open surfaces unchanged.
+
+### 10.11 Empty-space skipping
+
+The march need not sample where nothing can be drawn. Each frame the haze is drawn, a block of
+$4^3$ cells is marked active when one of its cells, or of the one-cell rim round it, could lift the
+haze above its floor $f$ by the march's own test ($v > f$ for the grey and Mach maps, $|v| > f$ for
+the others); a trilinear sample is a convex mixture of its eight cells, so in an inactive block
+every sample is below the floor. A macro block of $4^3$ blocks is busy when any of its blocks is
+active or near solid. At a sample in a block that is neither, the march moves to its first sample
+beyond the block (or the macro block), on the same lattice of sample positions, and never past the
+mesh's hit or into the slice's band. Nothing is skipped while dye, vortex cores or reversed-flow
+shells are drawn, since their extent is not measured. The image is the image without skipping
+(compared pixel for pixel on a paused flow); the saving is the empty space, about 10 - 15 % of the
+march without the haze and little while a developing wake fills the tunnel.
 
 ## 11. Performance identities
 
@@ -1256,6 +1317,55 @@ the kernel as it was before the performance work (`--check`). `tools/euler_run e
 same for the Euler solver. A code motion that "cannot change the arithmetic" did once (streaming
 the collision outputs changed bits through fused multiply-add contraction), which is why both
 checks exist.
+
+### 11.6 Readings with the step
+
+The force window, the health statistics, the reference density and the probe values are recorded
+at the end of a batch's last submission and read from mapped memory after it, and the window's
+restart becomes the first command of the next submission. They are the values the separate reads
+returned, on the same state, and the solver's arithmetic is untouched (P4_equiv). A batch then
+costs one blocking round trip to the GPU instead of four to six, each of which had left the GPU
+idle: at the app's 20 steps a batch the sandbox ran at 3,034 MLUPS before and 3,310 after, against
+3,530 at 200 steps a batch. The transonic batch takes its loads, its time and its render fields the
+same way, and small copies to and from the host reuse kept staging buffers.
+
+### 11.7 One force reduce per submission
+
+The step kernel's per-workgroup force partials go into consecutive slices of a ring of up to
+32 MB, and one pass folds every slice, each in the fixed order of §4.3, then adds the totals to the
+window in step order. The sums are those of a reduce after every step, bit for bit, without the
+one-workgroup dispatch between steps that left the rest of the GPU waiting (5.8 % of the time on
+the fast grid when removed altogether; about 1 - 1.5 % recovered as built).
+
+### 11.8 Voxelising a slab
+
+A model is voxelised, its signed distance found and its link fractions set over the x-slab it can
+affect: the triangles' extent with a margin of a few cells. Only flags that changed are uploaded,
+only the slab is read back, the distance outside it is filled with the value the kernel writes far
+from any triangle ($\pm\min(b + 1, 4)$ for a band $b$, by the cell's flag), and only the links
+that are not half-way are sent, scattered into the link array after the old and new slabs are reset
+to half-way on the GPU. The arrays are those of the whole-grid path (V12, V28, P2_catalogue). A
+model change on the ultra grid fell from 710 to 161 ms, and on the fast grid from 97 to 46 ms.
+
+### 11.9 The dye in the flow's step
+
+With the dye on, its D3Q7 step (§6) runs in the flow's own kernel, after the flow, with the velocity
+the thread has just computed: no separate pass, no barrier, and no write of $\rho$ and $\mathbf{u}$
+every step for the dye to read (the lazy writes of §11.1 stay lazy). The arithmetic is the separate
+pass's in the same order, and `tools/lbm_equiv` compares the two bit for bit, the separate pass
+remaining as the reference. A run with dye went from 2,137 to 2,510 MLUPS on the fast grid.
+
+### 11.10 Overlapping batches
+
+The app's worker keeps one batch in flight: it submits the next batch, then takes the readings of
+the one before it (§11.6) while the new one runs, so the GPU is not left idle between them. Each
+batch keeps its own force window and its own copies of the readings. The snapshot the renderer
+draws is copied at the end of the batch that produced it and made current only once that batch has
+completed, so a frame never waits on a batch; three snapshot slots allow it (one drawn, one being
+written, one free). A batch begun before a reset or restart is waited for and dropped. The solver's
+arithmetic is unchanged: only when the host waits has moved. On the fast grid, drawing 75 frames a
+second, the solver's throughput in steps per wall-clock second rose from about 3,140 to 3,310 -
+3,440 MLUPS, 92 - 95 % of its headless rate.
 
 ## 12. Statistics and signals
 

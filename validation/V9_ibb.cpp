@@ -15,9 +15,6 @@ using namespace windoa;
 
 namespace {
 
-// e_y of each D3Q19 direction (engine/shaders/lattice.glsl order).
-constexpr int kEy[lbm::Q] = {0, 0, 0, 1, -1, 0, 0, 1, -1, -1, 1, 0, 0, 0, 0, 1, -1, 1, -1};
-
 double certify(Context& ctx, double q) {
     constexpr int NX = 4, NY = 34, NZ = 4;
     constexpr float TAU = 0.8f, GX = 1.0e-5f;
@@ -35,7 +32,7 @@ double certify(Context& ctx, double q) {
     std::vector<std::uint8_t> flags(n, lbm::FLUID);
     for (int x = 0; x < NX; ++x)
         for (int z = 0; z < NZ; ++z) {
-            flags[(std::size_t(x) * NY + 0) * NZ + z] = lbm::OBSTACLE; // IBB acts on OBSTACLE
+            flags[Grid{NX, NY, NZ}.index(x, 0, z)] = lbm::OBSTACLE; // IBB acts on OBSTACLE
             flags[(std::size_t(x) * NY + NY - 1) * NZ + z] = lbm::OBSTACLE;
         }
     s.set_flags(flags);
@@ -44,9 +41,9 @@ double certify(Context& ctx, double q) {
     for (int d = 1; d < lbm::Q; ++d)
         for (int x = 0; x < NX; ++x)
             for (int z = 0; z < NZ; ++z) {
-                if (kEy[d] == -1) // links into the bottom wall
-                    qa[d * n + (std::size_t(x) * NY + 1) * NZ + z] = qv;
-                if (kEy[d] == +1) // links into the top wall
+                if (lattice::E[std::size_t(d)][1] == -1) // links into the bottom wall
+                    qa[d * n + Grid{NX, NY, NZ}.index(x, 1, z)] = qv;
+                if (lattice::E[std::size_t(d)][1] == +1) // links into the top wall
                     qa[d * n + (std::size_t(x) * NY + NY - 2) * NZ + z] = qv;
             }
     s.set_link_q(qa);

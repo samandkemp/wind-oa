@@ -34,5 +34,7 @@ const int CMODE_GREY = 2;
 const int CMODE_MACH = 3;
 const int CMODE_SEQ = 4;  // sequential, for magnitudes from zero
 
-// Solid occupancy block edge, cells (must match render/volume.cpp).
+// Solid occupancy block edge, cells (must match render/volume.cpp), and the
+// skipping's macro block edge, in occupancy blocks (kMacroBlock there).
 const int OCC_BLOCK = 4;
+const int MACRO_BLOCK = 4;

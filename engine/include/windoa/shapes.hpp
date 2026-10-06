@@ -51,6 +51,19 @@ std::vector<std::uint8_t> link_fractions(const std::vector<std::uint8_t>& flags,
                                          const std::vector<float>& phi, int nx, int ny, int nz,
                                          const geometry::Mesh* mesh = nullptr,
                                          int* filled = nullptr, int* exact = nullptr);
+// The same values as a list of the links that are not half-way: byte index
+// d N + cell in Solver's link array, and the value; [x0, x1) is the x-slab
+// they lie in (the OBSTACLE cells' x-range, one plane either side). For
+// Solver::set_link_q_sparse: a model costs its wall links, not 19 bytes for
+// every cell of the grid (359 MB on the ultra grid).
+struct LinkSet {
+    int x0 = 0, x1 = 0;
+    std::vector<std::uint32_t> index;
+    std::vector<std::uint8_t> q;
+};
+LinkSet link_set(const std::vector<std::uint8_t>& flags, const std::vector<float>& phi, int nx,
+                 int ny, int nz, const geometry::Mesh* mesh = nullptr, int* filled = nullptr,
+                 int* exact = nullptr);
 
 // The relaxation time giving Reynolds number `re` at lattice speed u over a
 // length of L cells: nu = u L / Re, tau = nu / cs^2 + 1/2.

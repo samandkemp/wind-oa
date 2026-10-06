@@ -66,11 +66,13 @@ Result run(Context& ctx, const Case& k, bool opt, bool f16) {
         std::vector<float> src(s.cells(), 0.0f);
         for (int y = 12; y < 20; ++y)
             for (int z = 12; z < 20; ++z)
-                src[(std::size_t(4) * NY + y) * NZ + z] = 0.5f;
+                src[Grid{NX, NY, NZ}.index(4, y, z)] = 0.5f;
         d.set_sources(src);
-        d.step_with(s, 150);
+        // reference: the separate dye pass; optimised: fused into the step
+        auto steps = [&](int n) { opt ? d.step_with(s, n) : d.step_with_reference(s, n); };
+        steps(150);
         s.read_mean_forces();
-        d.step_with(s, 151);
+        steps(151);
         r.dye = d.concentration();
     } else {
         // odd batch sizes: parity changes and submit boundaries mid-run
@@ -197,9 +199,9 @@ int main(int argc, char** argv) {
                  for (int y = 0; y < NY; ++y)
                      for (int z = 0; z < NZ; ++z)
                          if (x == 0 || x == NX - 1 || y == 0)
-                             f[(std::size_t(x) * NY + y) * NZ + z] = lbm::WALL;
+                             f[Grid{NX, NY, NZ}.index(x, y, z)] = lbm::WALL;
                          else if (y == NY - 1)
-                             f[(std::size_t(x) * NY + y) * NZ + z] = lbm::LID;
+                             f[Grid{NX, NY, NZ}.index(x, y, z)] = lbm::LID;
              s.set_flags(f);
              s.set_lid_velocity({0.08f, 0.0f, 0.0f});
              s.init_equilibrium(1.0f, {0.0f, 0.0f, 0.0f});
@@ -211,7 +213,7 @@ int main(int argc, char** argv) {
              s.set_inlet_turbulence(0.02f, 4.0f, 64, 0.05f);
              s.init_equilibrium(1.0f, {0.05f, 0.0f, 0.0f});
          }},
-        {"dye hook (rho / u every step)", [](lbm::Config& c) { c.regularised = true; },
+        {"dye: fused vs the separate pass", [](lbm::Config& c) { c.regularised = true; },
          [](lbm::Solver& s) {
              s.set_flags(sphere(24.0f, 5.0f));
              s.init_equilibrium(1.0f, {0.05f, 0.0f, 0.0f});

@@ -76,6 +76,10 @@ struct Entry {
     std::vector<Spinner> spinners;
     std::vector<Port> ports;
     std::vector<Rotor> rotors;
+    // Metres per model unit (most models are built in metres, the munitions
+    // and a few others in millimetres); 0 for a shape with no real size. It
+    // gives the full-size Reynolds number beside the simulated one.
+    double metres_per_unit = 1.0;
 };
 
 // In menu order (groups contiguous).

@@ -1,5 +1,7 @@
 #include "windoa/euler.hpp"
 
+#include "windoa/grid.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -121,7 +123,8 @@ void Solver::set_distance(std::span<const float> phi) {
 // geometry, on the host.
 void Solver::phi_from_flags() {
     const int nx = cfg_.nx, ny = cfg_.ny, nz = cfg_.nz;
-    auto id = [&](int x, int y, int z) { return (std::size_t(x) * ny + y) * nz + z; };
+    const Grid grid{nx, ny, nz};
+    auto id = [&](int x, int y, int z) { return grid.index(x, y, z); };
     std::vector<float> a(n_), b(n_);
     for (std::size_t c = 0; c < n_; ++c)
         a[c] = host_flags_[c] != kFluid ? 1.0f : 0.0f;
@@ -306,6 +309,10 @@ Solver::Loads Solver::body_loads(const std::array<float, 3>& ref) {
     });
     std::vector<float> v(std::size_t{groups_.total} * 8);
     ctx_.download(partials_, v.data(), v.size() * 4);
+    return sum_loads(v.data());
+}
+
+Solver::Loads Solver::sum_loads(const float* v) const {
     Loads l;
     for (std::size_t k = 0; k < groups_.total; ++k)
         for (std::size_t a = 0; a < 3; ++a) {
@@ -313,6 +320,55 @@ Solver::Loads Solver::body_loads(const std::array<float, 3>& ref) {
             l.moment[a] += v[8 * k + 4 + a];
         }
     return l;
+}
+
+Solver::Batch Solver::step_with_readings(int n, const std::array<float, 3>& ref, bool with_health) {
+    ensure_geometry();
+    const VkDeviceSize loads_bytes = std::size_t{groups_.total} * 32;
+    if (!loads_mirror_) {
+        loads_mirror_ = std::make_unique<Buffer>(ctx_, loads_bytes, MemoryUse::Readback);
+        health_mirror_ = std::make_unique<Buffer>(ctx_, loads_bytes, MemoryUse::Readback);
+        dt_mirror_ = std::make_unique<Buffer>(ctx_, 16, MemoryUse::Readback);
+    }
+    const Params p = params();
+    Params pf = p;
+    for (int a = 0; a < 3; ++a)
+        pf.aux2[a] = ref[std::size_t(a)];
+    while (n > 0) {
+        const int batch = std::min(n, kStepsPerSubmit);
+        const bool last = batch == n;
+        ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+            for (int s = 0; s < batch; ++s)
+                record_step(cmd);
+            if (!last)
+                return;
+            // body_loads(), time(), then refresh() / health(), as separate calls
+            // would run them
+            Context::barrier_full(cmd);
+            ghost_.record(cmd, &p, groups_.x, groups_.y);
+            Context::barrier_compute_to_compute(cmd);
+            force_.record(cmd, &pf, groups_.x, groups_.y);
+            Context::barrier_full(cmd);
+            const VkBufferCopy loads{0, 0, loads_bytes}, dt{0, 0, 16};
+            vkCmdCopyBuffer(cmd, partials_.handle(), loads_mirror_->handle(), 1, &loads);
+            vkCmdCopyBuffer(cmd, dt_.handle(), dt_mirror_->handle(), 1, &dt);
+            Context::barrier_full(cmd); // the copy reads partials before diag rewrites them
+            diag_.record(cmd, &p, groups_.x, groups_.y);
+            if (with_health) {
+                Context::barrier_full(cmd);
+                const VkBufferCopy health{0, 0, std::size_t{groups_.total} * 16};
+                vkCmdCopyBuffer(cmd, partials_.handle(), health_mirror_->handle(), 1, &health);
+            }
+        });
+        steps_ += batch;
+        n -= batch;
+    }
+    Batch b;
+    b.loads = sum_loads(static_cast<const float*>(loads_mirror_->data()));
+    b.time = static_cast<const float*>(dt_mirror_->data())[1];
+    if (with_health)
+        b.health = sum_health(static_cast<const float*>(health_mirror_->data()));
+    return b;
 }
 
 void Solver::refresh() {
@@ -324,6 +380,10 @@ Solver::Health Solver::health() {
     refresh();
     std::vector<float> v(std::size_t{groups_.total} * 4);
     ctx_.download(partials_, v.data(), v.size() * 4);
+    return sum_health(v.data());
+}
+
+Solver::Health Solver::sum_health(const float* v) const {
     Health h;
     double bad = 0.0;
     for (std::size_t k = 0; k < groups_.total; ++k) {

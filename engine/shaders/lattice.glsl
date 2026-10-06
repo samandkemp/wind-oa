@@ -1,6 +1,6 @@
-// D3Q19 lattice tables, shared by every LBM kernel (THEORY 1.1). The host
-// copies (src/shapes.cpp, the gates) use the same direction order, since f
-// is stored direction-major: keep them in lock-step.
+// D3Q19 lattice tables, shared by every LBM kernel (THEORY 1.1). The host's
+// copy (include/windoa/lattice.hpp) uses the same direction order, since f
+// is stored direction-major: keep the two in lock-step.
 //
 //   0      rest                1/3
 //   1-6    +-x, +-y, +-z       1/18

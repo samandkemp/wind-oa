@@ -52,6 +52,12 @@ layout(constant_id = 11) const bool F16 = false;
 // 3.12). The solver builds this pipeline beside the plain one and uses it
 // only while a force field is on, so without one nothing changes.
 layout(constant_id = 12) const bool FORCE_FIELD = false;
+// The dye (THEORY 6) fused into the step: after the flow, each FLUID cell
+// takes the D3Q7 TRT step of dye_step.comp with the velocity this thread
+// has just computed -- no macro read for it, and no macro write every step
+// (LAZY_MACRO stays lazy). The same arithmetic in the same order as the
+// separate pass (tools/lbm_equiv checks every bit). Off: the plain step.
+layout(constant_id = 13) const bool DYE = false;
 
 #include "lattice.glsl"
 #include "lbm_params.glsl"
@@ -66,8 +72,15 @@ layout(std430, binding = 3) readonly buffer MacroPrev { vec4 macro_prev[]; };  /
 layout(std430, binding = 4) writeonly buffer MacroOut { vec4 macro_out[]; };
 layout(std430, binding = 5) readonly buffer LinkQ { uint link_q[]; };  // packed u8, [Q][cell]
 layout(std430, binding = 6) readonly buffer UWall { vec4 u_wall[]; };
-layout(std430, binding = 7) writeonly buffer Partials { vec4 partials[]; };  // per group: F, T
+// per group: F, T -- in the slice that starts P.dims.w groups in (lbm_reduce.comp)
+layout(std430, binding = 7) writeonly buffer Partials { vec4 partials[]; };
 layout(std430, binding = 8) readonly buffer ForceField { vec4 force_field[]; };  // per cell
+// DYE: populations [7][cell] (read / write), concentration, source rates.
+// Its relaxation rates ride in the w of two push-constant vectors.
+layout(std430, binding = 9) readonly buffer GSrc { float gs[]; };
+layout(std430, binding = 10) writeonly buffer GDst { float gd[]; };
+layout(std430, binding = 11) buffer Conc { float conc[]; };
+layout(std430, binding = 12) readonly buffer DyeSrc { float dye_src[]; };
 
 shared vec4 s_force[256];
 shared vec4 s_torque[256];
@@ -87,7 +100,8 @@ float link_fraction(uint idx) {
     return b == 128u ? 0.5 : float(b) / 255.0;
 }
 
-void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
+// `u_cell` returns the velocity the step leaves at c (for the fused dye).
+void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque, out vec3 u_cell) {
     const int nx = n.x, ny = n.y, nz = n.z;
     const uint N = uint(nx * ny * nz);
     const ivec3 p = cell_coords(c, n);
@@ -104,6 +118,7 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
     if (MODE_X == 0 && x == 0) {
         for (int i = 0; i < Q; ++i) st(i, uint(i) * N + c, feq(i, 1.0, u_in));
         if (write_macro) macro_out[c] = vec4(u_in, 1.0);
+        u_cell = u_in;
         return;
     }
 
@@ -314,6 +329,69 @@ void process(uint c, ivec3 n, inout vec3 force, inout vec3 torque) {
 
     // ---- 5. Macroscopic output ---------------------------------------------------
     if (write_macro) macro_out[c] = vec4(u, rho);
+    u_cell = u;
+}
+
+// ---- The fused dye: dye_step.comp's FLUID branch, verbatim -------------------
+const ivec3 E7[7] = ivec3[](ivec3(0, 0, 0), ivec3(1, 0, 0), ivec3(-1, 0, 0), ivec3(0, 1, 0),
+                            ivec3(0, -1, 0), ivec3(0, 0, 1), ivec3(0, 0, -1));
+const float W7[7] = float[](0.25, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125);
+const int OPP7[7] = int[](0, 2, 1, 4, 3, 6, 5);
+
+void dye_step(uint c, ivec3 n, vec3 u) {
+    const uint N = uint(n.x * n.y * n.z);
+    const ivec3 p = cell_coords(c, n);
+    const int per = (MODE_X == 1 ? 1 : 0) | (MODE_Y == 1 ? 2 : 0) | (MODE_Z == 1 ? 4 : 0);
+    float g[7];
+    for (int i = 0; i < 7; ++i) {
+        ivec3 s = p - E7[i];
+        if ((per & 1) != 0) s.x = (s.x + n.x) % n.x;
+        if ((per & 2) != 0) s.y = (s.y + n.y) % n.y;
+        if ((per & 4) != 0) s.z = (s.z + n.z) % n.z;
+        float val;
+        if (s.x < 0) {
+            val = 0.0;  // clean inlet air
+        } else if (s.x >= n.x) {
+            const float eo = dot(vec3(E7[i]), u);
+            val = W7[i] * conc[c] * (1.0 + 4.0 * eo + 8.0 * eo * eo - 2.0 * dot(u, u));
+        } else if (s.y < 0 || s.y >= n.y || s.z < 0 || s.z >= n.z) {
+            val = gs[uint(OPP7[i]) * N + c];  // side walls: no flux
+        } else if (flags[cell_index(s.x, s.y, s.z, n)] != FLUID) {
+            val = gs[uint(OPP7[i]) * N + c];  // body: no flux
+        } else {
+            val = gs[uint(i) * N + cell_index(s.x, s.y, s.z, n)];
+        }
+        g[i] = val;
+    }
+    float C = 0.0;
+    for (int i = 0; i < 7; ++i) C += g[i];
+    const float r = dye_src[c];
+    if (r > 0.0) {  // relaxation source towards C = 1
+        const float dc = r * (1.0 - C);
+        for (int i = 0; i < 7; ++i) g[i] += W7[i] * dc;
+        C += dc;
+    }
+    const float C_MAX = 1.25;  // the boundedness limiter (see dye_step.comp)
+    if (C > C_MAX) {
+        const float k = C_MAX / C;
+        for (int i = 0; i < 7; ++i) g[i] *= k;
+        C = C_MAX;
+    }
+    const float usq = dot(u, u);
+    float geq[7];
+    for (int i = 0; i < 7; ++i) {
+        const float eu = dot(vec3(E7[i]), u);
+        geq[i] = W7[i] * C * (1.0 + 4.0 * eu + 8.0 * eu * eu - 2.0 * usq);
+    }
+    const float omega_minus = P.u_lid.w, omega_plus = P.torque_ref.w;
+    for (int i = 0; i < 7; ++i) {
+        const int o = OPP7[i];
+        const float gp = 0.5 * (g[i] + g[o]), gm = 0.5 * (g[i] - g[o]);
+        const float ep = 0.5 * (geq[i] + geq[o]), em = 0.5 * (geq[i] - geq[o]);
+        const float outv = g[i] - omega_plus * (gp - ep) - omega_minus * (gm - em);
+        gd[uint(i) * N + c] = max(outv, 0.0);  // guards f32 round-off only
+    }
+    conc[c] = C;
 }
 
 void main() {
@@ -324,7 +402,14 @@ void main() {
 
     vec3 force = vec3(0.0);
     vec3 torque = vec3(0.0);
-    if (c < N && flags[c] == FLUID) process(c, n, force, torque);
+    if (c < N && flags[c] == FLUID) {
+        vec3 u_cell;
+        process(c, n, force, torque, u_cell);
+        if (DYE) dye_step(c, n, u_cell);
+    } else if (DYE && c < N) { // no dye in solids (as the separate pass)
+        for (int i = 0; i < 7; ++i) gd[uint(i) * N + c] = 0.0;
+        conc[c] = 0.0;
+    }
 
     // Deterministic per-workgroup force / torque partials (fixed-order tree;
     // no float atomics). lbm_reduce.comp folds them into the step total.
@@ -337,7 +422,7 @@ void main() {
         barrier();
         if (s_any_link == 0u) {
             if (lid == 0u) {
-                const uint gid = linear_group();
+                const uint gid = uint(P.dims.w) + linear_group();
                 partials[2u * gid] = vec4(0.0);
                 partials[2u * gid + 1u] = vec4(0.0);
             }
@@ -355,7 +440,7 @@ void main() {
         barrier();
     }
     if (lid == 0u) {
-        const uint gid = linear_group();
+        const uint gid = uint(P.dims.w) + linear_group();
         partials[2u * gid] = s_force[0];
         partials[2u * gid + 1u] = s_torque[0];
     }

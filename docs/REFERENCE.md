@@ -68,6 +68,8 @@ that solver.
 | `dye_tau`, `dye_tau_plus` | float | 0.53, 1.0 | Dye relaxation times; $D = (\tau - 0.5)/4$ (§6.2) |
 | `dye_nozzle_rate` | float | 0.5 | Nozzle relaxation towards $C = 1$ per step (§6.3) |
 | `dye_nozzles` | int | 6 | Nozzles per side of the wand (a 6 x 6 rake) |
+| `dye_nozzle_cells` | int | 2 | Each nozzle's width in y and z, cells (a filament from the inlet must survive the tunnel's length) |
+| `rake_x` | float | 3 | The smoke wand and the dye nozzles: cells from the inlet |
 | `flow_cache_mb` | double | 512 | Disk budget of the settled-flow cache, MiB (§9.6) |
 | `storage_f16` | bool | false | Half-precision distribution storage: an ungated approximation (§11.3) |
 | `mach_min`, `mach_max` | float | 0.3, 1.6 | Range of the transonic Mach slider |
@@ -103,6 +105,8 @@ bare solver, as the gates construct them.
 Run-time setters (no recompilation): `set_inlet_velocity`, `set_body_force`, `set_lid_velocity`,
 `set_torque_ref`, `set_inlet_turbulence`, `set_turbulence_convection`, `set_rotation`,
 `set_wall_velocity` (a port's face, §3.11), `clear_wall_velocity`, `set_link_q`, `enforce_mass`.
+Between `begin_wall_update` and `end_wall_update`, `set_rotation` and `set_wall_velocity` edit only
+the host copy, and one upload of the cells that changed follows: the field is the same either way.
 `enable_force_field` switches the per-cell body force that actuator lines write (§3.12); it
 recompiles the step through a specialisation constant, and off it is bit-identical.
 
@@ -130,41 +134,43 @@ the cells flagged `kPortFlag + k` (§8.12).
 The 30 procedural models, in menu order. *Size* is the default length as a fraction of $n_x$ (or
 64 cells where none is given); the placement then shrinks a model that would not fit, and moves it
 so the nose clears the inlet. The longest axis is taken over the mesh and any rotor's swept disc.
-*Spinners* are the parts the *spinning parts* checkbox turns, *rotors* the actuator lines
-(§3.12) and *ports* the engine faces (§3.11, §8.12).
+*Full size* is the real object's length along the same axis, from the units each model is
+built in (`tunnel_run --catalogue` prints it); it gives the full-size Reynolds number beside the
+simulated one (§1.2). *Spinners* are the parts the *spinning parts* checkbox turns, *rotors* the
+actuator lines (§3.12) and *ports* the engine faces (§3.11, §8.12).
 
-| ID | Label | Group | Size | Ground | Spinners, rotors, ports |
-|---|---|---|---|---|---|
-| `sphere` | Sphere | Basic shapes | 0.15 | air | - |
-| `cube` | Cube | Basic shapes | 0.12 | air | - |
-| `cylinder` | Cylinder (cross-flow) | Basic shapes | 64 cells | air | - |
-| `cone` | Cone (15 deg) | Basic shapes | 64 cells | air | - |
-| `ball_spin` | Spinning ball (Magnus) | Basic shapes | 0.15 | air | 1 spinner (backspin) |
-| `wing_naca0012` | NACA 0012 wing | Aerodynamic references | 64 cells | air | - |
-| `ahmed_25deg` | Ahmed body (25 deg) | Aerodynamic references | 64 cells | air | - |
-| `car_saloon` | Saloon (XE-like) | Road vehicles | 64 cells | rolling road | 4 wheels |
-| `car_saloon_wing` | Saloon + rear wing | Road vehicles | 64 cells | rolling road | 4 wheels |
-| `car_lmp` | Le Mans prototype | Road vehicles | 64 cells | rolling road | 1 exhaust |
-| `car_open_wheel` | Open-wheel race car | Road vehicles | 64 cells | rolling road | 4 wheels; airbox and 2 radiator intakes, 1 exhaust |
-| `lorry` | Lorry + trailer | Road vehicles | 0.40 | rolling road | - |
-| `bullet_train` | Bullet train (leading car) | Road vehicles | 0.60 | rolling road | - |
-| `airliner` | Airliner (A320-like) | Aircraft | 64 cells | air | 2 fan intakes, 2 exhausts |
-| `concorde` | Supersonic delta (Concorde-like) | Aircraft | 0.50 | air | 2 intakes, 2 exhausts |
-| `uav_reaper` | UAV (MQ-9-like) | Aircraft | 64 cells | air | 1 rotor (3-blade pusher propeller) |
-| `uav_quad` | Quadcopter | Aircraft | 64 cells | air | 4 rotors (2 blades; diagonal pairs counter-rotate) |
-| `capsule` | Re-entry capsule (Apollo-like) | Space | 0.15 | air | - |
-| `rocket` | Rocket with grid fins (F9-like) | Space | 0.75 | air | 1 exhaust |
-| `round_556` | 5.56 mm projectile | Munitions | 0.40 | air | - |
-| `shell_105` | 105 mm howitzer shell | Munitions | 0.45 | air | 1 exhaust (base bleed) |
-| `apfsds` | APFSDS dart | Munitions | 0.70 | air | - |
-| `aim120` | AIM-120 AMRAAM-like | Munitions | 0.70 | air | 1 exhaust |
-| `ballistic_missile` | Ballistic missile (Scud-like) | Munitions | 0.65 | air | 1 exhaust |
-| `caarc_building` | Tall building (CAARC standard) | Wind engineering | 0.20 | fixed floor | - |
-| `city_block` | City block | Wind engineering | 0.40 | fixed floor | - |
-| `bridge_deck` | Bridge deck (Tacoma Narrows) | Wind engineering | 0.36 | air | - |
-| `wind_turbine` | Wind turbine | Rotating | 0.117 | fixed floor | 1 rotor (3 blades, designed for a tip-speed ratio of 7) |
-| `propeller` | Propeller | Rotating | 0.10 | air | 1 rotor (3 blades) |
-| `frisbee` | Frisbee | Rotating | 64 cells | air | 1 spinner |
+| ID | Label | Group | Size | Full size | Ground | Spinners, rotors, ports |
+|---|---|---|---|---|---|---|
+| `sphere` | Sphere | Basic shapes | 0.15 | - | air | - |
+| `cube` | Cube | Basic shapes | 0.12 | - | air | - |
+| `cylinder` | Cylinder (cross-flow) | Basic shapes | 64 cells | - | air | - |
+| `cone` | Cone (15 deg) | Basic shapes | 64 cells | - | air | - |
+| `ball_spin` | Spinning ball (Magnus) | Basic shapes | 0.15 | 0.22 m | air | 1 spinner (backspin) |
+| `wing_naca0012` | NACA 0012 wing | Aerodynamic references | 64 cells | 3 m | air | - |
+| `ahmed_25deg` | Ahmed body (25 deg) | Aerodynamic references | 64 cells | 1.04 m | air | - |
+| `car_saloon` | Saloon (XE-like) | Road vehicles | 64 cells | 4.67 m | rolling road | 4 wheels |
+| `car_saloon_wing` | Saloon + rear wing | Road vehicles | 64 cells | 4.67 m | rolling road | 4 wheels |
+| `car_lmp` | Le Mans prototype | Road vehicles | 64 cells | 4.7 m | rolling road | 1 exhaust |
+| `car_open_wheel` | Open-wheel race car | Road vehicles | 64 cells | 5.83 m | rolling road | 4 wheels; airbox and 2 radiator intakes, 1 exhaust |
+| `lorry` | Lorry + trailer | Road vehicles | 0.40 | 16.8 m | rolling road | - |
+| `bullet_train` | Bullet train (leading car) | Road vehicles | 0.60 | 31 m | rolling road | - |
+| `airliner` | Airliner (A320-like) | Aircraft | 64 cells | 37.6 m | air | 2 fan intakes, 2 exhausts |
+| `concorde` | Supersonic delta (Concorde-like) | Aircraft | 0.50 | 61.7 m | air | 2 intakes, 2 exhausts |
+| `uav_reaper` | UAV (MQ-9-like) | Aircraft | 64 cells | 20 m | air | 1 rotor (3-blade pusher propeller) |
+| `uav_quad` | Quadcopter | Aircraft | 64 cells | 0.63 m | air | 4 rotors (2 blades; diagonal pairs counter-rotate) |
+| `capsule` | Re-entry capsule (Apollo-like) | Space | 0.15 | 3.91 m | air | - |
+| `rocket` | Rocket with grid fins (F9-like) | Space | 0.75 | 70.6 m | air | 1 exhaust |
+| `round_556` | 5.56 mm projectile | Munitions | 0.40 | 23 mm | air | - |
+| `shell_105` | 105 mm howitzer shell | Munitions | 0.45 | 0.49 m | air | 1 exhaust (base bleed) |
+| `apfsds` | APFSDS dart | Munitions | 0.70 | 0.78 m | air | - |
+| `aim120` | AIM-120 AMRAAM-like | Munitions | 0.70 | 3.65 m | air | 1 exhaust |
+| `ballistic_missile` | Ballistic missile (Scud-like) | Munitions | 0.65 | 11.2 m | air | 1 exhaust |
+| `caarc_building` | Tall building (CAARC standard) | Wind engineering | 0.20 | 183 m | fixed floor | - |
+| `city_block` | City block | Wind engineering | 0.40 | 155 m | fixed floor | - |
+| `bridge_deck` | Bridge deck (Tacoma Narrows) | Wind engineering | 0.36 | 48 m | air | - |
+| `wind_turbine` | Wind turbine | Rotating | 0.117 | 150 m | fixed floor | 1 rotor (3 blades, designed for a tip-speed ratio of 7) |
+| `propeller` | Propeller | Rotating | 0.10 | 2.2 m | air | 1 rotor (3 blades) |
+| `frisbee` | Frisbee | Rotating | 64 cells | 0.28 m | air | 1 spinner |
 
 The rotors' design tip-speed ratios are 7 for the turbine and 4.5 for the propellers; the
 quadcopter's rotors drive the air downwards. The engine ports, with the subsonic speed ratio (face
@@ -200,7 +206,9 @@ unknown option (exit code 2) rather than ignoring it.
 ```
 windoa_app [fast|balanced|fine|ultra] [subsonic|transonic] [--model ID] [--f16] [--no-vsync]
            [--frames N] [--shot FILE.png] [--warmup STEPS] [--show LIST] [--field NAME]
-           [--spin R] [--power T] [--rotors L] [--aoa DEG] [--mach M] [--zoom F] [--view AZ,EL]
+           [--spin R] [--power T] [--rotors L] [--aoa DEG] [--size CELLS] [--look N]
+           [--mach M] [--zoom F] [--view AZ,EL] [--record DIR [--every N]] [--pick FX,FY]
+           [--window WxH] [--ui-scale S]
 ```
 
 | Flag | Default | Meaning |
@@ -209,19 +217,26 @@ windoa_app [fast|balanced|fine|ultra] [subsonic|transonic] [--model ID] [--f16] 
 | `subsonic` / `transonic` | `subsonic` | Starting regime |
 | `--model ID` | `car_saloon` | Starting catalogue model; an unknown ID is refused with the list |
 | `--f16` | off | Half-precision storage: an ungated approximation (§11.3) |
-| `--no-vsync` | off | Present without waiting for the display; frames are then capped at 240 a second (uncapped, the window starved the solver's queue: 3,040 down to 1,280 MLUPS) |
+| `--no-vsync` | off | Present without waiting for the display; frames stay capped at 90 a second, as with vsync (uncapped, the window starved the solver's queue: 3,040 down to 1,280 MLUPS) |
 | `--frames N` | - | Exit after N frames (scripts, smoke tests) |
 | `--shot FILE` | - | With `--frames`: save the last frame as a PNG, panels included |
 | `--warmup STEPS` | 0 | Run the solver this many steps before the first frame |
-| `--show LIST` | - | Comma-separated view toggles: `q`, `dye`, `lines`, `nosmoke`, `nohaze`, `voxel`, `help`; `slice`, `hslice`, `xslice` (the vertical, horizontal and cross slice); `avg` (time averaging), `recirc` (mean reversed-flow shells), `lic` (slice texture), `arrows` (slice arrows), `timelines`, `nopaint`, `wallspeed`, `reversed`, `oil` (surface paint), `analysis` (the Analysis panel open), `probes` (two probes in the wake); `noui` (panels hidden), `noplots`, `nobox` (no tunnel outline), `nosurface` (the body hidden) |
+| `--show LIST` | - | Comma-separated view toggles: `q`, `dye`, `lines`, `nosmoke`, `nohaze`, `voxel`, `smooth` (the solver's cells instead of the true shape), `help`; `slice`, `hslice`, `xslice` (the vertical, horizontal and cross slice); `avg` (time averaging), `recirc` (mean reversed-flow shells), `lic` (slice texture), `arrows` (slice arrows), `timelines`, `nopaint`, `wallspeed`, `reversed`, `oil` (surface paint), `analysis` (the Analysis panel open), `probes` (two probes in the wake), `paused` (the solver paused after the warm-up, so every frame shows the same flow); `noui` (panels hidden), `noplots`, `nobox` (no tunnel outline), `nosurface` (the body hidden); `animate` (moving flow textures; scripted runs keep them still otherwise), `sequential`, `greyscale` (colour maps), `logscale` |
 | `--field NAME` | `speed` | `speed`, `pressure`, `vorticity`, `vortx`, `mach`, `schlieren`, `mean` (mean speed) or `turb` (turbulence intensity) |
 | `--spin R` | - | Spin ratio for models with spinning parts |
 | `--power T` | - | Engines on at throttle T, for models with engine ports |
 | `--rotors L` | - | Rotors turning at tip-speed ratio L, for models with rotors |
 | `--aoa DEG` | 0 | Starting pitch / angle of attack |
+| `--size CELLS` | the model's | The model's longest axis at start, cells |
+| `--look N` | - | A look, 1 - 9: tunnel, smoke, pressure, vortices, texture, oil, dye, wake, schlieren (applied after `--show`) |
+| `--record DIR` | - | Record the frames to DIR as numbered PNGs from the first frame (R in the app) |
+| `--every N` | 1 | With `--record`: every N-th frame |
+| `--pick FX,FY` | - | A Ctrl + click at that fraction of the window on frame 10, in the start click mode (focus); prints the point |
 | `--mach M` | 0.8 | Starting transonic Mach number |
 | `--zoom F` | - | Camera distance times F, aimed at the model (F < 1 is nearer) |
-| `--view AZ,EL` | 35, 18 | Camera azimuth and elevation, degrees |
+| `--view AZ,EL` | 35, 18 | Camera azimuth and elevation, degrees (the scripted start view; an interactive run opens on the model, three-quarters from upstream) |
+| `--window WxH` | 80 % of the screen; 1600 x 900 with `--frames` | The window's client size in pixels (at least 320 x 240) |
+| `--ui-scale S` | the saved one; 1 with `--frames` | The UI scale, 0.6 - 2.5, on top of the monitor's own |
 
 On exit the app prints its throughput and timings.
 
@@ -230,10 +245,10 @@ On exit the app prints its throughput and timings.
 The app's `Tunnel` without a window: a headless sandbox session.
 
 ```
-tunnel_run [--preset fast|balanced|fine|ultra] [--model ID] [--batches N] [--steps S]
-           [--spin R] [--rotors L] [--power T] [--tu PCT] [--aoa DEG] [--size CELLS]
-           [--speed U] [--walls sub|half] [--dye] [--f16] [--average]
-           [--probe X,Y,Z ...] [--no-cache]
+tunnel_run [--preset fast|balanced|fine|ultra] [--model ID | --stl FILE] [--batches N]
+           [--steps S] [--spin R] [--rotors L] [--power T] [--tu PCT] [--aoa DEG] [--yaw DEG]
+           [--size CELLS] [--ground air|road|fixed] [--speed U] [--walls sub|half] [--dye]
+           [--f16] [--average] [--probe X,Y,Z ...] [--no-cache] [--csv FILE]
 tunnel_run --list
 tunnel_run --catalogue
 ```
@@ -242,6 +257,9 @@ tunnel_run --catalogue
 |---|---|---|
 | `--preset` | `fast` | Grid preset |
 | `--model ID` | `ahmed_25deg` | Catalogue model, at its default placement |
+| `--stl FILE` | - | Your own model instead (binary or ASCII STL, nose towards $-x$), in free air unless `--ground` |
+| `--ground air\|road\|fixed` | the model's | Free air, a rolling road (ride height 0.06 of the size, at least 4 cells) or a fixed floor |
+| `--yaw DEG` | 0 | Yaw |
 | `--batches N`, `--steps S` | 40, 50 | Run N batches of S steps |
 | `--spin R` | off | Spin ratio |
 | `--rotors L` | parked | Rotors turning at tip-speed ratio L (§3.12) |
@@ -251,13 +269,14 @@ tunnel_run --catalogue
 | `--size CELLS` | the model's | Length of the model's longest axis, cells |
 | `--speed U` | 0.05 | Freestream speed, lattice units (at most `u_max`, 0.11) |
 | `--walls sub\|half` | `sub` | Sub-cell walls (§3.6) or half-way bounce-back (§3.5) |
-| `--dye` | off | Run the dye from a wand ahead of the model |
+| `--dye` | off | Run the dye from the wand at the inlet |
 | `--f16` | off | Half-precision storage (ungated) |
 | `--average` | off | Time averaging once the flow has settled; reports the wake survey (§12.1, §12.2) |
 | `--probe X,Y,Z` | - | A probe at the cell (X, Y, Z); up to four; reports its spectra (§12.4) |
 | `--no-cache` | off | Neither restore nor save a settled flow, so the run develops from rest |
+| `--csv FILE` | - | Append the summary as one row, with a header when the file is new: `model, preset, size_cells, aoa_deg, yaw_deg, ground, u_lattice, speed_mps, re_sim, re_full_size, steps, settled, flow_throughs, cd_mean, cd_sd, cl_mean, cl_sd, cs, cm, st_shedding, a_ref_cells, mlups` (means over the second half of the run) |
 | `--list` | - | Print the catalogue's model IDs, groups and names |
-| `--catalogue` | - | Voxelise every catalogue model at its default placement and report cells, areas and bounds (CTest `P2_catalogue`) |
+| `--catalogue` | - | Voxelise every catalogue model at its default placement and report cells, areas, full size and timings (CTest `P2_catalogue`) |
 
 It prints progress ten times, each line ending with the settling status and the wind as a speed in
 sea-level air (§1.2), then the mean and standard deviation of Cd and Cl over the second half
@@ -291,12 +310,17 @@ euler_run equiv --save DIR | --check DIR    the Euler bit-identity baseline (§1
 
 ```
 bench [fast|balanced|fine|ultra|all] [--steps N]
+bench controls [fast|balanced|fine|ultra]
 ```
 
 Throughput of the lattice Boltzmann solver (plain, with moving boundaries, with dye, with f16
 storage) and of the Euler solver, at each preset. Defaults: `all` (every preset but `ultra`),
-1,000 steps. A measurement, not
-a gate: run it twice before believing a difference.
+1,000 steps. Each figure follows a second of warm-up (the GPU's clocks take about that long to
+rise; a short run once read 2,964 MLUPS where a long one read 3,450) and covers at least the
+steps given and two seconds. `bench controls` measures instead the worker's cost of one speed change, on a model
+with nothing moving, the saloon with its wheels spinning and the open-wheel car with wheels and
+engines (default preset `fast`). A measurement, not a gate: run it twice before believing a
+difference.
 
 ### lbm_equiv
 
@@ -326,22 +350,36 @@ what it compared against and the measured value. See [`docs/VALIDATION.md`](VALI
 
 | Input | Action |
 |---|---|
-| Right mouse drag | Orbit about the focus point |
-| Middle mouse drag | Pan |
+| Left or right mouse drag | Orbit about the focus point |
+| Middle mouse drag, or Shift + drag | Pan |
 | Wheel, or Q / E | Zoom |
+| Double-click | Focus the camera on the point under the cursor |
 | W A S D | Pan the focus point |
-| F | Focus on the model |
+| F | Focus on the model (a glide) |
+| 1 - 9 | The looks |
+| [ / ] | Previous / next model |
+| O | Orbit the camera |
+| R | Record the frames as numbered PNGs (again to stop) |
+| Ctrl + click | Focus, a probe or the smoke at the point under the cursor (quick bar) |
 | Space | Pause / resume the solver |
 | H | Hide the panels (the legends stay) |
 | P | Save a PNG screenshot, panels included |
 | F1 | Help window |
-| Esc | Quit |
+| Esc | Close the help; otherwise press twice within 2 s to quit |
+| Ctrl + = / - / 0 | UI scale up, down, 100 % (steps of 10 %) |
 | Ctrl + click a slider | Type an exact value |
 
 ### Panels
 
 | Panel | Control | Range | Meaning |
 |---|---|---|---|
+| Quick bar | model, with previous / next | the catalogue | Steps through the menu ([ / ]) |
+| Quick bar | wind; unit; presets | 7 - 145 mph (228 - 1,218 transonic); mph / km/h / m/s | The speed in sea-level air at the lattice's Mach number (§1.2); 30 / 70 mph, 50 / 110 km/h, 15 / 30 m/s and the top of the range (transonic: Mach 0.8, 1.2, 1.6) |
+| Quick bar | looks 1 - 9 | - | A whole combination of what is drawn (GUIDE 3.8) |
+| Quick bar | front, side, top, 3/4, rear, tunnel; orbit | - | Camera views (a glide; *tunnel* the whole tunnel); a turntable at a turn in 25 s |
+| Quick bar | sweep (right-click: from, to, period) | 7 - 145 mph or Mach 0.3 - 1.6; 4 - 120 s | The wind eased to and fro between two speeds (default 30 - 70 mph, 20 s) |
+| Quick bar | click mode | focus / probe / smoke | What Ctrl + click does at the point under the cursor |
+| Quick bar | moving textures; record (R) | - | Slice LIC and oil flow travel with the flow (§10.8); frames to `screenshots/rec_<time>` |
 | Tunnel | regime | subsonic / transonic | The solver (§8) |
 | Tunnel | flow speed | 0.005 - `u_max` (7 - 145 mph) | Freestream command, shown with its Mach-matched speed in sea-level air (§1.2); a change over 10 % re-develops (§9.2) |
 | Tunnel | inlet turbulence % | 0 - 2 | Synthetic inlet turbulence (§7) |
@@ -358,9 +396,11 @@ what it compared against and the measured value. See [`docs/VALIDATION.md`](VALI
 | Model | rotors turning; tip-speed ratio | 0 - 12 (starts at the rotor's design ratio) | Tip speed over wind speed; shows $C_T$, $C_P$ and a warning past 5 % of the section swept (§3.12) |
 | Model | engines (jets / intakes); throttle | 0 - 3 | Each port's speed ratio (subsonic) or exit pressure (transonic) times the throttle (§3.11, §8.12) |
 | Compare | save as A, save as B | - | Snapshot the coefficients and show B - A |
-| View | surface | hidden / voxel / smooth | How the body is drawn |
+| Compare | append to results.csv | - | A row of `results/results.csv` (gitignored): `time, model, preset, size_cells, aoa_deg, yaw_deg, roll_deg, ground, regime, speed_mps, speed_mph, re_sim, re_full_size, steps, settled, flow_throughs, cd, cl, cs, cm, a_ref_cells` |
+| View | surface | hidden / voxels / smoothed cells / true shape (mesh) | How the body is drawn: the solver's cells, or the model's own triangles (the default; §10.10) |
 | View | surface paint | none / pressure (Cp) / near-wall speed / reversed flow / oil flow | What the surface shows (§10.2, §10.7) |
 | View | field | speed / pressure / vorticity / streamwise vorticity / Mach / schlieren / mean speed / turbulence intensity | The field for the haze and the slice (§10.1, §12.1); the last two need time averaging |
+| View | colour map; colour range; log scale | the field's own / sequential / diverging / greyscale; x 0.1 - 5 | The field's colouring and the value that fills its scale (§10.1) |
 | View | flow haze; strength; floor | 0.2 - 4; 0 - 0.5 | The translucent field and its cut-off |
 | View | field slice; slice pos | off / x-y / x-z / y-z; 0.02 - 0.98 | An opaque plane of the field |
 | View | flow texture (LIC); velocity arrows; arrow spacing | -; -; 2 - 12 cells | The slice's in-plane flow as a texture or as arrows (§10.8, §10.9) |
@@ -369,9 +409,10 @@ what it compared against and the measured value. See [`docs/VALIDATION.md`](VALI
 | View | dye smoke; density; colour by speed | 0.2 - 10 | The transported dye (§6) |
 | View | vortex cores (Q); Q threshold | 0.1 - 10 | Q-criterion shells; threshold in multiples of the adaptive level (§10.3) |
 | View | mean reversed flow | - | Shells where the time-averaged streamwise flow runs backwards (§12.1) |
-| View | smoke tracks / fit model; height, width, y, z, detail | - | The smoke wand's position and size |
+| View | smoke follows the model / fit to model; height, width; smoke y, z (inlet); detail | -; 0.03 - 0.5; 0.02 - 0.98 | The smoke wand at the inlet: centred on the model's y, z, or placed there by y / z (fractions) or a Ctrl + click |
 | View | time plots; refit plots; tunnel box | - | The Cd / Cl / Cm strips; the domain outline |
 | View | render quality; render scale; field of view | 32 - 256 steps; 0.25 - 1; 20 - 90 deg | Ray-march samples; resolution; camera |
+| View | UI scale; UI font | 60 - 250 %; Segoe UI (system) / built-in | Text and panel size on top of the monitor's scale (Ctrl + = / - / 0); remembered between runs |
 | Analysis | average the flow; restart | - | Time averaging of the developed flow (§12.1) |
 | Analysis | show planes; auto plane; survey plane x | -; -; 1 - $n_x - 2$ | The wake survey's planes, drawn in the view, and the survey plane's position (§12.2) |
 | Analysis | probes; x y z | 0 - 4; cells | Probe positions, drawn as coloured crosses (§12.4) |

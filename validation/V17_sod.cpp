@@ -40,7 +40,7 @@ int main() {
         }
         const auto w = s.primitive();
         auto rho_at = [&](int x, int y, int z) {
-            return double(w[5 * ((std::size_t(x) * NY + y) * NZ + z)]);
+            return double(w[5 * (Grid{NX, NY, NZ}.index(x, y, z))]);
         };
         std::vector<double> rho(NX), rho_e(NX);
         double num = 0, den = 0, sym = 0;
@@ -51,9 +51,8 @@ int main() {
             num += std::abs(rho[x] - rho_e[x]);
             den += std::abs(rho_e[x]);
             for (int k = 0; k < 5; ++k) // all primitives, (0,0) vs (1,1)
-                sym = std::max(sym,
-                               double(std::abs(w[5 * ((std::size_t(x) * NY + 0) * NZ + 0) + k] -
-                                               w[5 * ((std::size_t(x) * NY + 1) * NZ + 1) + k])));
+                sym = std::max(sym, double(std::abs(w[5 * (Grid{NX, NY, NZ}.index(x, 0, 0)) + k] -
+                                                    w[5 * (Grid{NX, NY, NZ}.index(x, 1, 1)) + k])));
             if (rho_e[x] > 0.125 + 1e-6)
                 shock_ex = x;
         }

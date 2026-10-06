@@ -25,8 +25,6 @@ using namespace windoa;
 
 namespace {
 
-// e_x and weights per D3Q19 direction (engine/shaders/lattice.glsl order).
-constexpr int kEx[lbm::Q] = {0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, 0, 0, 0, 0};
 constexpr double kWq[lbm::Q] = {1.0 / 3,  1.0 / 18, 1.0 / 18, 1.0 / 18, 1.0 / 18,
                                 1.0 / 18, 1.0 / 18, 1.0 / 36, 1.0 / 36, 1.0 / 36,
                                 1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36,
@@ -52,7 +50,7 @@ double reflection(Context& ctx, int sponge, int target) {
     const std::size_t n = std::size_t(NX) * NY * NZ;
     std::vector<float> f0(lbm::Q * n);
     for (int i = 0; i < lbm::Q; ++i) {
-        const double eu = kEx[i] * U;
+        const double eu = lattice::E[std::size_t(i)][0] * U;
         for (int x = 0; x < NX; ++x) {
             const double rho = 1.0 + AMP * std::exp(-((x - X0) / SIG) * ((x - X0) / SIG));
             const auto v = float(kWq[i] * rho * (1 + 3 * eu + 4.5 * eu * eu - 1.5 * U * U));

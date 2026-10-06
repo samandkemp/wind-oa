@@ -52,7 +52,7 @@ Blob blob(Context& ctx, float tau_d) {
                                   (y + 0.5 - NY / 2.0) * (y + 0.5 - NY / 2.0) +
                                   (z + 0.5 - NZ / 2.0) * (z + 0.5 - NZ / 2.0);
                 const float v = float(std::exp(-r2 / (2 * S0 * S0)));
-                c0[(std::size_t(x) * NY + y) * NZ + z] = v;
+                c0[Grid{NX, NY, NZ}.index(x, y, z)] = v;
                 m0 += v;
             }
     d.set_concentration(c0);
@@ -63,7 +63,7 @@ Blob blob(Context& ctx, float tau_d) {
     for (int x = 0; x < NX; ++x)
         for (int y = 0; y < NY; ++y)
             for (int z = 0; z < NZ; ++z) {
-                const double v = cc[(std::size_t(x) * NY + y) * NZ + z];
+                const double v = cc[Grid{NX, NY, NZ}.index(x, y, z)];
                 px[x] += v;
                 py[y] += v;
                 m += v;
@@ -122,7 +122,7 @@ int main() {
             c.mode_z = lbm::AxisYZ::Periodic;
             lbm::Solver s(ctx, c);
             std::vector<std::uint8_t> flags(s.cells(), lbm::FLUID);
-            auto at = [&](int x, int y, int z) { return (std::size_t(x) * NY + y) * NZ + z; };
+            auto at = [&](int x, int y, int z) { return Grid{NX, NY, NZ}.index(x, y, z); };
             for (int x = 0; x < NX; ++x)
                 for (int z = 0; z < NZ; ++z) {
                     flags[at(x, NY / 2 - 1, z)] = flags[at(x, NY / 2, z)] =

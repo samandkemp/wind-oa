@@ -51,8 +51,8 @@ third-party library, Dear ImGui, is already vendored in `third_party/`.
 ### 1.2 Editor setup
 
 Any editor works. With VS Code, the Microsoft C/C++ extension provides IntelliSense and the
-`clang-format` binary the project's `.clang-format` uses (format on save). Source files are ASCII
-only.
+`clang-format` binary the project's `.clang-format` uses; turn on format on save, and the CMake
+Tools extension's use of the presets. Source files are ASCII only.
 
 ### 1.3 First build
 
@@ -87,9 +87,9 @@ build\app\RelWithDebInfo\windoa_app [fast|balanced|fine|ultra] [transonic] [--mo
 
 | Preset | Grid | Cells | Typical speed while rendering |
 |---|---|---|---|
-| fast (default) | 256 x 96 x 96 | 2.4 M | about 3,150 MLUPS |
+| fast (default) | 256 x 96 x 96 | 2.4 M | about 3,400 MLUPS |
 | balanced | 320 x 128 x 128 | 5.2 M | |
-| fine | 384 x 160 x 160 | 9.8 M | about 2,400 MLUPS with vortex cores on |
+| fine | 384 x 160 x 160 | 9.8 M | about 3,000 MLUPS; 2,700 with vortex cores on |
 | ultra | 512 x 192 x 192 | 18.9 M | about 160 steps a second: for patient studies, mostly headless |
 
 MLUPS is millions of lattice cell updates per second. The app finds the repository root itself:
@@ -108,22 +108,35 @@ graphics queue, so the window stays smooth however hard the solver works.
 
 | Input | Action |
 |---|---|
-| Right mouse drag | Orbit about the focus point |
-| Middle mouse drag | Pan |
+| Left or right mouse drag | Orbit about the focus point |
+| Middle mouse drag, or Shift + drag | Pan (Shift for a touchpad or a mouse without a middle button) |
 | Wheel, or Q / E | Zoom |
+| Double-click | On the model or a slice: focus the camera there |
 | W A S D | Pan the focus point |
 | F | Focus on the model |
+| 1 - 9 | The looks (section 3.8) |
+| [ / ] | Previous / next model |
+| O | Orbit the camera (a turntable) |
+| R | Record the frames as numbered PNGs (again to stop) |
+| Ctrl + click | On the model or a slice: focus the camera there, place a probe, or move the smoke (section 3.8) |
 | Space | Pause / resume the solver |
 | H | Hide the panels (the legends stay, for screenshots) |
 | P | Save a PNG screenshot, panels included |
 | F1 | Help |
-| Esc | Quit |
+| Esc, twice | Quit (the first press asks; a second within 2 s quits) |
+| Ctrl + = / - / 0 | The UI scale: larger, smaller, 100 % |
 | Ctrl + click a slider | Type an exact value |
 
-Panels can be dragged, docked and resized, and the layout is remembered. A layout that does not
-fit the window (one saved on a larger screen, or after the window shrinks) is put back to the
-starting arrangement for the current size; *reset layout* in the View panel does the same on
-demand.
+Panels can be dragged, docked and resized. When the window is resized, an undocked panel keeps its
+distance to its nearer edges; a layout that still does not fit is put back to the starting
+arrangement for the current size, and *reset layout* in the View panel does the same on demand.
+Panels are sized in multiples of the text, so they suit any window.
+
+Text and panels scale together with Ctrl + = / - / 0 or the View panel's *UI scale*, on top of the
+monitor's own scaling (moving the window to another monitor follows its scale). The UI scale, the
+font (the system's Segoe UI or Dear ImGui's built-in one), the speed unit and the render scale are
+remembered between runs. The window opens at 80 % of the screen, on the model seen
+three-quarters from upstream; *tunnel* on the quick bar shows the whole tunnel.
 
 ### 3.2 The Tunnel panel
 
@@ -136,8 +149,10 @@ the flow controls.
   speed in sea-level air, for example "SETTLED after 2.5 flow-throughs at 29.5 m/s (66 mph)".
 - **Cd, Cl, Cs** are the drag, lift and side-force coefficients, over $q A_{\mathrm{ref}}$; **Cm_z**
   is the pitching moment about the model's centre, over $q A_{\mathrm{ref}} L$.
-- **Re_sim** is the Reynolds number actually simulated, about $10^3$. A car at motorway speed is
-  about $4 \times 10^6$, so absolute Cd is qualitative and comparisons are trustworthy (Part 3).
+- **Re_sim** is the Reynolds number actually simulated, about $10^3$. The grey line beneath gives
+  the Reynolds number the real object would have at the speed shown (the saloon at 66 mph: 9.4
+  million), so the gap is in front of you: absolute Cd is qualitative and comparisons are
+  trustworthy (Part 3).
 - **flow speed** is in lattice units (Mach = $u \sqrt{3}$, kept under about 0.19), shown beside
   its speed in mph: the speed in sea-level air at the same Mach number, from 7 mph at the bottom of
   the slider to 145 mph at the top (66 mph at the default 0.05). It matches the compressibility,
@@ -183,11 +198,12 @@ the flow controls.
 
 | View | Shows |
 |---|---|
-| *surface* smooth / voxel | The body at the wall the solver uses (smooth), or its cells |
+| *surface* | The model's **true shape**, from its own triangles and sharp at any zoom (the start); the **voxels** the solver treats as solid, which is what the flow meets; or those cells **smoothed**. The paints read the same flow in every case (THEORY §10.10) |
 | *surface paint* | What the model is painted with: **pressure (Cp)**, red compression and blue suction against an upstream reference plane (a Pitot-static); **near-wall speed**, the flow one cell off the surface, which scales with the skin friction; **reversed flow**, blue where the near-wall flow runs upstream (separated); or **oil flow**, streaks along the near-wall flow as in a tunnel oil-film test |
 | *field* + *flow haze* | The chosen field through the tunnel, translucent; undisturbed flow is invisible |
+| *colour map*, *colour range*, *log scale* | The field's colouring: its own map, a sequential (viridis-like), diverging or greyscale one; the value that fills the scale (below 1 more contrast); a log that opens up the weak end (THEORY §10.1) |
 | *field slice* | The same field on a plane: vertical, horizontal or cross-stream; optionally with a **flow texture (LIC)**, noise smeared along the in-plane flow so every streamline shows at once, and **velocity arrows** on a grid |
-| *smoke* | Particles from the smoke wand (the cyan rectangle): **streaklines**, released continuously like tunnel smoke, or **timelines**, a line released across the wand every few steps like a pulsed hydrogen-bubble wire, whose bending shows the velocity profile |
+| *smoke* | Particles from the smoke wand (the cyan rectangle at the inlet, so the smoke runs the whole tunnel; it follows the model's height and span, or *smoke y / z* place it on the inlet): **streaklines**, released continuously like tunnel smoke, or **timelines**, a line released across the wand every few steps like a pulsed hydrogen-bubble wire, whose bending shows the velocity profile |
 | *dye smoke* | A transported concentration from nozzles on the wand, which fills the wake; coloured by local speed (violet still, yellow fast) or white |
 | *streamlines* | Instantaneous field lines; they differ from smoke when the wake is unsteady |
 | *vortex cores (Q)* | Where rotation beats strain, as translucent shells (green at the threshold, amber at 4x); the threshold adapts to the flow's own vorticity |
@@ -203,7 +219,9 @@ along the top follow what is on.
 ### 3.5 Compare and the plots
 
 *save as A* and *save as B* snapshot the coefficients and show the difference: the honest way to use
-a sandbox at this Reynolds number. Along the bottom the Cd, Cl and Cm plots scroll; their scale only
+a sandbox at this Reynolds number. *append to results.csv* adds the model, its placement, the wind
+and the coefficients as a row of `results/results.csv`, a table to compare in a spreadsheet (wait for
+SETTLED first; section 10 has the headless way). Along the bottom the Cd, Cl and Cm plots scroll; their scale only
 ever expands, so small fluctuations never look like waves, and *refit plots* refocuses on the recent
 history (which happens by itself once settled).
 
@@ -232,9 +250,15 @@ windoa_app --model airliner --aoa 6 --show "q,lines,nosmoke" --warmup 8000 --fra
 ```
 
 `--warmup` develops the flow before the first frame, `--frames` exits after that many and `--shot`
-saves the last one. `--zoom` moves the camera nearer the model and `--view AZ,EL` sets its azimuth
+saves the last one. A scripted run opens a 1600 x 900 window (`--window WxH` for another size) on
+the whole tunnel, the view that `--zoom` and `--view` refer to, and ignores the saved UI scale
+(`--ui-scale` sets one), so the same command gives the same picture. `--zoom` moves the camera nearer the model and `--view AZ,EL` sets its azimuth
 and elevation in degrees; `--size` sets the model's length in cells, `--mach` the transonic Mach
-number, and `--rotors` and `--power` start the rotors and the engines. The view flags (`--show`) cover
+number, `--rotors` and `--power` start the rotors and the engines, and `--look N` applies one of
+the looks of section 3.8 (after `--show`). Scripted runs keep flow textures still, so a picture
+repeats; the `animate` show token sets them moving, and `sequential`, `greyscale` and `logscale`
+choose the colouring. `--record DIR` (with `--every N`) writes the frames as numbered PNGs, and
+`--pick FX,FY` makes a Ctrl + click at that fraction of the window on frame 10. The view flags (`--show`) cover
 every overlay, the slices (`slice`, `hslice`, `xslice`) and the clean-picture switches (`noui`,
 `noplots`, `nobox`, `nosurface`); REFERENCE lists them all.
 
@@ -250,6 +274,37 @@ windoa_app --model car_saloon --show "oil,nohaze,nosmoke,noui,noplots" --zoom 0.
 windoa_app transonic --mach 0.8 --model wing_naca0012 --aoa 2 --field mach --show "slice,noui,noplots,nobox" --zoom 0.3 --view 90,0 --warmup 8000 --frames 120 --shot transonic_wing.png
 windoa_app transonic --mach 1.5 --model aim120 --size 90 --power 1 --field schlieren --show "slice,noui,noplots,nobox,nosurface" --zoom 0.55 --view 90,0 --warmup 20000 --frames 120 --shot missile_plume.png
 ```
+
+### 3.8 The quick bar and the looks
+
+The strip at the top centre holds what is worth reaching for while playing:
+
+- **The model**, with arrows (or `[` and `]`) to step through the catalogue.
+- **The wind**, in mph, km/h or m/s, with buttons for familiar speeds (30 and 70 mph, 50 and
+  110 km/h) and the top of the range. The figure is the speed of sea-level air at the lattice's
+  Mach number (THEORY §1.2); in transonic mode the same slider sets the Mach number.
+- **The looks**, keys 1 - 9, each a whole combination of what is drawn: *tunnel* (smoke, speed haze
+  and surface pressure, the start look), *smoke* (streaks over a plain body), *pressure* (surface
+  Cp and a pressure slice through the model), *vortices* (vortex cores in a haze of streamwise
+  vorticity), *texture* (a moving flow texture on a slice), *oil* (oil-flow streaks), *dye*,
+  *wake* (the time-averaged wake and its recirculation shells; it switches averaging on, so it
+  fills in once the flow has settled) and *schlieren* (density gradients: shocks in transonic
+  mode, sound waves below it). A look switches off what it does not use; the View panel then
+  adjusts it.
+- **The camera views**: front, side, top, three-quarters and rear, or the whole tunnel, gliding
+  there; *orbit* (or `O`) turns the camera slowly round the model. The quick bar is always drawn
+  over the panels.
+- **Sweep** eases the wind to and fro between two speeds (30 and 70 mph over 20 s unless set
+  otherwise; right-click the box to change them, or the Mach numbers in transonic mode). It is a
+  way to watch a wake respond to speed; the coefficients re-develop as it goes.
+- **Ctrl + click** on the model or a slice does what the choice beside the camera views says:
+  *focus* glides the camera's centre of turn to that point, *probe* places the next of the four
+  probes there, *smoke* aims the smoke there (the wand stays at the inlet and moves to that height
+  and span).
+- **Moving textures**: the slice texture and the oil-flow streaks travel with the flow
+  (THEORY §10.8). **Record** (or `R`) writes every frame as a numbered PNG to
+  `screenshots/rec_<time>`; H hides the panels for clean frames, and a background thread writes
+  them so the window keeps its pace. Pause and reset are repeated here too.
 
 # Part 2 - Building situations
 
@@ -291,7 +346,9 @@ Drop a binary or ASCII STL file into `models/` and restart the app; it appears u
 Author it nose towards $-x$ (the flow runs in $+x$). It is scaled so its longest axis equals the
 size slider, so its units do not matter. Imperfect meshes are tolerated (a winding-rule fill with a
 two-of-three axis vote), as are overlapping parts and zero-thickness sheets; parts thinner than a
-cell are kept one cell thick. Imported STL files are gitignored and never committed.
+cell are kept one cell thick. The view draws the model's own triangles, so its detail shows at any
+zoom. `tunnel_run --stl FILE` runs the same model headless, with `--ground` and `--yaw` for its
+placement (section 10). Imported STL files are gitignored and never committed.
 
 ### 4.6 Rotors
 
@@ -381,7 +438,7 @@ The tools drive the engine without a window, so a study can run unattended and r
 
 | Tool | For |
 |---|---|
-| `tunnel_run` | The app's sandbox headless: any catalogue model, size, speed, spin, rotors, engines, angle, turbulence, dye, f16 or half-way walls, reporting settled means, the lift spectrum, the rotors' coefficients and, with `--average`, the wake survey |
+| `tunnel_run` | The app's sandbox headless: any catalogue model or your own STL (`--stl`), size, speed, spin, rotors, engines, angles, ground, turbulence, dye, f16 or half-way walls, reporting settled means, the lift spectrum, the rotors' coefficients and, with `--average`, the wake survey; `--csv` appends the summary to a table |
 | `lbm_run` | A sphere or any STL in a bare solver, with the collision and boundary options exposed |
 | `euler_run sphere M` | A sphere in the compressible solver at Mach M |
 | `bench` | Throughput at each preset |
@@ -450,6 +507,24 @@ The same study answers a second question with one flag: `--walls half` runs the 
 instead of the sub-cell walls. It reads Cd 0.7135 (sd 0.0021), 5.3 % more drag, with two thirds of the
 lift and a weaker shedding peak (St 0.116): on a body with sharp edges and a slant, where the
 wall sits matters at this resolution (THEORY §3.9).
+
+### Comparing several models
+
+A comparison is a set of runs that differ in one thing. `--csv FILE` appends each run's summary as
+one row of a table (with a header when the file is new), so a loop over models, sizes or angles
+becomes one sheet:
+
+```
+foreach ($m in "car_saloon", "car_wing", "ahmed_25deg") {
+    build\tools\RelWithDebInfo\tunnel_run --model $m --size 64 --ground road --batches 300 --steps 100 --csv results\compare.csv
+}
+build\tools\RelWithDebInfo\tunnel_run --stl models\my_car.stl --size 64 --ground road --batches 300 --steps 100 --csv results\compare.csv
+```
+
+Hold the size, the speed, the preset and the ground fixed across the runs, since at this Reynolds
+number the coefficients depend on all of them (section 7); check that every row says `settled` 1,
+and compare the second-half means against their spread (`cd_sd`). The columns are listed in
+REFERENCE; the app's *append to results.csv* writes the same ones where they overlap.
 
 ## 11. Averages, the wake survey and spectra
 
@@ -561,6 +636,11 @@ Write the GLSL under the module's `shaders/` directory and add it with
   size or the turn.
 - **A panel has gone missing.** It may be folded or docked somewhere unexpected: *reset layout* in
   the View panel puts every panel back (H toggles them all).
+- **A red message on the Tunnel panel.** A change could not be applied (the message says why), or
+  the solver itself failed and stopped; *resume the solver* tries again. If it stops again at once,
+  restart the app.
+- **An imported model is refused.** The voxeliser takes up to 1,048,576 triangles, and a file with
+  non-finite coordinates cannot be placed; the message under the panels says which.
 
 ### Studies
 

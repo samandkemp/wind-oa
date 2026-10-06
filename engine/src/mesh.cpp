@@ -55,6 +55,14 @@ Mesh load_stl(const std::string& path) {
         throw std::runtime_error("cannot open " + path);
     const std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 
+    // A NaN or infinite coordinate would poison the bounds every placement
+    // is fitted to, so such a file is refused rather than voxelised.
+    auto checked = [&](Mesh m) {
+        for (const float v : m.xyz)
+            if (!std::isfinite(v))
+                throw std::runtime_error("non-finite vertex coordinates in " + path);
+        return m;
+    };
     // Binary sanity check: the declared size must match the actual size.
     if (raw.size() >= 84) {
         std::uint32_t count = 0;
@@ -67,10 +75,10 @@ Mesh load_stl(const std::string& path) {
                 std::memcpy(&m.xyz[std::size_t{t} * 9], raw.data() + 84 + std::size_t{t} * 50 + 12,
                             36);
             }
-            return m;
+            return checked(std::move(m));
         }
     }
-    return parse_ascii(raw);
+    return checked(parse_ascii(raw));
 }
 
 void save_stl(const std::string& path, const Mesh& mesh) {

@@ -10,6 +10,7 @@ namespace windoa::app {
 
 class Window {
   public:
+    // Client area width x height in pixels; 0 x 0 = 80 % of the screen.
     Window(const wchar_t* title, int width, int height);
     ~Window();
     Window(const Window&) = delete;

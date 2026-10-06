@@ -3,6 +3,9 @@
 add_executable(windoa_app
     src/main.cpp
     src/app.cpp
+    src/overlays.cpp
+    src/panels.cpp
+    src/play.cpp
     src/sim.cpp
     src/window.cpp
     src/swapchain.cpp

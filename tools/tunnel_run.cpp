@@ -1,5 +1,6 @@
 // Headless sandbox run: the app's Tunnel without a window. A development
 // tool (not a gate). kUsage below is the reference for the command line.
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -7,9 +8,11 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
+#include "windoa/airspeed.hpp"
 #include "windoa/catalogue.hpp"
 #include "windoa/context.hpp"
 #include "windoa/tunnel.hpp"
@@ -27,12 +30,17 @@ const char* const kUsage =
   --preset fast|balanced|fine|ultra
                                 grid preset (default fast)
   --model ID                    catalogue model (default ahmed_25deg)
+  --stl FILE                    your own model instead: a binary or ASCII STL,
+                                nose towards -x (scaled to --size, default 64)
+  --ground air|road|fixed       free air, a rolling road or a fixed floor
+                                (default: the catalogue model's own, air for --stl)
   --batches N                   batches to run (default 40)
   --steps S                     steps per batch (default 50)
   --spin R                      spin ratio, rim speed / U (models with spinners)
   --dye                         dye smoke on
   --tu PCT                      inlet turbulence intensity, percent
   --aoa DEG                     pitch, degrees
+  --yaw DEG                     yaw, degrees
   --size CELLS                  the model's longest axis, cells (default: its own)
   --speed U                     the freestream, lattice units (default 0.05; at most 0.11)
   --f16                         f16 distribution storage (an ungated approximation)
@@ -42,6 +50,9 @@ const char* const kUsage =
   --walls sub|half              sub-cell walls (default) or half-way bounce-back
   --rotors L                    rotors turning at tip-speed ratio L (models with rotors)
   --power T                     engines on at throttle T (models with jets / intakes)
+  --csv FILE                    append the run's summary as one row (a header
+                                when the file is new): runs of several models,
+                                sizes or angles become one comparison table
   -h, --help                    this text
 
 The summary gives the second-half means and the lift spectrum's peak as a
@@ -52,10 +63,10 @@ Strouhal number on the body's height (THEORY 12.3).
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0); // progress survives a crash
-    std::string preset = "fast", model_id = "ahmed_25deg";
+    std::string preset = "fast", model_id = "ahmed_25deg", stl, ground, csv;
     int batches = 40, steps = 50;
-    float spin = -1.0f, tu = 0.0f, aoa = 0.0f, rotors = -1.0f, power = -1.0f, size = 0.0f,
-          speed = 0.0f;
+    float spin = -1.0f, tu = 0.0f, aoa = 0.0f, yaw = 0.0f, rotors = -1.0f, power = -1.0f,
+          size = 0.0f, speed = 0.0f;
     bool dye = false, catalogue_check = false, f16 = false, average = false, no_cache = false,
          half_walls = false;
     std::vector<std::array<float, 3>> probes;
@@ -66,7 +77,19 @@ int main(int argc, char** argv) {
             preset = next();
         else if (s == "--model")
             model_id = next();
-        else if (s == "--batches")
+        else if (s == "--stl")
+            stl = next();
+        else if (s == "--csv")
+            csv = next();
+        else if (s == "--yaw")
+            yaw = float(std::atof(next()));
+        else if (s == "--ground") {
+            ground = next();
+            if (ground != "air" && ground != "road" && ground != "fixed") {
+                std::fprintf(stderr, "--ground takes air, road or fixed\n");
+                return 2;
+            }
+        } else if (s == "--batches")
             batches = std::atoi(next());
         else if (s == "--steps")
             steps = std::atoi(next());
@@ -146,25 +169,46 @@ int main(int argc, char** argv) {
                 const TunnelStatus st = tunnel.status();
                 const bool ok = st.n_solid > 0 && !st.out_of_bounds;
                 bad += ok ? 0 : 1;
-                std::printf(
-                    "%-22s %-18s %7zu tris %8zu cells  front %6.0f  plan %6.0f  %5.0f+%4.0f ms%s\n",
-                    e.id.c_str(), e.group.c_str(), st.n_tris, st.n_solid, st.a_frontal,
-                    st.a_planform, build_ms, st.vox_ms, ok ? "" : "  <-- CHECK");
+                char full[24] = "    -";
+                if (st.full_scale_length_m > 0.0)
+                    std::snprintf(full, sizeof(full), "%7.3g m", st.full_scale_length_m);
+                std::printf("%-22s %-18s %7zu tris %8zu cells  front %6.0f  plan %6.0f  full size "
+                            "%s  %5.0f+%4.0f ms%s\n",
+                            e.id.c_str(), e.group.c_str(), st.n_tris, st.n_solid, st.a_frontal,
+                            st.a_planform, full, build_ms, st.vox_ms, ok ? "" : "  <-- CHECK");
             }
             std::printf("%zu models, %d flagged\n", catalogue::entries().size(), bad);
             return bad ? 1 : 0;
         }
 
-        const catalogue::Entry* e = catalogue::find(model_id);
-        if (!e) {
-            std::printf("no catalogue model '%s' (tunnel_run --list)\n", model_id.c_str());
-            return 2;
+        Model m;
+        Placement p;
+        std::string name = model_id;
+        if (!stl.empty()) { // your own model: free air, centred, unless told otherwise
+            m = model_from_stl(stl);
+            name = std::filesystem::path(stl).filename().string();
+        } else {
+            const catalogue::Entry* e = catalogue::find(model_id);
+            if (!e) {
+                std::printf("no catalogue model '%s' (tunnel_run --list)\n", model_id.c_str());
+                return 2;
+            }
+            m = model_from_catalogue(*e);
+            p = default_placement(*e, ts, m.mesh);
         }
-        Model m = model_from_catalogue(*e);
-        Placement p = default_placement(*e, ts, m.mesh);
         if (size > 0.0f)
             p.length_cells = size;
+        if (!ground.empty()) { // as the app's placement control sets it
+            p.ground = ground == "road"    ? catalogue::Ground::Road
+                       : ground == "fixed" ? catalogue::Ground::Fixed
+                                           : catalogue::Ground::Air;
+            p.ride_height =
+                p.ground == catalogue::Ground::Road ? std::max(4.0f, 0.06f * p.length_cells) : 0.0f;
+            if (p.ground == catalogue::Ground::Air)
+                p.pos_frac[1] = 0.5f;
+        }
         p.aoa_deg = aoa;
+        p.yaw_deg = yaw;
         tunnel.set_model(std::move(m), p);
         if (spin >= 0.0f)
             tunnel.set_spin(true, spin);
@@ -183,8 +227,7 @@ int main(int argc, char** argv) {
         if (dye) {
             const TunnelStatus st = tunnel.status();
             tunnel.set_dye(true);
-            tunnel.set_dye_rake(std::max(4.0f, st.placed_centre[0] - 0.18f * ts.nx),
-                                st.placed_centre[1], st.placed_centre[2], 0.1f * ts.ny,
+            tunnel.set_dye_rake(ts.rake_x, st.placed_centre[1], st.placed_centre[2], 0.1f * ts.ny,
                                 0.1f * ts.nz);
         }
         const auto t0 = std::chrono::steady_clock::now();
@@ -242,6 +285,15 @@ int main(int argc, char** argv) {
             }
         }
         const TunnelStatus st = tunnel.status();
+        const double run_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        double mean_cd = st.cd, mean_cl = st.cl, sd_cd = 0.0, sd_cl = 0.0;
+        if (n_avg > 1) {
+            mean_cd = sum_cd / n_avg;
+            mean_cl = sum_cl / n_avg;
+            sd_cd = std::sqrt(std::max(sq_cd / n_avg - mean_cd * mean_cd, 0.0));
+            sd_cl = std::sqrt(std::max(sq_cl / n_avg - mean_cl * mean_cl, 0.0));
+        }
         if (n_avg > 1) {
             const double mcd = sum_cd / n_avg, mcl = sum_cl / n_avg;
             std::printf("second-half mean: Cd %.4f (sd %.4f)  Cl %.4f (sd %.4f)  over %d batches\n",
@@ -291,8 +343,45 @@ int main(int argc, char** argv) {
                         100.0 * st.rotor_blockage);
         if (st.has_ports)
             std::printf("engines %s, jet scale %.3f\n", st.power_on ? "on" : "off", st.jet_scale);
+        if (st.full_scale_length_m > 0.0)
+            std::printf("wind %s: full size (%.3g m) at that speed Re %.2g, this run Re %.0f\n",
+                        airspeed::describe(st.airspeed_mach).c_str(), st.full_scale_length_m,
+                        st.full_scale_re, st.re_sim);
+        else
+            std::printf("wind %s: this run Re %.0f\n", airspeed::describe(st.airspeed_mach).c_str(),
+                        st.re_sim);
         std::printf("spin scale %.3f, cache: %s (%d entries)\n", st.spin_scale,
                     st.cache_note.c_str(), st.cache_entries);
+        std::printf("voxelised %zu triangles to %zu cells in %.0f ms (walls included)\n", st.n_tris,
+                    st.n_solid, st.vox_ms);
+        if (!csv.empty()) { // one row per run, a header for a new file
+            std::error_code ec;
+            const bool fresh =
+                !std::filesystem::exists(csv, ec) || std::filesystem::file_size(csv, ec) == 0;
+            std::ofstream out(csv, std::ios::app);
+            if (!out) {
+                std::printf("FAIL: cannot write %s\n", csv.c_str());
+                return 1;
+            }
+            if (fresh)
+                out << "model,preset,size_cells,aoa_deg,yaw_deg,ground,u_lattice,speed_mps,"
+                       "re_sim,re_full_size,steps,settled,flow_throughs,cd_mean,cd_sd,cl_mean,"
+                       "cl_sd,cs,cm,st_shedding,a_ref_cells,mlups\n";
+            static const char* kGround[] = {"air", "road", "fixed"};
+            char row[512];
+            std::snprintf(row, sizeof(row),
+                          "\"%s\",%s,%.0f,%.2f,%.2f,%s,%.4f,%.2f,%.0f,%.4g,%lld,%d,%.2f,%.5f,%.5f,"
+                          "%.5f,%.5f,%.5f,%.5f,%.4f,%.1f,%.0f\n",
+                          name.c_str(), preset.c_str(), p.length_cells, aoa, yaw,
+                          kGround[std::clamp(int(p.ground), 0, 2)], st.u_applied,
+                          airspeed::metres_per_second(st.airspeed_mach), st.re_sim,
+                          st.full_scale_re, static_cast<long long>(st.steps), st.settled ? 1 : 0,
+                          st.flow_throughs, mean_cd, sd_cd, mean_cl, sd_cl, st.cs, st.cm,
+                          a.st_shedding, st.a_ref,
+                          double(ts.nx) * ts.ny * ts.nz * double(batches) * steps / run_sec / 1e6);
+            out << row;
+            std::printf("appended the summary to %s\n", csv.c_str());
+        }
         if (no_cache)
             std::filesystem::remove_all(cache_dir);
         return 0;

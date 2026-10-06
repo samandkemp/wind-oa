@@ -72,17 +72,28 @@ flowchart TB
     I -- "commands posted as closures" --> T
 ```
 
-The worker runs batches of solver steps sized to about 16 ms of GPU time, and after a batch copies
-the fields the renderer needs into one of two snapshot slots, signalling a timeline semaphore. A
-frame takes the latest published slot and makes its own GPU submission wait for that semaphore
-value, so the CPU never blocks. Before overwriting a slot, the worker waits until every frame that
-read it has finished. Commands from the panels (a new model, a speed change) are closures run on
-the worker between batches, so the `Tunnel` is only ever touched by one thread.
+The worker runs batches of solver steps sized to about 16 ms of GPU time and keeps one in flight:
+it submits the next batch, then takes the readings of the one before it while the new one runs
+(THEORY §11.10). A batch can carry, at its end, a copy of the fields the renderer needs into a free
+snapshot slot (of three: one drawn, one being written, one free), signalling a timeline semaphore;
+the slot becomes the latest once the batch has completed, so a frame never waits on the solver.
+Before overwriting a slot, the worker waits until every frame that read it has finished. Commands from the panels (a new model, a speed change) are closures run on
+the worker between batches, so the `Tunnel` is only ever touched by one thread. A slider posts a
+command every frame it moves, so those carry a key: a newer command supersedes a pending one with
+the same key, and the worker applies only the latest value. If a command or a batch fails, the
+Tunnel panel says so in red; a failed batch stops the solver until *resume the solver* is pressed.
+New flow is published only once a frame has taken the previous snapshot, so the copies keep pace
+with the display and stop while the window is minimised. With new geometry the worker also hands
+over the placed model's triangles, for the true-shape view (§12).
 
-The queues share one GPU, so what the window draws is time the solver does not get. With vsync
-(the default) the window draws 60 frames a second at about 0.5 - 1.3 ms each, and the solver keeps
-about 3,050 of its 3,600 MLUPS. Without vsync the frame rate is capped at 240 a second: an
-uncapped window drew about 900 and cut the solver to 1,280 MLUPS.
+The queues share one GPU, so what the window draws is time the solver does not get. The window
+draws at most 90 frames a second, with or without vsync, at about 0.5 - 1.4 ms each on the fast
+grid, and the solver keeps about 3,300 - 3,400 of the 3,450 - 3,600 MLUPS it reaches headless (an
+uncapped window once drew about 900 frames and cut the solver to 1,280 MLUPS). A batch's readings -- the force
+window, the health check, the reference density and the probes -- are recorded at the end of the
+batch's own submission and read from mapped memory, so a batch costs one round trip to the GPU;
+each extra round trip left the GPU idle, and together they had cost the solver 12 % (THEORY
+§11.6).
 
 **The code path:** `app/src/sim.cpp` (`SimWorker::run`, `publish`), `app/src/app.cpp` (the frame),
 `render/src/volume.cpp` (`VolumeRenderer::record`).
@@ -348,21 +359,30 @@ Each frame the renderer runs a few compute passes over the latest snapshot:
    shells are on.
 2. **Q** (every third frame): the vortex-core criterion from a smoothed velocity, with an adaptive
    threshold computed on the GPU (§10.3).
-3. **March:** one ray per pixel, front to back, accumulating the model surface, the slice plane,
+3. **True shape:** the placed model's triangles are rasterised with the march's own camera into a
+   distance and a normal per pixel, which the march takes as the model's surface (§10.10). The
+   voxel and smoothed views draw the solver's cells instead: what the flow actually meets.
+4. **March:** one ray per pixel, front to back, accumulating the model surface, the slice plane,
    the vortex cores, the mean reversed-flow shells, the dye and the field haze. Opacity comes from
    the deviation from the freestream, so undisturbed air is transparent and only what the model
    changes shows. The surface can be painted with Cp, with the speed or direction of the flow one
    cell off it, or with oil-flow streaks: noise smeared along that near-wall flow by a
    line-integral convolution, so the streaks trace the skin-friction lines (§10.7). The slice can
-   carry the same texture of its in-plane flow (§10.8).
-4. **Splats:** smoke particles (streaklines, or timelines from a pulsed line), streamline
+   carry the same texture of its in-plane flow (§10.8); both can move, the bright part of each
+   streak travelling downstream with the flow. The field can be recoloured (a sequential,
+   diverging or greyscale map), its range narrowed or widened, and put on a log scale (§10.1).
+   Surfaces are lit by a key light, a fill from the eye and a soft glint, darkened where solid
+   closes round them (corners, under the body, at the floor; §10.10).
+5. **Splats:** smoke particles (streaklines, or timelines from a pulsed line), streamline
    segments, velocity arrows on the slice, the probe crosses and the wake-survey planes,
    depth-tested against the marched image (§10.9).
 
 The ray march samples 3-D textures, so the GPU's texture units do the trilinear interpolation. On
 the fast grid a frame's rendering costs about 0.7 ms of GPU time with the haze alone, and
 1.5 - 2 ms with vortex cores, dye and streamlines on as well; the slice texture and the oil-flow
-paint add about 0.3 - 0.5 ms each at 1600 x 900.
+paint add about 0.3 - 0.5 ms each at 1600 x 900. The cost scales with the pixels drawn; the true
+shape costs about 12 % more than the smoothed cells. Hovering over the Tunnel panel's timing line
+shows each pass's GPU time (`VolumeRenderer::pass_times`).
 
 ## 13. The identity discipline
 
@@ -399,9 +419,11 @@ therefore off by default.
 | A catalogue model, its spinning parts, rotors or engine ports | `engine/src/catalogue.cpp` |
 | How rotors load the air (actuator lines) | `engine/src/rotor.cpp`, `alm_elements.comp`, `alm_spread.comp` |
 | The settling thresholds | `ConvergenceMonitor` in `engine/include/windoa/convergence.hpp` |
-| What is drawn, and how | `render/src/volume.cpp`, `render/src/tracers.cpp` and `render/shaders/` |
+| What is drawn, and how | `render/src/volume.cpp`, `render/src/tracers.cpp` and `render/shaders/`; the true shape in `render/src/mesh_raster.cpp`, `mesh_vs.vert` and `mesh_fs.frag` |
+| The UI's font, scale and saved preferences | `App::init_imgui`, `apply_style`, `read_pref` in `app/src/app.cpp` |
 | Averages, the wake survey, spectra | `engine/src/flow_stats.cpp`, `engine/src/spectrum.cpp`, `Tunnel::refresh_analysis` |
-| The panels | `app/src/app.cpp` |
+| The panels | `app/src/panels.cpp`; the quick bar, looks and camera views in `play.cpp`; legends, plots and help in `overlays.cpp`; the frame loop in `app.cpp` |
+| The lattice's directions and weights, or grid indexing, on the host | `engine/include/windoa/lattice.hpp`, `grid.hpp` |
 
 ### Checking that nothing is broken
 

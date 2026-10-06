@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "mc_tables.hpp"
+#include "windoa/grid.hpp"
 
 namespace windoa {
 
@@ -26,7 +27,8 @@ int corner_sum(int c) {
 geometry::Mesh marching_cubes(const std::vector<float>& f, int nx, int ny, int nz, float iso) {
     if (nx < 2 || ny < 2 || nz < 2 || f.size() != std::size_t(nx) * ny * nz)
         throw std::invalid_argument("marching_cubes: the field does not match the grid");
-    auto at = [&](int x, int y, int z) { return f[(std::size_t(x) * ny + y) * nz + z]; };
+    const Grid grid{nx, ny, nz};
+    auto at = [&](int x, int y, int z) { return f[grid.index(x, y, z)]; };
 
     geometry::Mesh mesh;
     for (int x = 0; x + 1 < nx; ++x)

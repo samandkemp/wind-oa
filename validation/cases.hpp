@@ -48,7 +48,7 @@ inline Result run(Context& ctx, bool regularised, bool recursive, float g_x = G_
     std::vector<std::uint8_t> flags(std::size_t(NX) * NY * NZ, lbm::FLUID);
     for (int x = 0; x < NX; ++x)
         for (int z = 0; z < NZ; ++z) {
-            flags[(std::size_t(x) * NY + 0) * NZ + z] = lbm::WALL;
+            flags[Grid{NX, NY, NZ}.index(x, 0, z)] = lbm::WALL;
             flags[(std::size_t(x) * NY + NY - 1) * NZ + z] = lbm::WALL;
         }
     s.set_flags(flags);
@@ -110,7 +110,7 @@ struct Result {
 inline std::vector<std::uint8_t> flags() {
     std::vector<std::uint8_t> f(std::size_t(NX) * NY * NZ, lbm::FLUID);
     auto at = [&](int x, int y, int z) -> std::uint8_t& {
-        return f[(std::size_t(x) * NY + y) * NZ + z];
+        return f[Grid{NX, NY, NZ}.index(x, y, z)];
     };
     for (int y = 0; y < NY; ++y)
         for (int z = 0; z < NZ; ++z)
@@ -222,7 +222,7 @@ inline Result run(Context& ctx, float tau, bool regularised) {
     for (int y = 0; y < NY; ++y) // frontal area: OBSTACLE anywhere along x
         for (int z = 0; z < NZ; ++z)
             for (int x = 0; x < NX; ++x)
-                if (flags[(std::size_t(x) * NY + y) * NZ + z] == lbm::OBSTACLE) {
+                if (flags[Grid{NX, NY, NZ}.index(x, y, z)] == lbm::OBSTACLE) {
                     r.a_ref += 1.0;
                     break;
                 }

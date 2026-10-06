@@ -17,7 +17,8 @@ Written in C++20 with Vulkan compute, a Dear ImGui front-end and a headless engi
 
 *The saloon in the rolling-road tunnel: smoke from the wand, the speed haze (blue slower, red
 faster than the freestream) and the surface pressure, with the run status and forces on the left,
-the view controls on the right and the force histories along the bottom. Its wake is unsteady
+the quick bar along the top (the model, the wind in mph, the looks and the camera views), the view
+controls on the right and the force histories along the bottom. Its wake is unsteady
 enough that the settling detector reports it as such rather than declaring a mean.*
 
 > **The tunnel runs at sandbox Reynolds numbers, about $10^3 - 10^4$, not at full scale.** Absolute
@@ -196,6 +197,10 @@ which keeps its precision where the physics is (§11.3); it is the useful kind o
 and it exists only because the slower path was kept and measured rather than retired once the faster
 one worked. Half precision is therefore off by default, and it is not gated: every gate runs f32.
 
+Your own model: drop an STL file into `models/` (nose towards $-x$) and it appears in the app's
+model menu under *Imported*. `tunnel_run --stl FILE` runs it headless, and `--csv FILE` gathers
+runs of several models into one table for comparison ([GUIDE §10](docs/GUIDE.md#comparing-several-models)).
+
 See [docs/GUIDE.md](docs/GUIDE.md) for everything else.
 
 ## Status
@@ -209,7 +214,13 @@ voxeliser, marching cubes, dye, synthetic inlet turbulence, a settling detector 
 cache, on grids up to 18.9 million cells. On top of the flow sit time averages, a wake survey that
 measures the drag a second way, probes and spectra; the views run from vortex cores and dye to
 oil-flow streaks, flow textures, arrows and pulsed timelines, in an interactive app with the solver
-on its own GPU queue. All 31 validation gates hold, each against its external reference.
+on its own GPU queue, with a quick bar for play: the wind in mph or km/h with a sweep, nine
+one-key looks, gliding camera views and an orbit, click to place, colour maps and frame recording.
+The model is drawn in its true shape from its own triangles, or as the cells the solver sees, and
+the interface scales with the monitor and a UI scale of its own. Your own STL models run in the app
+and headless, and results collect into CSV tables for comparison. All 31 validation gates hold,
+each against its external reference. The project is complete in this form: further work would be
+new physics, each gated before it is made fast.
 
 Each theory section states the limitations its model accepts. The largest is the Reynolds number: at
 about $10^3$ the tunnel reads the Ahmed body's drag at about 1.4, against 0.285 in experiment at full

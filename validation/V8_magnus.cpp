@@ -26,7 +26,7 @@ int main() {
                 const double dx = x + 0.5 - CX, dy = y + 0.5 - CY;
                 if (dx * dx + dy * dy <= double(R) * R)
                     for (int z = 0; z < NZ; ++z)
-                        flags[(std::size_t(x) * NY + y) * NZ + z] = lbm::OBSTACLE;
+                        flags[Grid{NX, NY, NZ}.index(x, y, z)] = lbm::OBSTACLE;
             }
 
         const double alphas[3] = {0.0, 1.0, 2.0};

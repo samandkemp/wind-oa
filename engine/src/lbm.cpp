@@ -1,12 +1,14 @@
 #include "windoa/lbm.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
 
 #include "lbm_init_spv.hpp"
+#include "lbm_linkq_spv.hpp"
 #include "lbm_reduce_spv.hpp"
 #include "lbm_refresh_spv.hpp"
 #include "lbm_scale_spv.hpp"
@@ -40,7 +42,10 @@ constexpr int kStepsPerSubmit = 128;      // keeps each GPU batch well under the
 constexpr std::size_t kAccumVec4 = 5;     // see lbm_reduce.comp
 
 // Specialisation constants of lbm_step.comp.
-std::array<std::uint32_t, 13> step_spec(const Config& c, bool force_field = false) {
+constexpr std::uint32_t kStepBindings = 13; // lbm_step.comp: 9 + the fused dye's 4
+
+std::array<std::uint32_t, 14> step_spec(const Config& c, bool force_field = false,
+                                        bool dye = false) {
     return {static_cast<std::uint32_t>(c.mode_x),
             static_cast<std::uint32_t>(c.mode_y),
             static_cast<std::uint32_t>(c.mode_z),
@@ -53,7 +58,8 @@ std::array<std::uint32_t, 13> step_spec(const Config& c, bool force_field = fals
             c.opt_lazy_macro ? 1u : 0u,
             c.opt_sparse_forces ? 1u : 0u,
             c.storage_f16 ? 1u : 0u,
-            force_field ? 1u : 0u};
+            force_field ? 1u : 0u,
+            dye ? 1u : 0u};
 }
 
 // Bytes per stored distribution value, and the kernels' F16 constant.
@@ -63,12 +69,6 @@ std::size_t f_bytes(const Config& c) {
 std::array<std::uint32_t, 1> f16_spec(const Config& c) {
     return {c.storage_f16 ? 1u : 0u};
 }
-
-// D3Q19 rest weights (the f16 storage holds f - w_i)
-constexpr float kW[19] = {1.0f / 3,  1.0f / 18, 1.0f / 18, 1.0f / 18, 1.0f / 18,
-                          1.0f / 18, 1.0f / 18, 1.0f / 36, 1.0f / 36, 1.0f / 36,
-                          1.0f / 36, 1.0f / 36, 1.0f / 36, 1.0f / 36, 1.0f / 36,
-                          1.0f / 36, 1.0f / 36, 1.0f / 36, 1.0f / 36};
 
 std::size_t cell_count(const Config& c) {
     if (c.nx < 3 || c.ny < 1 || c.nz < 1) {
@@ -87,28 +87,34 @@ Solver::Solver(Context& ctx, const Config& cfg)
       link_q_(ctx, cfg.use_ibb ? (Q * n_ + 3) / 4 * 4 : 16),
       u_wall_(ctx, cfg.moving_boundaries ? n_ * 16 : 16),
       force_field_(std::make_unique<Buffer>(ctx, 16)),
-      partials_(ctx, std::size_t{2} * groups_for(ctx, n_, kStepLocal).total * 16),
-      accum_(ctx, kAccumVec4 * 16), stats_partials_(ctx, std::size_t{groups_.total} * 16),
-      step_(ctx, spv::lbm_step, 9, sizeof(Params), 2, step_spec(cfg)),
-      step_forced_(ctx, spv::lbm_step, 9, sizeof(Params), 2, step_spec(cfg, true)),
-      reduce_(ctx, spv::lbm_reduce, 2, sizeof(Params)),
+      ring_slices_(ring_slices(groups_for(ctx, n_, kStepLocal).total)),
+      partials_(ctx, std::size_t{2} * ring_slices_ * groups_for(ctx, n_, kStepLocal).total * 16),
+      totals_(ctx, std::size_t{2} * ring_slices_ * 16), accum_(ctx, kAccumVec4 * 16),
+      accum_mirror_{Buffer(ctx, kAccumVec4 * 16, MemoryUse::Readback),
+                    Buffer(ctx, kAccumVec4 * 16, MemoryUse::Readback)},
+      stats_partials_(ctx, std::size_t{groups_.total} * 16),
+      step_(ctx, spv::lbm_step, kStepBindings, sizeof(Params), 2, step_spec(cfg)),
+      step_forced_(ctx, spv::lbm_step, kStepBindings, sizeof(Params), 2, step_spec(cfg, true)),
+      reduce_(ctx, spv::lbm_reduce, 3, sizeof(Params)),
       init_(ctx, spv::lbm_init, 4, sizeof(Params), 1, f16_spec(cfg)),
       stats_(ctx, spv::lbm_stats, 3, sizeof(Params), 2),
       scale_(ctx, spv::lbm_scale, 3, sizeof(Params), 2, f16_spec(cfg)),
-      refresh_(ctx, spv::lbm_refresh, 3, sizeof(Params), 2, f16_spec(cfg)) {
+      refresh_(ctx, spv::lbm_refresh, 3, sizeof(Params), 2, f16_spec(cfg)),
+      linkq_(ctx, spv::lbm_linkq, 2, sizeof(Params)), dye_dummy_(ctx, 16) {
     if (cfg.storage_f16 && !ctx.gpu().storage_16bit)
         throw std::runtime_error("lbm::Solver: f16 storage needs 16-bit storage buffers");
+    bind_step_sets();
     // set k reads f_[k] / macro_[k] and writes the other pair.
     for (int k = 0; k < 2; ++k) {
-        const int o = 1 - k;
-        for (ComputeKernel* sk : {&step_, &step_forced_})
-            sk->bind(k, {&f_[k], &f_[o], &flag_buf_, &macro_[k], &macro_[o], &link_q_, &u_wall_,
-                         &partials_, force_field_.get()});
         stats_.bind(k, {&flag_buf_, &macro_[k], &stats_partials_});
         scale_.bind(k, {&f_[k], &flag_buf_, &macro_[k]});
         refresh_.bind(k, {&f_[k], &flag_buf_, &macro_[k]});
     }
-    reduce_.bind({&partials_, &accum_});
+    reduce_.bind({&partials_, &totals_, &accum_});
+    for (Buffer& m : accum_mirror_)
+        std::memset(m.data(), 0, kAccumVec4 * 16);
+    if (cfg.use_ibb) // every link half-way until set (set_link_q_slab writes a slab)
+        ctx_.fill_u32(link_q_, 0x80808080u);
     init_.bind({&f_[0], &f_[1], &macro_[0], &macro_[1]});
 
     torque_ref_ = {cfg.nx / 2.0f, cfg.ny / 2.0f, cfg.nz / 2.0f};
@@ -141,6 +147,10 @@ void Solver::push_params(void* out, const float aux[4]) const {
         p.u_lid[k] = lid_velocity_[k];
         p.torque_ref[k] = torque_ref_[k];
     }
+    if (fused_on_) { // the fused dye's TRT rates (lbm_params.glsl)
+        p.u_lid[3] = fused_.omega_minus;
+        p.torque_ref[3] = fused_.omega_plus;
+    }
     if (aux)
         std::memcpy(p.aux, aux, sizeof(p.aux));
     std::memcpy(out, &p, sizeof(p));
@@ -151,10 +161,30 @@ void Solver::push_params(void* out, const float aux[4]) const {
 void Solver::set_flags(std::span<const std::uint8_t> flags) {
     if (flags.size() != n_)
         throw std::runtime_error("set_flags: wrong size");
+    // Only the range that changed goes up (a new model rewrites its slab of
+    // the grid, not the grid): all of it the first time, or when the caller
+    // passes the solver's own copy.
+    std::size_t lo = 0, hi = n_;
+    if (flags_uploaded_ && flags.data() != flags_.data()) {
+        lo = std::size_t(std::mismatch(flags.begin(), flags.end(), flags_.begin()).first -
+                         flags.begin());
+        hi = lo;
+        for (std::size_t c = n_; c > lo; --c)
+            if (flags[c - 1] != flags_[c - 1]) {
+                hi = c;
+                break;
+            }
+    }
     if (flags.data() != flags_.data())
-        flags_.assign(flags.begin(), flags.end());
-    std::vector<std::uint32_t> words(flags_.begin(), flags_.end());
-    ctx_.upload(flag_buf_, words.data(), words.size() * sizeof(std::uint32_t));
+        std::copy(flags.begin() + std::ptrdiff_t(lo), flags.begin() + std::ptrdiff_t(hi),
+                  flags_.begin() + std::ptrdiff_t(lo));
+    if (hi > lo) {
+        std::vector<std::uint32_t> words(flags_.begin() + std::ptrdiff_t(lo),
+                                         flags_.begin() + std::ptrdiff_t(hi));
+        ctx_.upload(flag_buf_, words.data(), words.size() * sizeof(std::uint32_t),
+                    lo * sizeof(std::uint32_t));
+    }
+    flags_uploaded_ = true;
     ++geometry_version_;
 }
 
@@ -166,6 +196,60 @@ void Solver::set_link_q(std::span<const std::uint8_t> q) {
     // Byte k lands in word k / 4 at bits 8 (k % 4) on a little-endian host --
     // exactly what the shader's link_fraction() unpacks.
     ctx_.upload(link_q_, q.data(), q.size());
+    link_x0_ = 0; // all of it may differ from half-way now
+    link_x1_ = cfg_.nx;
+}
+
+void Solver::set_link_q_sparse(int x0, int x1, std::span<const std::uint32_t> index,
+                               std::span<const std::uint8_t> q) {
+    if (!cfg_.use_ibb)
+        throw std::runtime_error("set_link_q_sparse: solver built without use_ibb");
+    if (index.size() != q.size())
+        throw std::runtime_error("set_link_q_sparse: index and value counts differ");
+    const std::size_t plane = std::size_t(cfg_.ny) * cfg_.nz;
+    if (plane % 4 != 0) { // the fill below needs whole words a plane: the dense path
+        std::vector<std::uint8_t> dense(Q * n_, 128);
+        for (std::size_t k = 0; k < index.size(); ++k)
+            dense.at(index[k]) = q[k];
+        set_link_q(dense);
+        return;
+    }
+    x0 = std::clamp(x0, 0, cfg_.nx);
+    x1 = std::clamp(x1, x0, cfg_.nx);
+    // The union with the slab set before: half-way where the new one ends.
+    const int lo = link_x1_ > link_x0_ ? std::min(x0, link_x0_) : x0;
+    const int hi = link_x1_ > link_x0_ ? std::max(x1, link_x1_) : x1;
+    link_x0_ = x0;
+    link_x1_ = x1;
+    const std::size_t n = index.size();
+    if (n > 0) {
+        if (!link_entries_ || link_entries_->size() < n * 8)
+            link_entries_ = std::make_unique<Buffer>(ctx_, std::max<std::size_t>(n * 8, 4096),
+                                                     MemoryUse::Upload);
+        auto* e = static_cast<std::uint32_t*>(link_entries_->data());
+        for (std::size_t k = 0; k < n; ++k) {
+            if (index[k] >= Q * n_)
+                throw std::runtime_error("set_link_q_sparse: link outside the grid");
+            e[2 * k] = index[k];
+            e[2 * k + 1] = q[k];
+        }
+        linkq_.bind({&link_q_, link_entries_.get()});
+    }
+    Params p;
+    const float aux[4] = {static_cast<float>(n), 0.0f, 0.0f, 0.0f};
+    push_params(&p, aux);
+    ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+        if (hi > lo) {
+            for (int d = 0; d < Q; ++d) {
+                const VkDeviceSize off = VkDeviceSize(d) * n_ + VkDeviceSize(lo) * plane;
+                const VkDeviceSize len = VkDeviceSize(hi - lo) * plane;
+                vkCmdFillBuffer(cmd, link_q_.handle(), off, len, 0x80808080u);
+            }
+            Context::barrier_full(cmd);
+        }
+        if (n > 0)
+            linkq_.record(cmd, &p, std::uint32_t((n + 255) / 256));
+    });
 }
 
 void Solver::init_equilibrium(float rho0, Vec3 u) {
@@ -174,35 +258,132 @@ void Solver::init_equilibrium(float rho0, Vec3 u) {
     push_params(&p, aux);
     ctx_.submit_and_wait([&](VkCommandBuffer cmd) { init_.record(cmd, &p, groups_.x, groups_.y); });
     ctx_.fill_zero(accum_);
+    for (Buffer& m : accum_mirror_)
+        std::memset(m.data(), 0, kAccumVec4 * 16);
+    window_reset_pending_ = false;
     parity_ = 0;
     steps_ = 0;
 }
 
 // -- Stepping --------------------------------------------------------------------
 
+// Set k reads f_[k] / macro_[k] and writes the other pair; with a fused
+// scalar it reads the scalar's live populations in the same parity (offset
+// by fused_bound_, which follows the scalar's own parity), else placeholders.
+void Solver::bind_step_sets() {
+    const int d = fused_on_ ? ((*fused_.parity ^ parity_) & 1) : 0;
+    for (int k = 0; k < 2; ++k) {
+        const int o = 1 - k;
+        const Buffer* g_src = fused_on_ ? fused_.g[k ^ d] : &dye_dummy_;
+        const Buffer* g_dst = fused_on_ ? fused_.g[1 - (k ^ d)] : &dye_dummy_;
+        const Buffer* conc = fused_on_ ? fused_.conc : &dye_dummy_;
+        const Buffer* src = fused_on_ ? fused_.src : &dye_dummy_;
+        for (ComputeKernel* sk : {&step_, &step_forced_, step_dye_.get(), step_forced_dye_.get()})
+            if (sk)
+                sk->bind(k, {&f_[k], &f_[o], &flag_buf_, &macro_[k], &macro_[o], &link_q_, &u_wall_,
+                             &partials_, force_field_.get(), g_src, g_dst, conc, src});
+    }
+    fused_bound_ = d;
+}
+
+void Solver::fuse_scalar(const FusedScalar* s) {
+    fused_on_ = s != nullptr;
+    if (s) {
+        if (!s->g[0] || !s->g[1] || !s->conc || !s->src || !s->parity)
+            throw std::runtime_error("Solver::fuse_scalar: missing buffers");
+        fused_ = *s;
+        if (!step_dye_) { // built on first use: most runs never fuse a scalar
+            constexpr auto push = static_cast<std::uint32_t>(sizeof(Params));
+            step_dye_ = std::make_unique<ComputeKernel>(ctx_, spv::lbm_step, kStepBindings, push, 2,
+                                                        step_spec(cfg_, false, true));
+            step_forced_dye_ = std::make_unique<ComputeKernel>(
+                ctx_, spv::lbm_step, kStepBindings, push, 2u, step_spec(cfg_, true, true));
+        }
+    } else {
+        fused_ = {};
+    }
+    bind_step_sets();
+}
+
+// The steps' force partials go into consecutive slices of a ring, folded by
+// one reduce pass for all of them (lbm_reduce.comp): a one-workgroup reduce
+// after every step left the GPU idle for 5.8 % of the time on the fast grid.
+// The ring holds up to 32 MB (the fast grid's whole submit; the ultra
+// grid's in steps of 14).
+int Solver::ring_slices(std::uint32_t step_groups) {
+    const std::size_t slice_bytes = std::size_t{2} * step_groups * 16;
+    return int(std::clamp<std::size_t>((32u << 20) / slice_bytes, 1, kStepsPerSubmit));
+}
+
+void Solver::record_reduce(VkCommandBuffer cmd, std::uint32_t step_groups, int steps) {
+    Params p;
+    float aux[4] = {static_cast<float>(step_groups), 0.0f, static_cast<float>(steps), 0.0f};
+    push_params(&p, aux);
+    reduce_.record(cmd, &p, std::uint32_t(steps)); // fold: a workgroup per step
+    Context::barrier_compute_to_compute(cmd);
+    aux[3] = 1.0f;
+    push_params(&p, aux);
+    reduce_.record(cmd, &p, 1); // accumulate, in step order
+    Context::barrier_compute_to_compute(cmd);
+}
+
 void Solver::step(int n_steps) {
     step(n_steps, StepHook{});
 }
 
 void Solver::step(int n_steps, const StepHook& after_each) {
+    run_steps(n_steps, after_each, false, 0);
+}
+
+Solver::Ticket Solver::step_async(int n_steps, const StepHook& after_each, const Tail& tail) {
+    const int slot = async_slot_;
+    async_slot_ ^= 1;
+    return {run_steps(n_steps, after_each, true, slot, &tail), slot};
+}
+
+void Solver::finish(const Ticket& t) {
+    ctx_.wait(t.submit);
+    finish_readings(t.slot);
+}
+
+std::uint64_t Solver::run_steps(int n_steps, const StepHook& after_each, bool async, int slot,
+                                const Tail* tail) {
+    std::uint64_t ticket = 0;
+    bool first = true;
     Params p;
     const Groups sg = groups_for(ctx_, n_, kStepLocal);
     const float aux[4] = {static_cast<float>(sg.total), 0.0f, 0.0f, 0.0f};
     push_params(&p, aux);
     const bool turb = turb_on_ && cfg_.mode_x == AxisX::InletOutlet && turb_;
+    if (fused_on_ && ((*fused_.parity ^ parity_) & 1) != fused_bound_)
+        bind_step_sets(); // the scalar's parity moved (a clear): realign its buffers
+    ComputeKernel& kernel = fused_on_ ? (force_field_on_ ? *step_forced_dye_ : *step_dye_)
+                                      : (force_field_on_ ? step_forced_ : step_);
     const std::uint32_t plane = static_cast<std::uint32_t>(cfg_.ny * cfg_.nz);
     while (n_steps > 0) {
         const int batch = std::min(n_steps, kStepsPerSubmit);
-        ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+        const bool last = batch == n_steps;
+        auto record = [&](VkCommandBuffer cmd) {
+            // The window restarts where read_mean_forces() asked, and at the
+            // start of every pipelined batch (each keeps its own window).
+            if (window_reset_pending_ || (async && first)) {
+                vkCmdFillBuffer(cmd, accum_.handle(), 2 * 16, 3 * 16, 0u);
+                Context::barrier_full(cmd);
+                window_reset_pending_ = false;
+            }
             int par = parity_;
+            int slice = 0; // the partials ring slice this step writes
             for (int s = 0; s < batch; ++s) {
                 // rho / u are written on the steps someone reads them: the
                 // last of the submit, or every step for a per-step hook
                 p.aux[1] = (after_each || s == batch - 1) ? 1.0f : 0.0f;
-                (force_field_on_ ? step_forced_ : step_)
-                    .record_set(cmd, static_cast<std::uint32_t>(par), &p, sg.x, sg.y);
+                p.dims[3] = slice * static_cast<std::int32_t>(sg.total);
+                kernel.record_set(cmd, static_cast<std::uint32_t>(par), &p, sg.x, sg.y);
                 Context::barrier_compute_to_compute(cmd);
-                reduce_.record(cmd, &p, 1);
+                if (++slice == ring_slices_ || s == batch - 1) { // fold the ring's steps
+                    record_reduce(cmd, sg.total, slice);
+                    slice = 0;
+                }
                 if (turb) { // overwrite the inlet plane the step has written
                     Params tp;
                     const float ta[4] = {static_cast<float>(turb_phase_), turb_intensity_,
@@ -212,17 +393,106 @@ void Solver::step(int n_steps, const StepHook& after_each) {
                                       (plane + kLocal - 1) / kLocal);
                     turb_phase_ = std::fmod(turb_phase_ + turb_u_, double(turb_span_));
                 }
-                Context::barrier_compute_to_compute(cmd);
+                if (turb) // the next step or the hook reads the plane it wrote
+                    Context::barrier_compute_to_compute(cmd);
                 par ^= 1;
                 if (after_each)
                     after_each(cmd, par); // macro_[par] is this step's output
             }
-        });
-        if (batch % 2)
+            if (last)
+                record_readings(cmd, par, slot);
+            if (last && tail && tail->record) {
+                Context::barrier_full(cmd);
+                tail->record(cmd, par);
+            }
+        };
+        const bool signal = last && tail && tail->signal != VK_NULL_HANDLE;
+        if (async)
+            ticket = ctx_.submit_async(record, signal ? tail->signal : VK_NULL_HANDLE,
+                                       signal ? tail->value : 0);
+        else
+            ctx_.submit_and_wait(record);
+        first = false;
+        if (batch % 2) {
             parity_ ^= 1;
+            if (fused_on_)
+                *fused_.parity ^= 1; // its live buffer moves with the flow's
+        }
         steps_ += batch;
         n_steps -= batch;
+        if (last && !async)
+            finish_readings(slot);
     }
+    return ticket;
+}
+
+void Solver::request_plane_density(int x) {
+    want_plane_ = std::clamp(x, 0, cfg_.nx - 1);
+}
+
+void Solver::request_probes(std::span<const std::size_t> cells) {
+    for (std::size_t c : cells)
+        if (c >= n_)
+            throw std::runtime_error("Solver::request_probes: cell outside the grid");
+    want_probes_.assign(cells.begin(), cells.end());
+}
+
+// The end of a step() submission: the force accumulator into its mirror
+// (after the last reduce), then any requested statistics and probes on the
+// state the steps leave (`live`).
+void Solver::record_readings(VkCommandBuffer cmd, int live, int slot) {
+    const VkBufferCopy acc{0, 0, kAccumVec4 * 16};
+    vkCmdCopyBuffer(cmd, accum_.handle(), accum_mirror_[slot].handle(), 1, &acc);
+    const int planes[2] = {want_health_ ? -1 : INT_MIN, want_plane_};
+    for (int k = 0; k < 2; ++k) {
+        if (planes[k] == INT_MIN || (k == 1 && planes[k] < 0))
+            continue;
+        std::unique_ptr<Buffer>& mirror = stats_mirror_[slot][k];
+        if (!mirror)
+            mirror = std::make_unique<Buffer>(ctx_, stats_partials_.size(), MemoryUse::Readback);
+        Params p;
+        const float aux[4] = {static_cast<float>(planes[k]), 0.0f, 0.0f, 0.0f};
+        push_params(&p, aux);
+        stats_.record_set(cmd, static_cast<std::uint32_t>(live), &p, groups_.x, groups_.y);
+        Context::barrier_full(cmd); // compute writes -> copy; and the copy before a reuse
+        const VkBufferCopy all{0, 0, stats_partials_.size()};
+        vkCmdCopyBuffer(cmd, stats_partials_.handle(), mirror->handle(), 1, &all);
+        Context::barrier_full(cmd);
+    }
+    if (!want_probes_.empty()) {
+        const VkDeviceSize bytes = want_probes_.size() * 16;
+        std::unique_ptr<Buffer>& mirror = probe_mirror_[slot];
+        if (!mirror || mirror->size() < bytes)
+            mirror = std::make_unique<Buffer>(ctx_, bytes, MemoryUse::Readback);
+        std::vector<VkBufferCopy> regions(want_probes_.size());
+        for (std::size_t i = 0; i < want_probes_.size(); ++i)
+            regions[i] = {want_probes_[i] * 16, i * 16, 16};
+        vkCmdCopyBuffer(cmd, macro_[live].handle(), mirror->handle(), std::uint32_t(regions.size()),
+                        regions.data());
+    }
+    slot_read_[slot] = {true, want_health_, want_plane_, want_probes_.size()};
+    want_health_ = false;
+    want_plane_ = -1;
+    want_probes_.clear();
+}
+
+void Solver::finish_readings(int slot) {
+    SlotReadings& r = slot_read_[slot];
+    read_slot_ = slot;
+    if (!r.recorded)
+        return;
+    r.recorded = false;
+    if (r.health) {
+        const StatsSum s = sum_stats(static_cast<const float*>(stats_mirror_[slot][0]->data()));
+        last_health_ = {static_cast<float>(s.max_speed), static_cast<int>(s.bad)};
+    }
+    if (r.plane >= 0) {
+        const StatsSum s = sum_stats(static_cast<const float*>(stats_mirror_[slot][1]->data()));
+        last_plane_density_ = 1.0 + (s.count > 0 ? s.excess / s.count : 0.0);
+    }
+    last_probes_.resize(r.probes);
+    if (r.probes > 0)
+        std::memcpy(last_probes_.data(), probe_mirror_[slot]->data(), r.probes * 16);
 }
 
 // -- Inlet turbulence --------------------------------------------------------------
@@ -286,11 +556,12 @@ void Solver::build_turbulence_patch(float length, int span, std::uint32_t seed) 
     ctx_.download(b1, a.data(), a.size() * sizeof(float)); // 3 passes: 0->1->0->1
 
     // u' = curl A (periodic central differences), mean-free, unit rms.
+    const Grid patch{span, ny, nz};
     auto at = [&](int s, int y, int z, int k) {
         s = (s + span) % span;
         y = (y + ny) % ny;
         z = (z + nz) % nz;
-        return a[4 * ((std::size_t(s) * ny + y) * nz + z) + k];
+        return a[4 * patch.index(s, y, z) + k];
     };
     std::vector<float> up(cells * 4, 0.0f);
     double mean[3] = {0, 0, 0};
@@ -302,7 +573,7 @@ void Solver::build_turbulence_patch(float length, int span, std::uint32_t seed) 
                     return 0.5f * (at(s + o[ax][0], y + o[ax][1], z + o[ax][2], k) -
                                    at(s - o[ax][0], y - o[ax][1], z - o[ax][2], k));
                 };
-                const std::size_t c = (std::size_t(s) * ny + y) * nz + z;
+                const std::size_t c = patch.index(s, y, z);
                 const float u = d(2, 1) - d(1, 2);
                 const float v = d(0, 2) - d(2, 0);
                 const float ww = d(1, 0) - d(0, 1);
@@ -366,16 +637,19 @@ std::vector<float> Solver::turbulence_patch() {
 // -- Forces ------------------------------------------------------------------------
 
 Vec3 Solver::obstacle_force() {
-    float a[4];
-    ctx_.download(accum_, a, sizeof(a));
+    const float* a = static_cast<const float*>(accum_mirror_[read_slot_].data());
     return {a[0], a[1], a[2]};
 }
 
+// The window as the last step() submission left it; its restart is the next
+// submission's first command, and the mirror's copy is cleared so a second
+// read before any step finds an empty window.
 MeanForces Solver::read_mean_forces() {
     float a[kAccumVec4 * 4];
-    ctx_.download(accum_, a, sizeof(a));
-    const float zeros[12] = {};
-    ctx_.upload(accum_, zeros, sizeof(zeros), 2 * 16); // restart the window
+    Buffer& mirror = accum_mirror_[read_slot_];
+    std::memcpy(a, mirror.data(), sizeof(a));
+    std::memset(static_cast<char*>(mirror.data()) + 2 * 16, 0, 3 * 16);
+    window_reset_pending_ = true;
     MeanForces m;
     m.steps = static_cast<int>(a[16]);
     if (m.steps > 0) {
@@ -398,6 +672,10 @@ Solver::StatsSum Solver::stats(int plane) {
     });
     std::vector<float> v(std::size_t{groups_.total} * 4);
     ctx_.download(stats_partials_, v.data(), v.size() * sizeof(float));
+    return sum_stats(v.data());
+}
+
+Solver::StatsSum Solver::sum_stats(const float* v) const {
     StatsSum s;
     for (std::size_t g = 0; g < groups_.total; ++g) {
         s.max_speed = std::max(s.max_speed, static_cast<double>(v[4 * g]));
@@ -445,7 +723,7 @@ std::vector<float> Solver::get_state() {
         ctx_.download(f_[live()], h.data(), h.size() * sizeof(std::uint16_t));
         for (int i = 0; i < Q; ++i)
             for (std::size_t c = 0; c < n_; ++c)
-                f[i * n_ + c] = from_half(h[i * n_ + c]) + kW[i];
+                f[i * n_ + c] = from_half(h[i * n_ + c]) + lattice::W[std::size_t(i)];
         return f;
     }
     ctx_.download(f_[live()], f.data(), f.size() * sizeof(float));
@@ -459,7 +737,7 @@ void Solver::set_state(std::span<const float> f) {
         std::vector<std::uint16_t> h(Q * n_);
         for (int i = 0; i < Q; ++i)
             for (std::size_t c = 0; c < n_; ++c)
-                h[i * n_ + c] = to_half(f[i * n_ + c] - kW[i]);
+                h[i * n_ + c] = to_half(f[i * n_ + c] - lattice::W[std::size_t(i)]);
         ctx_.upload(f_[0], h.data(), h.size() * sizeof(std::uint16_t));
         ctx_.upload(f_[1], h.data(), h.size() * sizeof(std::uint16_t));
     } else {
@@ -523,12 +801,7 @@ void Solver::enable_force_field(bool on) {
     force_field_on_ = on;
     if (on && force_field_->size() < n_ * 16) {
         force_field_ = std::make_unique<Buffer>(ctx_, n_ * 16);
-        for (int k = 0; k < 2; ++k) {
-            const int o = 1 - k;
-            for (ComputeKernel* sk : {&step_, &step_forced_})
-                sk->bind(k, {&f_[k], &f_[o], &flag_buf_, &macro_[k], &macro_[o], &link_q_, &u_wall_,
-                             &partials_, force_field_.get()});
-        }
+        bind_step_sets();
     }
     if (on)
         ctx_.fill_zero(*force_field_);
@@ -539,6 +812,47 @@ void Solver::clear_wall_velocity() {
         throw std::runtime_error("solver built without moving_boundaries");
     std::fill(u_wall_host_.begin(), u_wall_host_.end(), 0.0f);
     ctx_.fill_zero(u_wall_);
+    wall_set_lo_ = wall_set_hi_ = 0;
+}
+
+void Solver::begin_wall_update() {
+    if (!cfg_.moving_boundaries)
+        throw std::runtime_error("solver built without moving_boundaries");
+    if (wall_set_hi_ > wall_set_lo_)
+        std::fill(u_wall_host_.begin() + std::ptrdiff_t(4 * wall_set_lo_),
+                  u_wall_host_.begin() + std::ptrdiff_t(4 * wall_set_hi_), 0.0f);
+    wall_dirty_lo_ = wall_set_lo_;
+    wall_dirty_hi_ = wall_set_hi_;
+    wall_set_lo_ = wall_set_hi_ = 0;
+    wall_deferred_ = true;
+}
+
+void Solver::end_wall_update() {
+    wall_deferred_ = false;
+    if (wall_dirty_hi_ > wall_dirty_lo_)
+        upload_wall_range(wall_dirty_lo_, wall_dirty_hi_);
+    wall_dirty_lo_ = wall_dirty_hi_ = 0;
+}
+
+void Solver::mark_wall_cells(std::size_t lo, std::size_t hi) {
+    auto extend = [&](std::size_t& a, std::size_t& b) {
+        if (b <= a) {
+            a = lo;
+            b = hi;
+        } else {
+            a = std::min(a, lo);
+            b = std::max(b, hi);
+        }
+    };
+    extend(wall_set_lo_, wall_set_hi_);
+    if (wall_deferred_)
+        extend(wall_dirty_lo_, wall_dirty_hi_);
+}
+
+// The host copy and the device buffer agree outside [lo, hi), so uploading
+// only that range leaves the device holding exactly the host copy.
+void Solver::upload_wall_range(std::size_t lo, std::size_t hi) {
+    ctx_.upload(u_wall_, u_wall_host_.data() + 4 * lo, (hi - lo) * 16, lo * 16);
 }
 
 int Solver::set_rotation(Vec3 axis_point, Vec3 omega, std::optional<float> radius,
@@ -550,11 +864,25 @@ int Solver::set_rotation(Vec3 axis_point, Vec3 omega, std::optional<float> radiu
     const double ax[3] = {omega[0] / std::max(on, 1e-12), omega[1] / std::max(on, 1e-12),
                           omega[2] / std::max(on, 1e-12)};
     const double hl = half_len.value_or(radius.value_or(0.0f));
+    // Only the capture cylinder's bounding box can hold its cells (the whole
+    // grid when there is no cylinder).
+    int lo[3] = {0, 0, 0}, hi[3] = {cfg_.nx - 1, cfg_.ny - 1, cfg_.nz - 1};
+    if (radius) {
+        const int dims[3] = {cfg_.nx, cfg_.ny, cfg_.nz};
+        for (int k = 0; k < 3; ++k) {
+            const double ext = hl * std::abs(ax[k]) +
+                               double(*radius) * std::sqrt(std::max(0.0, 1.0 - ax[k] * ax[k])) +
+                               1.0;
+            lo[k] = std::max(0, int(std::floor(axis_point[std::size_t(k)] - ext)));
+            hi[k] = std::min(dims[k] - 1, int(std::ceil(axis_point[std::size_t(k)] + ext)));
+        }
+    }
     int count = 0;
-    for (int x = 0; x < cfg_.nx; ++x) {
-        for (int y = 0; y < cfg_.ny; ++y) {
-            for (int z = 0; z < cfg_.nz; ++z) {
-                const std::size_t c = (static_cast<std::size_t>(x) * cfg_.ny + y) * cfg_.nz + z;
+    std::size_t first = n_, last = 0;
+    for (int x = lo[0]; x <= hi[0]; ++x) {
+        for (int y = lo[1]; y <= hi[1]; ++y) {
+            for (int z = lo[2]; z <= hi[2]; ++z) {
+                const std::size_t c = grid().index(x, y, z);
                 if (flags_[c] != OBSTACLE)
                     continue;
                 const double r[3] = {x + 0.5 - axis_point[0], y + 0.5 - axis_point[1],
@@ -572,11 +900,15 @@ int Solver::set_rotation(Vec3 axis_point, Vec3 omega, std::optional<float> radiu
                 u_wall_host_[4 * c + 1] = static_cast<float>(omega[2] * r[0] - omega[0] * r[2]);
                 u_wall_host_[4 * c + 2] = static_cast<float>(omega[0] * r[1] - omega[1] * r[0]);
                 ++count;
+                first = std::min(first, c);
+                last = std::max(last, c);
             }
         }
     }
     if (count > 0) {
-        ctx_.upload(u_wall_, u_wall_host_.data(), u_wall_host_.size() * sizeof(float));
+        mark_wall_cells(first, last + 1);
+        if (!wall_deferred_)
+            upload_wall_range(first, last + 1);
     }
     return count;
 }
@@ -589,6 +921,7 @@ int Solver::set_wall_velocity(Vec3 point, Vec3 axis, float radius, float half_le
     const double ax[3] = {axis[0] / std::max(an, 1e-12), axis[1] / std::max(an, 1e-12),
                           axis[2] / std::max(an, 1e-12)};
     int count = 0;
+    std::size_t first = n_, last = 0;
     const int r_cells = int(std::ceil(radius + half_len)) + 1;
     const int lo[3] = {std::max(0, int(point[0]) - r_cells), std::max(0, int(point[1]) - r_cells),
                        std::max(0, int(point[2]) - r_cells)};
@@ -598,7 +931,7 @@ int Solver::set_wall_velocity(Vec3 point, Vec3 axis, float radius, float half_le
     for (int x = lo[0]; x <= hi[0]; ++x)
         for (int y = lo[1]; y <= hi[1]; ++y)
             for (int z = lo[2]; z <= hi[2]; ++z) {
-                const std::size_t c = (static_cast<std::size_t>(x) * cfg_.ny + y) * cfg_.nz + z;
+                const std::size_t c = grid().index(x, y, z);
                 if (flags_[c] != OBSTACLE)
                     continue;
                 const double r[3] = {x + 0.5 - point[0], y + 0.5 - point[1], z + 0.5 - point[2]};
@@ -610,9 +943,14 @@ int Solver::set_wall_velocity(Vec3 point, Vec3 axis, float radius, float half_le
                 for (int k = 0; k < 3; ++k)
                     u_wall_host_[4 * c + std::size_t(k)] = u[std::size_t(k)];
                 ++count;
+                first = std::min(first, c);
+                last = std::max(last, c);
             }
-    if (count > 0)
-        ctx_.upload(u_wall_, u_wall_host_.data(), u_wall_host_.size() * sizeof(float));
+    if (count > 0) {
+        mark_wall_cells(first, last + 1);
+        if (!wall_deferred_)
+            upload_wall_range(first, last + 1);
+    }
     return count;
 }
 

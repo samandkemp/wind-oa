@@ -21,9 +21,6 @@ using namespace windoa;
 
 namespace {
 
-// e_x per D3Q19 direction (engine/shaders/lattice.glsl order).
-constexpr int kEx[lbm::Q] = {0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, 0, 0, 0, 0};
-
 void part_a(Context& ctx, gate::Gate& g) {
     g.section("A: open tunnel (inlet + pressure outlet), sphere obstacle");
     constexpr int NX = 96, NY = 48, NZ = 48;
@@ -44,7 +41,7 @@ void part_a(Context& ctx, gate::Gate& g) {
                     std::sqrt(double((x - 32) * (x - 32)) + (y - NY / 2.0) * (y - NY / 2.0) +
                               (z - NZ / 2.0) * (z - NZ / 2.0));
                 if (r < 8.0)
-                    flags[(std::size_t(x) * NY + y) * NZ + z] = lbm::OBSTACLE;
+                    flags[Grid{NX, NY, NZ}.index(x, y, z)] = lbm::OBSTACLE;
             }
     s.set_flags(flags);
     s.init_equilibrium(1.0f, {U_IN, 0.0f, 0.0f});
@@ -70,12 +67,12 @@ void part_a(Context& ctx, gate::Gate& g) {
         double fx = 0.0;
         for (int y = 0; y < NY; ++y)
             for (int z = 0; z < NZ; ++z) {
-                const std::size_t cell = (std::size_t(x) * NY + y) * NZ + z;
+                const std::size_t cell = Grid{NX, NY, NZ}.index(x, y, z);
                 const std::size_t next = cell + std::size_t(NY) * NZ; // the cell at x + 1
                 for (int i = 0; i < lbm::Q; ++i) {
-                    if (kEx[i] == 1)
+                    if (lattice::E[std::size_t(i)][0] == 1)
                         fx += f[std::size_t(i) * n + cell];
-                    else if (kEx[i] == -1)
+                    else if (lattice::E[std::size_t(i)][0] == -1)
                         fx -= f[std::size_t(i) * n + next];
                 }
             }

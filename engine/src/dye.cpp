@@ -32,6 +32,31 @@ Dye::Dye(Context& ctx, const lbm::Solver& solver, float tau, float tau_plus)
     ctx_.fill_zero(src_);
 }
 
+Dye::~Dye() {
+    detach();
+}
+
+void Dye::attach(lbm::Solver& solver) {
+    if (&solver != &solver_)
+        throw std::runtime_error("Dye::attach: not the solver it was built for");
+    lbm::Solver::FusedScalar f;
+    f.g[0] = &g_[0];
+    f.g[1] = &g_[1];
+    f.conc = &conc_;
+    f.src = &src_;
+    f.omega_minus = 1.0f / tau_;
+    f.omega_plus = 1.0f / tau_plus_;
+    f.parity = &parity_;
+    solver.fuse_scalar(&f);
+    attached_ = &solver;
+}
+
+void Dye::detach() {
+    if (attached_)
+        attached_->fuse_scalar(nullptr);
+    attached_ = nullptr;
+}
+
 void Dye::clear() {
     ctx_.fill_zero(g_[0]);
     ctx_.fill_zero(g_[1]);
@@ -75,7 +100,20 @@ void Dye::record_step(VkCommandBuffer cmd, int macro_index) {
 }
 
 void Dye::step_with(lbm::Solver& solver, int n) {
+    const bool was = attached();
+    if (!was)
+        attach(solver);
+    solver.step(n);
+    if (!was)
+        detach();
+}
+
+void Dye::step_with_reference(lbm::Solver& solver, int n) {
+    const bool was = attached();
+    detach(); // the flow alone, then the separate pass after each step
     solver.step(n, [&](VkCommandBuffer cmd, int macro_index) { record_step(cmd, macro_index); });
+    if (was)
+        attach(solver);
 }
 
 std::vector<float> Dye::concentration() {

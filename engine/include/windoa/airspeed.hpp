@@ -14,6 +14,7 @@ namespace windoa::airspeed {
 
 inline constexpr double kSeaLevelSoundSpeed = 340.29; // m/s, ISA at 15 C
 inline constexpr double kMetresPerSecondPerMph = 0.44704;
+inline constexpr double kSeaLevelKinematicViscosity = 1.461e-5; // m^2/s, ISA at 15 C
 
 inline double mach_from_lattice(double u) {
     return u * std::sqrt(3.0);
@@ -23,6 +24,11 @@ inline double metres_per_second(double mach) {
 }
 inline double mph(double metres_per_second) {
     return metres_per_second / kMetresPerSecondPerMph;
+}
+// The Reynolds number of a full-size object `length_m` long in sea-level air
+// at `metres_per_second`: what the real thing would see at the speed shown.
+inline double full_scale_reynolds(double metres_per_second, double length_m) {
+    return metres_per_second * length_m / kSeaLevelKinematicViscosity;
 }
 
 // "29.5 m/s (66 mph)" for a Mach number: one decimal where it still matters.

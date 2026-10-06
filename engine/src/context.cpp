@@ -47,108 +47,128 @@ Context::Context(const ContextOptions& opts) {
     ici.enabledExtensionCount = static_cast<std::uint32_t>(opts.instance_extensions.size());
     ici.ppEnabledExtensionNames = opts.instance_extensions.data();
     vk_check(vkCreateInstance(&ici, nullptr, &instance_), "vkCreateInstance");
+    try {
 
-    // Pick the GPU: a discrete one with a compute queue beats anything else.
-    std::uint32_t n = 0;
-    vk_check(vkEnumeratePhysicalDevices(instance_, &n, nullptr), "vkEnumeratePhysicalDevices");
-    std::vector<VkPhysicalDevice> pds(n);
-    vk_check(vkEnumeratePhysicalDevices(instance_, &n, pds.data()), "vkEnumeratePhysicalDevices");
-    int best_score = 0;
-    for (VkPhysicalDevice pd : pds) {
-        GpuInfo g = describe_gpu(pd);
-        if (opts.graphics)
-            g.compute_queue_family = graphics_compute_family(pd);
-        if (g.compute_queue_family == UINT32_MAX)
-            continue;
-        const int score = g.discrete ? 2 : 1;
-        if (score > best_score) {
-            best_score = score;
-            physical_ = pd;
-            gpu_ = g;
+        // Pick the GPU: a discrete one with a compute queue beats anything else.
+        std::uint32_t n = 0;
+        vk_check(vkEnumeratePhysicalDevices(instance_, &n, nullptr), "vkEnumeratePhysicalDevices");
+        std::vector<VkPhysicalDevice> pds(n);
+        vk_check(vkEnumeratePhysicalDevices(instance_, &n, pds.data()),
+                 "vkEnumeratePhysicalDevices");
+        int best_score = 0;
+        for (VkPhysicalDevice pd : pds) {
+            GpuInfo g = describe_gpu(pd);
+            if (opts.graphics)
+                g.compute_queue_family = graphics_compute_family(pd);
+            if (g.compute_queue_family == UINT32_MAX)
+                continue;
+            const int score = g.discrete ? 2 : 1;
+            if (score > best_score) {
+                best_score = score;
+                physical_ = pd;
+                gpu_ = g;
+            }
         }
-    }
-    if (physical_ == VK_NULL_HANDLE) {
-        vkDestroyInstance(instance_, nullptr);
-        throw std::runtime_error(opts.graphics ? "no Vulkan device with a graphics+compute queue"
-                                               : "no Vulkan device with a compute queue");
-    }
-    family_ = gpu_.compute_queue_family;
-    graphics_family_ = family_;
-    if (opts.graphics && opts.async_compute && gpu_.async_compute_family != UINT32_MAX)
-        family_ = gpu_.async_compute_family; // engine work on its own queue
-    vkGetPhysicalDeviceMemoryProperties(physical_, &mem_);
-    VkPhysicalDeviceProperties props{};
-    vkGetPhysicalDeviceProperties(physical_, &props);
-    max_groups_x_ = props.limits.maxComputeWorkGroupCount[0];
+        if (physical_ == VK_NULL_HANDLE)
+            throw std::runtime_error(opts.graphics
+                                         ? "no Vulkan device with a graphics+compute queue"
+                                         : "no Vulkan device with a compute queue");
+        family_ = gpu_.compute_queue_family;
+        graphics_family_ = family_;
+        if (opts.graphics && opts.async_compute && gpu_.async_compute_family != UINT32_MAX)
+            family_ = gpu_.async_compute_family; // engine work on its own queue
+        vkGetPhysicalDeviceMemoryProperties(physical_, &mem_);
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physical_, &props);
+        max_groups_x_ = props.limits.maxComputeWorkGroupCount[0];
 
-    const float priority = 1.0f;
-    VkDeviceQueueCreateInfo qci[2]{};
-    for (VkDeviceQueueCreateInfo& q : qci) {
-        q.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        q.queueCount = 1;
-        q.pQueuePriorities = &priority;
+        const float priority = 1.0f;
+        VkDeviceQueueCreateInfo qci[2]{};
+        for (VkDeviceQueueCreateInfo& q : qci) {
+            q.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            q.queueCount = 1;
+            q.pQueuePriorities = &priority;
+        }
+        qci[0].queueFamilyIndex = family_;
+        qci[1].queueFamilyIndex = graphics_family_;
+        VkDeviceCreateInfo dci{};
+        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = family_ != graphics_family_ ? 2u : 1u;
+        dci.pQueueCreateInfos = qci;
+        dci.enabledExtensionCount = static_cast<std::uint32_t>(opts.device_extensions.size());
+        dci.ppEnabledExtensionNames = opts.device_extensions.data();
+        // Features are switched on by chaining feature structs through pNext.
+        // Timeline semaphores (core 1.2): cross-queue hand-offs, always on.
+        VkPhysicalDeviceVulkan12Features f12{};
+        f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        f12.timelineSemaphore = VK_TRUE;
+        VkPhysicalDeviceVulkan13Features f13{};
+        f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        // 16-bit storage buffers (1.1): the LBM kernels carry an f16 view of the
+        // distributions (lbm::Config::storage_f16), so the capability is in
+        // their SPIR-V whichever storage is chosen.
+        VkPhysicalDeviceVulkan11Features f11{};
+        f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+        f11.storageBuffer16BitAccess = gpu_.storage_16bit ? VK_TRUE : VK_FALSE;
+        f11.pNext = &f12;
+        dci.pNext = &f11;
+        if (opts.graphics) {
+            f13.dynamicRendering = VK_TRUE; // no VkRenderPass / VkFramebuffer objects
+            f13.synchronization2 = VK_TRUE;
+            f12.pNext = &f13;
+        }
+        vk_check(vkCreateDevice(physical_, &dci, nullptr, &device_), "vkCreateDevice");
+        vkGetDeviceQueue(device_, family_, 0, &queue_);
+        vkGetDeviceQueue(device_, graphics_family_, 0, &graphics_queue_);
+        sharing_[0] = family_;
+        sharing_[1] = graphics_family_;
+
+        VkCommandPoolCreateInfo pci{};
+        pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = family_;
+        vk_check(vkCreateCommandPool(device_, &pci, nullptr, &pool_), "vkCreateCommandPool");
+
+        VkCommandBufferAllocateInfo cai{};
+        cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cai.commandPool = pool_;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        vk_check(vkAllocateCommandBuffers(device_, &cai, &cmd_), "vkAllocateCommandBuffers");
+
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        vk_check(vkCreateFence(device_, &fci, nullptr, &fence_), "vkCreateFence");
+        for (AsyncSlot& a : async_) {
+            vk_check(vkAllocateCommandBuffers(device_, &cai, &a.cmd), "vkAllocateCommandBuffers");
+            vk_check(vkCreateFence(device_, &fci, nullptr, &a.fence), "vkCreateFence");
+        }
+    } catch (...) { // a destructor does not run for a half-built object
+        release();
+        throw;
     }
-    qci[0].queueFamilyIndex = family_;
-    qci[1].queueFamilyIndex = graphics_family_;
-    VkDeviceCreateInfo dci{};
-    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    dci.queueCreateInfoCount = family_ != graphics_family_ ? 2u : 1u;
-    dci.pQueueCreateInfos = qci;
-    dci.enabledExtensionCount = static_cast<std::uint32_t>(opts.device_extensions.size());
-    dci.ppEnabledExtensionNames = opts.device_extensions.data();
-    // Features are switched on by chaining feature structs through pNext.
-    // Timeline semaphores (core 1.2): cross-queue hand-offs, always on.
-    VkPhysicalDeviceVulkan12Features f12{};
-    f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    f12.timelineSemaphore = VK_TRUE;
-    VkPhysicalDeviceVulkan13Features f13{};
-    f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-    // 16-bit storage buffers (1.1): the LBM kernels carry an f16 view of the
-    // distributions (lbm::Config::storage_f16), so the capability is in
-    // their SPIR-V whichever storage is chosen.
-    VkPhysicalDeviceVulkan11Features f11{};
-    f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
-    f11.storageBuffer16BitAccess = gpu_.storage_16bit ? VK_TRUE : VK_FALSE;
-    f11.pNext = &f12;
-    dci.pNext = &f11;
-    if (opts.graphics) {
-        f13.dynamicRendering = VK_TRUE; // no VkRenderPass / VkFramebuffer objects
-        f13.synchronization2 = VK_TRUE;
-        f12.pNext = &f13;
-    }
-    vk_check(vkCreateDevice(physical_, &dci, nullptr, &device_), "vkCreateDevice");
-    vkGetDeviceQueue(device_, family_, 0, &queue_);
-    vkGetDeviceQueue(device_, graphics_family_, 0, &graphics_queue_);
-    sharing_[0] = family_;
-    sharing_[1] = graphics_family_;
-
-    VkCommandPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pci.queueFamilyIndex = family_;
-    vk_check(vkCreateCommandPool(device_, &pci, nullptr, &pool_), "vkCreateCommandPool");
-
-    VkCommandBufferAllocateInfo cai{};
-    cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cai.commandPool = pool_;
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    vk_check(vkAllocateCommandBuffers(device_, &cai, &cmd_), "vkAllocateCommandBuffers");
-
-    VkFenceCreateInfo fci{};
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    vk_check(vkCreateFence(device_, &fci, nullptr, &fence_), "vkCreateFence");
 }
 
 Context::~Context() {
+    release();
+}
+
+void Context::release() {
+    upload_staging_.reset(); // Buffers go before the device
+    download_staging_.reset();
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
-        vkDestroyFence(device_, fence_, nullptr);
+        vkDestroyFence(device_, fence_, nullptr); // a null handle is a no-op
+        for (AsyncSlot& a : async_)
+            vkDestroyFence(device_, a.fence, nullptr);
         vkDestroyCommandPool(device_, pool_, nullptr); // frees cmd_ too
         vkDestroyDevice(device_, nullptr);
+        device_ = VK_NULL_HANDLE;
     }
-    if (instance_ != VK_NULL_HANDLE)
+    if (instance_ != VK_NULL_HANDLE) {
         vkDestroyInstance(instance_, nullptr);
+        instance_ = VK_NULL_HANDLE;
+    }
 }
 
 void Context::submit_and_wait(const std::function<void(VkCommandBuffer)>& record) {
@@ -158,24 +178,57 @@ void Context::submit_and_wait(const std::function<void(VkCommandBuffer)>& record
 void Context::submit_and_wait(const std::function<void(VkCommandBuffer)>& record,
                               VkSemaphore signal, std::uint64_t value) {
     std::lock_guard<std::mutex> lock(submit_mutex_);
-    vk_check(vkResetCommandBuffer(cmd_, 0), "vkResetCommandBuffer");
+    record_batch(cmd_, record);
+    vk_check(vkResetFences(device_, 1, &fence_), "vkResetFences");
+    submit_batch(cmd_, fence_, signal, value);
+    vk_check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+}
+
+std::uint64_t Context::submit_async(const std::function<void(VkCommandBuffer)>& record,
+                                    VkSemaphore signal, std::uint64_t value) {
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    AsyncSlot& a = async_[async_tickets_ % kAsyncSlots];
+    if (a.ticket != 0) // its last batch must be done before the buffer is reused
+        vk_check(vkWaitForFences(device_, 1, &a.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    record_batch(a.cmd, record);
+    vk_check(vkResetFences(device_, 1, &a.fence), "vkResetFences");
+    submit_batch(a.cmd, a.fence, signal, value);
+    a.ticket = ++async_tickets_;
+    return a.ticket;
+}
+
+void Context::wait(std::uint64_t ticket) {
+    for (AsyncSlot& a : async_)
+        if (a.ticket == ticket) {
+            vk_check(vkWaitForFences(device_, 1, &a.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+            return;
+        }
+    // not found: its slot has been reused, so it completed before that
+}
+
+// A fence wait makes a batch's writes available to the host, not visible to
+// the next batch's shaders -- hence the barriers at both ends.
+void Context::record_batch(VkCommandBuffer cmd,
+                           const std::function<void(VkCommandBuffer)>& record) {
+    vk_check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vk_check(vkBeginCommandBuffer(cmd_, &bi), "vkBeginCommandBuffer");
-    // A fence wait makes the previous batch's writes available to the host,
-    // not visible to the next batch's shaders -- hence the leading barrier.
-    barrier_full(cmd_);
-    record(cmd_);
-    barrier_full(cmd_);
-    vk_check(vkEndCommandBuffer(cmd_), "vkEndCommandBuffer");
+    vk_check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+    barrier_full(cmd);
+    record(cmd);
+    barrier_full(cmd);
+    vk_check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+}
 
+// Optional timeline signal: the hand-off to another queue (the signal makes
+// the batch's writes available to whoever waits on it there).
+void Context::submit_batch(VkCommandBuffer cmd, VkFence fence, VkSemaphore signal,
+                           std::uint64_t value) {
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd_;
-    // Optional timeline signal: the hand-off to another queue (the signal
-    // makes this batch's writes available to whoever waits on it there).
+    si.pCommandBuffers = &cmd;
     VkTimelineSemaphoreSubmitInfo ti{};
     ti.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     ti.signalSemaphoreValueCount = 1;
@@ -185,9 +238,7 @@ void Context::submit_and_wait(const std::function<void(VkCommandBuffer)>& record
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &signal;
     }
-    vk_check(vkResetFences(device_, 1, &fence_), "vkResetFences");
-    vk_check(vkQueueSubmit(queue_, 1, &si, fence_), "vkQueueSubmit");
-    vk_check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    vk_check(vkQueueSubmit(queue_, 1, &si, fence), "vkQueueSubmit");
 }
 
 void Context::upload(Buffer& dst, const void* src, VkDeviceSize bytes, VkDeviceSize dst_offset) {
@@ -197,11 +248,22 @@ void Context::upload(Buffer& dst, const void* src, VkDeviceSize bytes, VkDeviceS
         std::memcpy(static_cast<char*>(dst.data()) + dst_offset, src, bytes);
         return;
     }
-    Buffer staging(*this, bytes, MemoryUse::Upload);
-    std::memcpy(staging.data(), src, bytes);
+    std::unique_lock<std::mutex> lock(staging_mutex_, std::defer_lock);
+    std::unique_ptr<Buffer> temporary;
+    Buffer* staging = nullptr;
+    if (bytes <= kStagingKeep) {
+        lock.lock();
+        if (!upload_staging_)
+            upload_staging_ = std::make_unique<Buffer>(*this, kStagingKeep, MemoryUse::Upload);
+        staging = upload_staging_.get();
+    } else {
+        temporary = std::make_unique<Buffer>(*this, bytes, MemoryUse::Upload);
+        staging = temporary.get();
+    }
+    std::memcpy(staging->data(), src, bytes);
     submit_and_wait([&](VkCommandBuffer cmd) {
         VkBufferCopy region{0, dst_offset, bytes};
-        vkCmdCopyBuffer(cmd, staging.handle(), dst.handle(), 1, &region);
+        vkCmdCopyBuffer(cmd, staging->handle(), dst.handle(), 1, &region);
     });
 }
 
@@ -213,12 +275,23 @@ void Context::download(const Buffer& src, void* dst, VkDeviceSize bytes, VkDevic
         std::memcpy(dst, static_cast<const char*>(src.data()) + src_offset, bytes);
         return;
     }
-    Buffer staging(*this, bytes, MemoryUse::Readback);
+    std::unique_lock<std::mutex> lock(staging_mutex_, std::defer_lock);
+    std::unique_ptr<Buffer> temporary;
+    Buffer* staging = nullptr;
+    if (bytes <= kStagingKeep) {
+        lock.lock();
+        if (!download_staging_)
+            download_staging_ = std::make_unique<Buffer>(*this, kStagingKeep, MemoryUse::Readback);
+        staging = download_staging_.get();
+    } else {
+        temporary = std::make_unique<Buffer>(*this, bytes, MemoryUse::Readback);
+        staging = temporary.get();
+    }
     submit_and_wait([&](VkCommandBuffer cmd) {
         VkBufferCopy region{src_offset, 0, bytes};
-        vkCmdCopyBuffer(cmd, src.handle(), staging.handle(), 1, &region);
+        vkCmdCopyBuffer(cmd, src.handle(), staging->handle(), 1, &region);
     });
-    std::memcpy(dst, staging.data(), bytes);
+    std::memcpy(dst, staging->data(), bytes);
 }
 
 void Context::fill_u32(Buffer& dst, std::uint32_t value) {
@@ -289,7 +362,8 @@ void Context::wait_timeline(VkSemaphore s, std::uint64_t value) const {
 // -- Buffer ------------------------------------------------------------------
 
 Buffer::Buffer(Context& ctx, VkDeviceSize bytes, MemoryUse use)
-    : device_(ctx.device()), size_(std::max<VkDeviceSize>(bytes, 16)) {
+    : device_(ctx.device()), memory_(ctx.device()), buffer_(ctx.device()),
+      size_(std::max<VkDeviceSize>(bytes, 16)) {
     VkBufferCreateInfo bci{};
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = size_;
@@ -304,10 +378,10 @@ Buffer::Buffer(Context& ctx, VkDeviceSize bytes, MemoryUse use)
         bci.queueFamilyIndexCount = 2;
         bci.pQueueFamilyIndices = fams.data();
     }
-    vk_check(vkCreateBuffer(device_, &bci, nullptr, &buffer_), "vkCreateBuffer");
+    vk_check(vkCreateBuffer(device_, &bci, nullptr, buffer_.put()), "vkCreateBuffer");
 
     VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(device_, buffer_, &req);
+    vkGetBufferMemoryRequirements(device_, buffer_.get(), &req);
     const VkMemoryPropertyFlags visible =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     std::uint32_t type = UINT32_MAX;
@@ -325,38 +399,29 @@ Buffer::Buffer(Context& ctx, VkDeviceSize bytes, MemoryUse use)
             type = ctx.find_memory_type(req.memoryTypeBits, visible);
         break;
     }
-    if (type == UINT32_MAX) {
-        vkDestroyBuffer(device_, buffer_, nullptr);
+    if (type == UINT32_MAX)
         throw std::runtime_error("no suitable Vulkan memory type for a buffer");
-    }
 
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
-    VkResult r = vkAllocateMemory(device_, &mai, nullptr, &memory_);
-    if (r != VK_SUCCESS) {
-        vkDestroyBuffer(device_, buffer_, nullptr);
-        vk_check(r, "vkAllocateMemory");
-    }
-    vk_check(vkBindBufferMemory(device_, buffer_, memory_, 0), "vkBindBufferMemory");
+    vk_check(vkAllocateMemory(device_, &mai, nullptr, memory_.put()), "vkAllocateMemory");
+    vk_check(vkBindBufferMemory(device_, buffer_.get(), memory_.get(), 0), "vkBindBufferMemory");
     if (use != MemoryUse::Device) {
-        vk_check(vkMapMemory(device_, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_), "vkMapMemory");
+        vk_check(vkMapMemory(device_, memory_.get(), 0, VK_WHOLE_SIZE, 0, &mapped_), "vkMapMemory");
     }
 }
 
-Buffer::~Buffer() {
-    if (mapped_)
-        vkUnmapMemory(device_, memory_);
-    vkDestroyBuffer(device_, buffer_, nullptr);
-    vkFreeMemory(device_, memory_, nullptr);
-}
+// The handles free themselves: the buffer, then its memory (which unmaps it).
+Buffer::~Buffer() = default;
 
 // -- Image3D -------------------------------------------------------------------
 
 Image3D::Image3D(Context& ctx, int nx, int ny, int nz)
-    : device_(ctx.device()),
-      extent_{std::uint32_t(nz), std::uint32_t(ny), std::uint32_t(nx)} { // z fastest (see header)
+    : device_(ctx.device()), extent_{std::uint32_t(nz), std::uint32_t(ny), std::uint32_t(nx)},
+      memory_(ctx.device()), image_(ctx.device()), view_(ctx.device()),
+      sampler_(ctx.device()) { // extent: z fastest (see the header)
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ici.imageType = VK_IMAGE_TYPE_3D;
@@ -375,24 +440,26 @@ Image3D::Image3D(Context& ctx, int nx, int ny, int nz)
         ici.pQueueFamilyIndices = fams.data();
     }
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    vk_check(vkCreateImage(device_, &ici, nullptr, &image_), "vkCreateImage (3-D)");
+    vk_check(vkCreateImage(device_, &ici, nullptr, image_.put()), "vkCreateImage (3-D)");
     VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(device_, image_, &req);
+    vkGetImageMemoryRequirements(device_, image_.get(), &req);
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
     mai.memoryTypeIndex =
         ctx.find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    vk_check(vkAllocateMemory(device_, &mai, nullptr, &memory_), "vkAllocateMemory (3-D)");
-    vk_check(vkBindImageMemory(device_, image_, memory_, 0), "vkBindImageMemory");
+    if (mai.memoryTypeIndex == UINT32_MAX)
+        throw std::runtime_error("no device-local Vulkan memory type for a 3-D image");
+    vk_check(vkAllocateMemory(device_, &mai, nullptr, memory_.put()), "vkAllocateMemory (3-D)");
+    vk_check(vkBindImageMemory(device_, image_.get(), memory_.get(), 0), "vkBindImageMemory");
 
     VkImageViewCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    vi.image = image_;
+    vi.image = image_.get();
     vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
     vi.format = VK_FORMAT_R32_SFLOAT;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vk_check(vkCreateImageView(device_, &vi, nullptr, &view_), "vkCreateImageView (3-D)");
+    vk_check(vkCreateImageView(device_, &vi, nullptr, view_.put()), "vkCreateImageView (3-D)");
 
     VkSamplerCreateInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -401,7 +468,7 @@ Image3D::Image3D(Context& ctx, int nx, int ny, int nz)
     si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.maxLod = 0.0f;
-    vk_check(vkCreateSampler(device_, &si, nullptr, &sampler_), "vkCreateSampler");
+    vk_check(vkCreateSampler(device_, &si, nullptr, sampler_.put()), "vkCreateSampler");
 
     // UNDEFINED -> GENERAL once; copies and sampling then need only memory
     // barriers.
@@ -413,29 +480,24 @@ Image3D::Image3D(Context& ctx, int nx, int ny, int nz)
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = image_;
+        b.image = image_.get();
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b);
         VkClearColorValue zero{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(cmd, image_, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+        vkCmdClearColorImage(cmd, image_.get(), VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
     });
 }
 
-Image3D::~Image3D() {
-    vkDestroySampler(device_, sampler_, nullptr);
-    vkDestroyImageView(device_, view_, nullptr);
-    vkDestroyImage(device_, image_, nullptr);
-    vkFreeMemory(device_, memory_, nullptr);
-}
+Image3D::~Image3D() = default; // sampler, view, image, then the memory
 
 void Image3D::record_copy_from(VkCommandBuffer cmd, const Buffer& src) const {
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = extent_;
-    vkCmdCopyBufferToImage(cmd, src.handle(), image_, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    vkCmdCopyBufferToImage(cmd, src.handle(), image_.get(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
 // -- ComputeKernel -----------------------------------------------------------
@@ -450,7 +512,8 @@ ComputeKernel::ComputeKernel(Context& ctx, std::span<const std::uint32_t> spirv,
                              std::span<const Slot> slots, std::uint32_t push_bytes,
                              std::uint32_t n_sets, std::span<const std::uint32_t> spec)
     : device_(ctx.device()), slots_(slots.begin(), slots.end()), push_bytes_(push_bytes),
-      n_sets_(n_sets) {
+      n_sets_(n_sets), module_(ctx.device()), set_layout_(ctx.device()), layout_(ctx.device()),
+      pipeline_(ctx.device()), pool_(ctx.device()) {
     if (n_sets < 1 || n_sets > 4)
         throw std::runtime_error("ComputeKernel: 1..4 sets");
     const std::uint32_t n = static_cast<std::uint32_t>(slots_.size());
@@ -459,7 +522,7 @@ ComputeKernel::ComputeKernel(Context& ctx, std::span<const std::uint32_t> spirv,
     smi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     smi.codeSize = spirv.size_bytes();
     smi.pCode = spirv.data();
-    vk_check(vkCreateShaderModule(device_, &smi, nullptr, &module_), "vkCreateShaderModule");
+    vk_check(vkCreateShaderModule(device_, &smi, nullptr, module_.put()), "vkCreateShaderModule");
 
     std::uint32_t n_buf = 0, n_tex = 0;
     std::vector<VkDescriptorSetLayoutBinding> binds(n);
@@ -477,8 +540,9 @@ ComputeKernel::ComputeKernel(Context& ctx, std::span<const std::uint32_t> spirv,
     dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dli.bindingCount = n;
     dli.pBindings = binds.data();
-    vk_check(vkCreateDescriptorSetLayout(device_, &dli, nullptr, &set_layout_),
+    vk_check(vkCreateDescriptorSetLayout(device_, &dli, nullptr, set_layout_.put()),
              "vkCreateDescriptorSetLayout");
+    const VkDescriptorSetLayout set_layout = set_layout_.get();
 
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -486,10 +550,11 @@ ComputeKernel::ComputeKernel(Context& ctx, std::span<const std::uint32_t> spirv,
     VkPipelineLayoutCreateInfo pli{};
     pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 1;
-    pli.pSetLayouts = &set_layout_;
+    pli.pSetLayouts = &set_layout;
     pli.pushConstantRangeCount = push_bytes > 0 ? 1 : 0;
     pli.pPushConstantRanges = &pcr;
-    vk_check(vkCreatePipelineLayout(device_, &pli, nullptr, &layout_), "vkCreatePipelineLayout");
+    vk_check(vkCreatePipelineLayout(device_, &pli, nullptr, layout_.put()),
+             "vkCreatePipelineLayout");
 
     // Specialisation constant k <- spec[k] (4 bytes each; a GLSL bool
     // constant takes a VkBool32, i.e. also 4 bytes).
@@ -507,11 +572,11 @@ ComputeKernel::ComputeKernel(Context& ctx, std::span<const std::uint32_t> spirv,
     cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpi.stage.module = module_;
+    cpi.stage.module = module_.get();
     cpi.stage.pName = "main";
     cpi.stage.pSpecializationInfo = spec.empty() ? nullptr : &si;
-    cpi.layout = layout_;
-    vk_check(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipeline_),
+    cpi.layout = layout_.get();
+    vk_check(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpi, nullptr, pipeline_.put()),
              "vkCreateComputePipelines");
 
     VkDescriptorPoolSize ps[2]{};
@@ -524,24 +589,18 @@ ComputeKernel::ComputeKernel(Context& ctx, std::span<const std::uint32_t> spirv,
     dpi.maxSets = n_sets;
     dpi.poolSizeCount = nps;
     dpi.pPoolSizes = ps;
-    vk_check(vkCreateDescriptorPool(device_, &dpi, nullptr, &pool_), "vkCreateDescriptorPool");
+    vk_check(vkCreateDescriptorPool(device_, &dpi, nullptr, pool_.put()), "vkCreateDescriptorPool");
 
-    std::vector<VkDescriptorSetLayout> layouts(n_sets, set_layout_);
+    std::vector<VkDescriptorSetLayout> layouts(n_sets, set_layout);
     VkDescriptorSetAllocateInfo dai{};
     dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = pool_;
+    dai.descriptorPool = pool_.get();
     dai.descriptorSetCount = n_sets;
     dai.pSetLayouts = layouts.data();
     vk_check(vkAllocateDescriptorSets(device_, &dai, sets_), "vkAllocateDescriptorSets");
 }
 
-ComputeKernel::~ComputeKernel() {
-    vkDestroyDescriptorPool(device_, pool_, nullptr); // frees the sets too
-    vkDestroyPipeline(device_, pipeline_, nullptr);
-    vkDestroyPipelineLayout(device_, layout_, nullptr);
-    vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
-    vkDestroyShaderModule(device_, module_, nullptr);
-}
+ComputeKernel::~ComputeKernel() = default; // the handles, in reverse order of creation
 
 void ComputeKernel::bind(std::uint32_t set, std::initializer_list<const Buffer*> buffers) {
     std::vector<Resource> r;
@@ -597,11 +656,11 @@ void ComputeKernel::bind_list(std::uint32_t set, const std::vector<Resource>& re
 
 void ComputeKernel::record_set(VkCommandBuffer cmd, std::uint32_t set, const void* push,
                                std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) const {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &sets_[set], 0,
-                            nullptr);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_.get());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_.get(), 0, 1, &sets_[set],
+                            0, nullptr);
     if (push_bytes_ > 0) {
-        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes_, push);
+        vkCmdPushConstants(cmd, layout_.get(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes_, push);
     }
     vkCmdDispatch(cmd, gx, gy, gz);
 }

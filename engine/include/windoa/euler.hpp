@@ -20,6 +20,8 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -100,6 +102,17 @@ class Solver {
 
     // Render fields (refreshed by health() / refresh()): vec4 (u, p), rho.
     void refresh();
+
+    // step(n), then in its last submission what body_loads(ref), time() and
+    // refresh() -- or health(), when `with_health` -- would give on the state
+    // it leaves, read from mapped memory: one blocking round trip for the
+    // batch instead of one for each (the tunnel takes them every batch).
+    struct Batch {
+        Loads loads;
+        double time = 0.0;
+        std::optional<Health> health;
+    };
+    Batch step_with_readings(int n, const std::array<float, 3>& ref, bool with_health);
     const Buffer& macro_buffer() const { return macro_; }
     const Buffer& rho_buffer() const { return rho_; }
     const Buffer& flag_buffer() const { return flags_; }
@@ -125,6 +138,10 @@ class Solver {
     std::vector<std::uint8_t> host_flags_;
 
     Buffer u_, u1_, flags_, phi_, gs_, gn_, gpw_, dt_, partials_, macro_, rho_, ports_;
+    // step_with_readings(): the loads' and the health's partials, the time
+    std::unique_ptr<Buffer> loads_mirror_, health_mirror_, dt_mirror_;
+    Loads sum_loads(const float* partials) const;
+    Health sum_health(const float* partials) const;
     ComputeKernel ghost_, update_, stage_, dt_kernel_, force_, diag_;
 };
 

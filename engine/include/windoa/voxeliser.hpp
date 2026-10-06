@@ -21,6 +21,9 @@ namespace windoa {
 
 class Voxeliser {
   public:
+    // The shell pass packs a triangle index into 20 bits of its key.
+    static constexpr std::size_t kMaxTriangles = std::size_t{1} << 20;
+
     Voxeliser(Context& ctx, int nx, int ny, int nz);
     ~Voxeliser();
     Voxeliser(const Voxeliser&) = delete;
@@ -43,6 +46,12 @@ class Voxeliser {
 
   private:
     void upload_flags(const std::vector<std::uint8_t>& flags);
+    // What flags_ holds on the device (empty: unknown), so an upload sends
+    // only what differs; and the last mesh's x-extent, beyond which no pass
+    // changes a cell (the downloads take that slab only).
+    std::vector<std::uint8_t> device_flags_;
+    float tri_xmin_ = 0.0f, tri_xmax_ = -1.0f;
+    std::pair<int, int> slab(float margin) const; // planes [x0, x1)
     void run(const ComputeKernel& k, const void* params, std::uint64_t items, std::uint32_t local);
 
     Context& ctx_;

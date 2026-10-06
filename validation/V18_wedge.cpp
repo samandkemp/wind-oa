@@ -41,7 +41,7 @@ int main() {
                 const double d = xc > X0 ? (yc - (xc - X0) * std::tan(TH)) * std::cos(TH)
                                          : std::hypot(xc - X0, yc);
                 for (int z = 0; z < NZ; ++z) {
-                    const std::size_t k = (std::size_t(x) * NY + y) * NZ + z;
+                    const std::size_t k = Grid{NX, NY, NZ}.index(x, y, z);
                     flags[k] = solid ? 1 : 0;
                     phi[k] = float(d);
                 }

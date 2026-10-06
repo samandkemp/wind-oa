@@ -7,40 +7,60 @@
 // Summing per step into the window (one add of ~0.4) rather than per link
 // is what keeps long windows exact in f32: per-link adds vanish into a
 // large sum (an Ahmed Cd of 0.716 once read 0.603 that way).
+//
+// The steps write their partials into consecutive slices of a ring, and
+// this kernel runs once for several steps, in two modes (P.aux.w):
+//   0  fold: workgroup s sums slice s (one step's partials) into totals[s],
+//      each thread over a fixed stride, then a fixed tree
+//   1  accumulate: one thread adds the P.aux.z steps' totals into the
+//      window in step order
+// The arithmetic and its order are those of a reduce after every step; a
+// one-workgroup dispatch per step left the GPU idle for ~6 % of the time.
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 256) in;
 #include "lbm_params.glsl"
 
-layout(std430, binding = 0) readonly buffer Partials { vec4 partials[]; };
-layout(std430, binding = 1) buffer Accum { vec4 accum[]; };
+layout(std430, binding = 0) readonly buffer Partials { vec4 partials[]; };  // [slice][group] F, T
+layout(std430, binding = 1) buffer Totals { vec4 totals[]; };  // per slice: F, T
+layout(std430, binding = 2) buffer Accum { vec4 accum[]; };
 
 shared vec4 s_force[256];
 shared vec4 s_torque[256];
 
 void main() {
     const uint lid = gl_LocalInvocationID.x;
-    const uint groups = uint(P.aux.x);   // step-kernel workgroups
-    vec4 f = vec4(0.0);
-    vec4 t = vec4(0.0);
-    for (uint k = lid; k < groups; k += 256u) {
-        f += partials[2u * k];
-        t += partials[2u * k + 1u];
-    }
-    s_force[lid] = f;
-    s_torque[lid] = t;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) {
-            s_force[lid] += s_force[lid + s];
-            s_torque[lid] += s_torque[lid + s];
+    if (P.aux.w == 0.0) {
+        const uint groups = uint(P.aux.x);  // step-kernel workgroups
+        const uint slice = gl_WorkGroupID.x;
+        const uint base = slice * groups;
+        vec4 f = vec4(0.0);
+        vec4 t = vec4(0.0);
+        for (uint k = lid; k < groups; k += 256u) {
+            f += partials[2u * (base + k)];
+            t += partials[2u * (base + k) + 1u];
         }
+        s_force[lid] = f;
+        s_torque[lid] = t;
         barrier();
-    }
-    if (lid == 0u) {
-        accum[0] = s_force[0];
-        accum[1] = s_torque[0];
-        accum[2] += s_force[0];
-        accum[3] += s_torque[0];
-        accum[4].x += 1.0;
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (lid < s) {
+                s_force[lid] += s_force[lid + s];
+                s_torque[lid] += s_torque[lid + s];
+            }
+            barrier();
+        }
+        if (lid == 0u) {
+            totals[2u * slice] = s_force[0];
+            totals[2u * slice + 1u] = s_torque[0];
+        }
+    } else if (lid == 0u) {
+        const uint steps = uint(P.aux.z);
+        for (uint s = 0u; s < steps; ++s) {
+            accum[0] = totals[2u * s];
+            accum[1] = totals[2u * s + 1u];
+            accum[2] += totals[2u * s];
+            accum[3] += totals[2u * s + 1u];
+            accum[4].x += 1.0;
+        }
     }
 }

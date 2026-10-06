@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "windoa/context.hpp"
+#include "windoa/grid.hpp"
 
 namespace windoa::gate {
 

@@ -1,10 +1,15 @@
 // Turntable camera about a target point, in lattice cells, driven by Dear
 // ImGui's input state:
-//   RMB drag     orbit (azimuth / elevation)
-//   MMB drag     pan the target in the view plane
-//   wheel        zoom
+//   LMB or RMB drag          orbit (azimuth / elevation)
+//   MMB drag, Shift + drag   pan the target in the view plane (Shift for a
+//                            touchpad or a mouse without a middle button)
+//   wheel                    zoom
+// (Ctrl + click is the app's: click to place.)
 //   W A S D      pan;  Q / E  zoom out / in  (F, refocus, is the app's)
 // Input is ignored while ImGui wants the mouse / keyboard (over a panel).
+// fly_to() glides to a view (the app's view presets); orbit_rate turns the
+// camera about the vertical through the target (a turntable). Any manual
+// move ends a glide.
 #pragma once
 
 #include <algorithm>
@@ -28,17 +33,60 @@ class OrbitCamera {
         elevation = radians(22.0f);
     }
 
+    // Glide to a view over `seconds` (eased at both ends); the azimuth takes
+    // the shorter way round.
+    void fly_to(const std::array<float, 3>& to_target, float to_distance, float to_azimuth,
+                float to_elevation, float seconds = 0.45f) {
+        from_ = {target[0], target[1], target[2], distance, azimuth, elevation};
+        float daz = std::remainder(to_azimuth - azimuth, 2.0f * kPi);
+        to_ = {to_target[0],  to_target[1],
+               to_target[2],  to_distance,
+               azimuth + daz, std::clamp(to_elevation, radians(-85.0f), radians(85.0f))};
+        fly_t_ = 0.0f;
+        fly_time_ = std::max(seconds, 1e-3f);
+        flying_ = true;
+    }
+    bool flying() const { return flying_; }
+    float orbit_rate = 0.0f; // radians per second about the vertical; 0 = still
+
     void update(const ImGuiIO& io) {
         const float w = std::max(io.DisplaySize.x, 1.0f);
+        // A drag: LMB without Ctrl (a click to place) or RMB / MMB, moving.
+        const bool lmb = ImGui::IsMouseDown(ImGuiMouseButton_Left) && !io.KeyCtrl;
+        const bool rmb = ImGui::IsMouseDown(ImGuiMouseButton_Right);
+        const bool mmb = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+        const bool moved = io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f;
+        const bool drag = !io.WantCaptureMouse && moved && (lmb || rmb || mmb);
+        const bool panning = mmb || (io.KeyShift && (lmb || rmb));
+        const bool manual = drag || (!io.WantCaptureMouse && io.MouseWheel != 0.0f) ||
+                            (!io.WantCaptureKeyboard &&
+                             (ImGui::IsKeyDown(ImGuiKey_W) || ImGui::IsKeyDown(ImGuiKey_A) ||
+                              ImGui::IsKeyDown(ImGuiKey_S) || ImGui::IsKeyDown(ImGuiKey_D) ||
+                              ImGui::IsKeyDown(ImGuiKey_Q) || ImGui::IsKeyDown(ImGuiKey_E)));
+        if (manual)
+            flying_ = false;
+        if (flying_) {
+            fly_t_ += io.DeltaTime;
+            const float x = std::min(fly_t_ / fly_time_, 1.0f);
+            const float e = x * x * (3.0f - 2.0f * x); // smoothstep
+            auto mix = [&](int k) { return from_[k] + (to_[k] - from_[k]) * e; };
+            target = {mix(0), mix(1), mix(2)};
+            distance = mix(3);
+            azimuth = mix(4);
+            elevation = mix(5);
+            if (x >= 1.0f)
+                flying_ = false;
+        } else if (orbit_rate != 0.0f) {
+            azimuth += orbit_rate * io.DeltaTime;
+        }
         if (!io.WantCaptureMouse) {
-            if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+            if (drag && panning) {
+                const float k = distance / w; // ~1 pixel of drag = 1 pixel of motion
+                pan(-io.MouseDelta.x * k, io.MouseDelta.y * k);
+            } else if (drag) {
                 azimuth += io.MouseDelta.x / w * kOrbitRate;
                 elevation = std::clamp(elevation + io.MouseDelta.y / w * kOrbitRate,
                                        radians(-85.0f), radians(85.0f));
-            }
-            if (ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
-                const float k = distance / w; // ~1 pixel of drag = 1 pixel of motion
-                pan(-io.MouseDelta.x * k, io.MouseDelta.y * k);
             }
             if (io.MouseWheel != 0.0f)
                 distance *= std::pow(0.9f, io.MouseWheel);
@@ -85,9 +133,11 @@ class OrbitCamera {
     float distance = 100.0f;
     float azimuth = 0.0f, elevation = 0.0f; // radians
 
+    static float radians(float deg) { return deg * kPi / 180.0f; }
+
   private:
+    static constexpr float kPi = 3.14159265f;
     static constexpr float kOrbitRate = 3.5f; // radians per full-window drag
-    static float radians(float deg) { return deg * 3.14159265f / 180.0f; }
 
     std::array<float, 3> direction() const { // target -> eye, unit
         const float ce = std::cos(elevation);
@@ -110,6 +160,10 @@ class OrbitCamera {
     }
 
     std::array<float, 3> box_{64.0f, 64.0f, 64.0f};
+    // a glide: target xyz, distance, azimuth, elevation at its ends
+    std::array<float, 6> from_{}, to_{};
+    float fly_t_ = 0.0f, fly_time_ = 1.0f;
+    bool flying_ = false;
 };
 
 } // namespace windoa::app
